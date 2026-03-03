@@ -1,4 +1,3 @@
-import random
 from treys import Card, Deck, Evaluator
 from dataclasses import dataclass, field
 from typing import Optional
@@ -25,16 +24,17 @@ class Street(Enum):
 
 @dataclass
 class PokerPlayer:
-    user_id:      int
-    display_name: str
-    chips:        int  = 0
-    hole_cards:   list = field(default_factory=list)
-    bet:          int  = 0       # amount bet THIS street
-    total_bet:    int  = 0       # total bet this hand
-    folded:       bool = False
-    all_in:       bool = False
-    acted:        bool = False   # has acted at least once this street
-    sitting_out:  bool = False
+    user_id:       int
+    display_name:  str
+    chips:         int  = 0
+    hole_cards:    list = field(default_factory=list)
+    bet:           int  = 0
+    total_bet:     int  = 0
+    folded:        bool = False
+    all_in:        bool = False
+    acted:         bool = False
+    sitting_out:   bool = False
+    pending_rebuy: int  = 0
 
     def reset_for_hand(self):
         self.hole_cards  = []
@@ -50,36 +50,50 @@ class PokerPlayer:
         self.acted = False
 
 @dataclass
+class SidePot:
+    amount:   int
+    eligible: list
+
+@dataclass
 class HandResult:
-    winners:     list
-    pot:         int
-    summary:     str
-    chip_deltas: dict
-    is_over:     bool = False
+    winners:      list        # all unique winners across all pots
+    pot:          int
+    summary:      str
+    chip_deltas:  dict        # {user_id: net gain/loss}
+    winner_ranks: dict = None # {user_id: "Flush"} etc
+    pot_results:  list = None # [(amount, [winner,...]), ...] one entry per side pot
+    is_over:      bool = False
 
 class PokerGame:
     SMALL_BLIND = 25
     BIG_BLIND   = 50
     MIN_BUYIN   = 50
+    MAX_PLAYERS = 8
 
     def __init__(self):
-        self.players:           list[PokerPlayer] = []
-        self.pending_joins:     list[PokerPlayer] = []
-        self.pending_leaves:    list[int]         = []
-        self.street:            Street            = Street.WAITING
-        self.pot:               int               = 0
-        self.community:         list[int]         = []
-        self.deck:              Optional[Deck]    = None
-        self.dealer_idx:        int               = 0
-        self.current_idx:       int               = 0
-        self.current_bet:       int               = 0
-        self.last_raiser:       Optional[int]     = None
-        self.hand_num:          int               = 0
-        self._hand_result:      Optional[HandResult] = None
+        self.players:        list[PokerPlayer] = []
+        self.pending_joins:  list[PokerPlayer] = []
+        self.pending_leaves: list[int]         = []
+        self.street:         Street            = Street.WAITING
+        self.pot:            int               = 0
+        self.community:      list[int]         = []
+        self.deck:           Optional[Deck]    = None
+        self.dealer_idx:     int               = 0
+        self.current_idx:    int               = 0
+        self.current_bet:    int               = 0
+        self.last_raiser:    Optional[int]     = None
+        self.hand_num:       int               = 0
+        self._hand_result:   Optional[HandResult] = None
+        self.side_pots:      list[SidePot]     = []
+        self.banned_users:   list[int]         = []  # global table ban
+        self.kicked_users:   list[int]         = []  # pending kick (force leave after hand)
 
-    # ── Lobby ──────────────────────────────────────────────────────────────
+    # Lobby
 
     def add_player(self, user_id: int, display_name: str, chips: int) -> str:
+        total = len(self.players) + len(self.pending_joins)
+        if total >= self.MAX_PLAYERS:
+            return f"❌ Table is full ({self.MAX_PLAYERS} players max)."
         if any(p.user_id == user_id for p in self.players):
             return "❌ You're already at the table."
         if any(p.user_id == user_id for p in self.pending_joins):
@@ -110,6 +124,17 @@ class PokerGame:
         self.players.remove(p)
         return p.chips, f"👋 **{p.display_name}** cashed out **{p.chips}** chips."
 
+    def queue_rebuy(self, user_id: int, amount: int) -> str:
+        p = self.get_player(user_id)
+        if p:
+            p.pending_rebuy += amount
+            return f"✅ **{amount}** chips queued — added to your stack next hand. (Pending: **{p.pending_rebuy}**)"
+        for pj in self.pending_joins:
+            if pj.user_id == user_id:
+                pj.chips += amount
+                return f"✅ Added **{amount}** chips. Stack at join: **{pj.chips}**."
+        return "❌ You're not at the table."
+
     def _process_pending(self):
         for uid in self.pending_leaves:
             p = self.get_player(uid)
@@ -121,14 +146,20 @@ class PokerGame:
             self.players.append(p)
         self.pending_joins.clear()
 
-    # ── Hand lifecycle ─────────────────────────────────────────────────────
+    # Hand lifecycle
 
     def start_hand(self) -> tuple[bool, str]:
+        for p in self.players:
+            if p.pending_rebuy > 0:
+                p.chips += p.pending_rebuy
+                p.pending_rebuy = 0
+
         self._process_pending()
         active = [p for p in self.players if p.chips > 0]
         if len(active) < 2:
             return False, "❌ Need at least 2 players with chips to start."
-        self.players = active
+        self.players   = active
+        self.side_pots = []
         for p in self.players:
             p.reset_for_hand()
 
@@ -147,21 +178,15 @@ class PokerGame:
 
         self._post_blind(sb_idx, self.SMALL_BLIND)
         self._post_blind(bb_idx, self.BIG_BLIND)
-        self.current_bet = self.BIG_BLIND
-
-        # BB is considered to have "acted" for preflop purposes (they've put money in)
-        # but they still get an option if no one raises — handled by acted flag
-        self.players[bb_idx].acted = False  # BB gets their option
+        self.current_bet           = self.BIG_BLIND
+        self.players[bb_idx].acted = False
 
         for p in self.players:
             p.hole_cards = self.deck.draw(2)
 
-        # Action starts left of BB
-        self.current_idx = (bb_idx + 1) % n
-        # Skip anyone who is all-in from blinds
-        self.current_idx = self._next_active_idx(self.current_idx)
-
-        self.street = Street.PREFLOP
+        start            = (bb_idx + 1) % n
+        self.current_idx = self._next_active_idx(start)
+        self.street      = Street.PREFLOP
 
         dealer = self.players[self.dealer_idx].display_name
         sb     = self.players[sb_idx].display_name
@@ -172,34 +197,46 @@ class PokerGame:
         )
 
     def _post_blind(self, idx: int, amount: int):
-        p = self.players[idx]
-        actual = min(amount, p.chips)
+        p            = self.players[idx]
+        actual       = min(amount, p.chips)
         p.chips     -= actual
         p.bet       += actual
         p.total_bet += actual
-        p.acted      = True   # blinds count as acted so they don't get skipped
+        p.acted      = True
         self.pot    += actual
         if p.chips == 0:
             p.all_in = True
 
-    # ── Actions ────────────────────────────────────────────────────────────
+    # Helpers
 
     def get_player(self, user_id: int) -> Optional[PokerPlayer]:
         return next((p for p in self.players if p.user_id == user_id), None)
 
     @property
     def active_players(self) -> list[PokerPlayer]:
-        """Players who can still act (not folded, not all-in)."""
         return [p for p in self.players if not p.folded and not p.all_in]
 
     @property
     def players_in_hand(self) -> list[PokerPlayer]:
         return [p for p in self.players if not p.folded]
 
+    @property
+    def all_in_run_out(self) -> bool:
+        """Zero active players — board runs itself."""
+        return len(self.active_players) == 0
+
     def current_player(self) -> Optional[PokerPlayer]:
         if self.street in (Street.WAITING, Street.SHOWDOWN):
             return None
-        return self.players[self.current_idx]
+        if self.all_in_run_out:
+            return None
+        cp = self.players[self.current_idx]
+        if cp.folded or cp.all_in:
+            self.current_idx = self._next_active_idx(self.current_idx)
+            cp = self.players[self.current_idx]
+            if cp.folded or cp.all_in:
+                return None
+        return cp
 
     def is_turn(self, user_id: int) -> bool:
         cp = self.current_player()
@@ -207,6 +244,8 @@ class PokerGame:
 
     def call_amount(self, player: PokerPlayer) -> int:
         return min(self.current_bet - player.bet, player.chips)
+
+    # Actions
 
     def fold(self, user_id: int) -> tuple[bool, str]:
         p = self.get_player(user_id)
@@ -241,20 +280,25 @@ class PokerGame:
         p = self.get_player(user_id)
         if not p or not self.is_turn(user_id):
             return False, "❌ It's not your turn."
+        others_can_call = any(
+            not o.folded and not o.all_in and o.user_id != user_id
+            for o in self.players
+        )
+        if not others_can_call:
+            return False, "❌ Everyone else is all-in. You can only call or fold."
         total_needed = self.current_bet - p.bet + amount
         if total_needed > p.chips:
             total_needed = p.chips
-        if amount < self.BIG_BLIND and total_needed < p.chips:
-            return False, f"❌ Minimum raise is {self.BIG_BLIND}."
+        if amount <= 0:
+            return False, "❌ Raise amount must be greater than 0."
         p.chips     -= total_needed
         p.bet       += total_needed
         p.total_bet += total_needed
         self.pot    += total_needed
-        self.current_bet  = p.bet
-        self.last_raiser  = user_id
+        self.current_bet = p.bet
+        self.last_raiser = user_id
         if p.chips == 0:
             p.all_in = True
-        # A raise re-opens action: everyone else needs to act again
         for other in self.active_players:
             if other.user_id != user_id:
                 other.acted = False
@@ -263,119 +307,210 @@ class PokerGame:
         end = self._advance()
         return True, msg + ("\n" + end if end else "")
 
-    # ── Advancement ────────────────────────────────────────────────────────
+    # Advancement
 
     def _advance(self) -> str:
-        # Only one player left — they win
         alive = self.players_in_hand
         if len(alive) == 1:
-            winner = alive[0]
+            winner        = alive[0]
             winner.chips += self.pot
-            msg = f"🏆 **{winner.display_name}** wins **{self.pot}** chips (all others folded)!"
-            self._hand_result = self._build_result([winner])
+            self._hand_result = self._build_fold_result(winner)
             self._end_hand()
-            return msg
+            return f"🏆 **{winner.display_name}** wins **{self.pot}** chips (all others folded)!"
 
         if self._betting_closed():
             return self._next_street()
 
-        # Move to the next player who can act
         self.current_idx = self._next_active_idx((self.current_idx + 1) % len(self.players))
         return ""
 
     def _betting_closed(self) -> bool:
         """
-        Betting is closed when every player who can act has:
-        1. Acted at least once this street, AND
-        2. Their bet matches the current bet (or they're all-in)
+        Betting closes when all active players have acted and matched current_bet.
+        When the last active player calls all-in, they become all_in=True,
+        so active_players becomes empty and this returns True immediately.
         """
-        active = self.active_players  # not folded, not all-in
+        active = self.active_players
         if not active:
-            return True   # everyone is all-in or folded — run out the board
-
+            return True
         for p in active:
             if not p.acted:
-                return False          # hasn't acted yet this street
-            if p.bet < self.current_bet:
-                return False          # hasn't matched the bet
-
+                return False
+            if p.bet < self.current_bet and p.chips > 0:
+                return False
         return True
 
     def _next_active_idx(self, start_idx: int) -> int:
-        """Find the next index (from start_idx) of a player who can act."""
         n = len(self.players)
         for i in range(n):
             idx = (start_idx + i) % n
             p   = self.players[idx]
             if not p.folded and not p.all_in:
                 return idx
-        # All remaining are all-in — return current (won't be asked to act)
         return self.current_idx
 
     def _next_street(self) -> str:
         for p in self.players:
             p.reset_for_street()
-        self.current_bet  = 0
-        self.last_raiser  = None
-
-        # First to act post-flop: first active player left of dealer
-        n = len(self.players)
+        self.current_bet = 0
+        self.last_raiser = None
+        n     = len(self.players)
         start = (self.dealer_idx + 1) % n
         self.current_idx = self._next_active_idx(start)
 
         if self.street == Street.PREFLOP:
             self.street     = Street.FLOP
             self.community += self.deck.draw(3)
-            return f"🌊 **Flop:** {hand_str(self.community)}  |  Pot: {self.pot}"
+            msg = f"🌊 **Flop:** {hand_str(self.community)}  |  Pot: {self.pot}"
         elif self.street == Street.FLOP:
             self.street     = Street.TURN
             self.community += self.deck.draw(1)
-            return f"↩️ **Turn:** {hand_str(self.community)}  |  Pot: {self.pot}"
+            msg = f"↩️ **Turn:** {hand_str(self.community)}  |  Pot: {self.pot}"
         elif self.street == Street.TURN:
             self.street     = Street.RIVER
             self.community += self.deck.draw(1)
-            return f"🏁 **River:** {hand_str(self.community)}  |  Pot: {self.pot}"
+            msg = f"🏁 **River:** {hand_str(self.community)}  |  Pot: {self.pot}"
         elif self.street == Street.RIVER:
             return self._showdown()
-        return ""
+        else:
+            return ""
+
+        # After dealing: if 0 active players, run board automatically.
+        # If 1 active player, they have no one left to bet against —
+        # mark them acted and immediately advance (streets auto-run without prompting).
+        active = self.active_players
+        if len(active) == 0:
+            tail = self._next_street()
+            return msg + ("\n" + tail if tail else "")
+        if len(active) == 1:
+            active[0].acted = True
+            tail = self._next_street()
+            return msg + ("\n" + tail if tail else "")
+
+        return msg
+
+    # Side pots
+
+    def _compute_side_pots(self) -> list[SidePot]:
+        in_hand = self.players_in_hand
+        all_p   = self.players
+        levels  = sorted(set(p.total_bet for p in in_hand if p.total_bet > 0))
+        pots: list[SidePot] = []
+        prev = 0
+        for level in levels:
+            amount   = sum(min(p.total_bet, level) - min(p.total_bet, prev) for p in all_p)
+            eligible = [p for p in in_hand if p.total_bet >= level]
+            if amount > 0 and eligible:
+                pots.append(SidePot(amount=amount, eligible=eligible))
+            prev = level
+        leftover = self.pot - sum(sp.amount for sp in pots)
+        if leftover > 0 and pots:
+            pots[-1].amount += leftover
+        elif leftover > 0 and in_hand:
+            pots.append(SidePot(amount=leftover, eligible=in_hand))
+        return pots
+
+    # Showdown
 
     def _showdown(self) -> str:
-        self.street  = Street.SHOWDOWN
-        alive        = self.players_in_hand
-        scores       = {p.user_id: evaluator.evaluate(p.hole_cards, self.community) for p in alive}
-        best         = min(scores.values())
-        winners      = [p for p in alive if scores[p.user_id] == best]
-        split        = self.pot // len(winners)
-        for w in winners:
-            w.chips += split
+        self.street = Street.SHOWDOWN
+        alive       = self.players_in_hand
+        scores      = {p.user_id: evaluator.evaluate(p.hole_cards, self.community)
+                       for p in alive}
+
+        pots        = self._compute_side_pots()
+        chip_deltas = {p.user_id: -p.total_bet for p in self.players}
+        pot_results = []
+
+        for sp in pots:
+            best      = min(scores[p.user_id] for p in sp.eligible)
+            winners   = [p for p in sp.eligible if scores[p.user_id] == best]
+            each      = sp.amount // len(winners)
+            remainder = sp.amount - each * len(winners)
+            for i, w in enumerate(winners):
+                award = each + (remainder if i == 0 else 0)
+                w.chips               += award
+                chip_deltas[w.user_id] += award
+            pot_results.append((sp.amount, winners))
 
         lines = ["🃏 **Showdown!**", f"Board: {hand_str(self.community)}"]
         for p in alive:
             rank_str = evaluator.class_to_string(evaluator.get_rank_class(scores[p.user_id]))
             lines.append(f"  **{p.display_name}**: {hand_str(p.hole_cards)} → *{rank_str}*")
-        if len(winners) == 1:
-            lines.append(f"\n🏆 **{winners[0].display_name}** wins **{self.pot}** chips!")
-        else:
-            names = ", ".join(w.display_name for w in winners)
-            lines.append(f"\n🤝 Split pot! **{names}** each win **{split}** chips.")
+        lines.append("")
 
-        self._hand_result = self._build_result(winners, scores)
+        if len(pots) == 1:
+            amt, winners = pot_results[0]
+            if len(winners) == 1:
+                lines.append(f"🏆 **{winners[0].display_name}** wins **{amt}** chips!")
+            else:
+                each  = amt // len(winners)
+                names = ", ".join(w.display_name for w in winners)
+                lines.append(f"🤝 Split — **{names}** each win **{each}** chips.")
+        else:
+            for i, (amt, winners) in enumerate(pot_results):
+                label = "Main pot" if i == 0 else f"Side pot {i}"
+                each  = amt // len(winners)
+                if len(winners) == 1:
+                    lines.append(f"🏆 **{label}** ({amt}🪙): **{winners[0].display_name}**")
+                else:
+                    names = ", ".join(w.display_name for w in winners)
+                    lines.append(f"🤝 **{label}** ({amt}🪙): **{names}** ({each}🪙 each)")
+
+        seen        = set()
+        all_winners = []
+        for _, ws in pot_results:
+            for w in ws:
+                if w.user_id not in seen:
+                    seen.add(w.user_id)
+                    all_winners.append(w)
+
+        winner_ranks = {
+            w.user_id: evaluator.class_to_string(evaluator.get_rank_class(scores[w.user_id]))
+            for w in all_winners
+        }
+
+        self.side_pots    = pots
+        self._hand_result = HandResult(
+            winners      = all_winners,
+            pot          = self.pot,
+            summary      = "\n".join(lines),
+            chip_deltas  = chip_deltas,
+            winner_ranks = winner_ranks,
+            pot_results  = pot_results,
+        )
         self._end_hand()
         return "\n".join(lines)
 
-    def _build_result(self, winners: list, scores: dict = None) -> HandResult:
-        deltas = {}
+    def force_fold(self, user_id: int) -> tuple[bool, str]:
+        """Force a player to fold regardless of turn (for kick/admin)."""
+        p = self.get_player(user_id)
+        if not p:
+            return False, "Player not found."
+        if p.folded:
+            return False, "Already folded."
+        p.folded = True
+        p.acted  = True
+        msg = f"🏳️ **{p.display_name}** was force-folded."
+        # If it was their turn, advance
+        if self.is_turn(user_id) or not self.current_player():
+            end = self._advance()
+            return True, msg + ("\n" + end if end else "")
+        # If not their turn, check if folding them closes betting
+        if self._betting_closed():
+            end = self._next_street()
+            return True, msg + ("\n" + end if end else "")
+        return True, msg
+
+    def _build_fold_result(self, winner: "PokerPlayer") -> HandResult:
+        deltas = {p.user_id: -p.total_bet for p in self.players}
+        deltas[winner.user_id] += self.pot
+        lines = [f"Hand #{self.hand_num} | Pot: {self.pot}",
+                 f"Winner: {winner.display_name} (all folded)"]
         for p in self.players:
-            if any(w.user_id == p.user_id for w in winners):
-                deltas[p.user_id] = (self.pot // len(winners)) - p.total_bet
-            else:
-                deltas[p.user_id] = -p.total_bet
-        lines = [f"Hand #{self.hand_num} | Pot: {self.pot}"]
-        lines.append("Winners: " + ", ".join(w.display_name for w in winners))
-        for p in self.players:
-            sign = "+" if deltas[p.user_id] >= 0 else ""
-            lines.append(f"  {p.display_name}: {sign}{deltas[p.user_id]}")
-        return HandResult(winners=winners, pot=self.pot,
+            d = deltas[p.user_id]
+            lines.append(f"  {p.display_name}: {'+' if d >= 0 else ''}{d}")
+        return HandResult(winners=[winner], pot=self.pot,
                           summary="\n".join(lines), chip_deltas=deltas)
 
     def _end_hand(self):
@@ -384,3 +519,8 @@ class PokerGame:
             self.dealer_idx = (self.dealer_idx + 1) % len(self.players)
         self.community = []
         self.pot       = 0
+        for p in self.players:
+            p.bet       = 0
+            p.total_bet = 0
+            p.folded    = False
+            p.all_in    = False

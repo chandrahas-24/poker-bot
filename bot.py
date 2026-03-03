@@ -15,7 +15,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await init_db()
 
-    # ── Crash recovery: return any chips that were in-game when bot went offline
     recovered = await recover_chips_in_play()
     if recovered:
         print(f"⚠️  Recovered chips for {len(recovered)} player(s) after restart:")
@@ -35,6 +34,15 @@ async def on_ready():
         print("✅ Synced commands globally")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    # Hook into poker cog for embed resend counter
+    from poker import on_channel_message
+    await on_channel_message(message)
+    await bot.process_commands(message)
 
 if __name__ == "__main__":
     token = os.getenv("BOT_TOKEN")

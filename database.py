@@ -48,25 +48,43 @@ async def init_db():
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id        INTEGER PRIMARY KEY,
-                small_blind     INTEGER DEFAULT 25,
-                big_blind       INTEGER DEFAULT 50,
-                min_wallet      INTEGER DEFAULT 50,
-                next_hand_delay INTEGER DEFAULT 30,
-                manager_role_id INTEGER DEFAULT NULL,
-                log_channel_id  INTEGER DEFAULT NULL
+                guild_id          INTEGER PRIMARY KEY,
+                small_blind       INTEGER DEFAULT 25,
+                big_blind         INTEGER DEFAULT 50,
+                min_wallet        INTEGER DEFAULT 50,
+                next_hand_delay   INTEGER DEFAULT 30,
+                manager_role_id   INTEGER DEFAULT NULL,
+                log_channel_id    INTEGER DEFAULT NULL,
+                turn_timeout      INTEGER DEFAULT 300,
+                resend_after_msgs INTEGER DEFAULT 10
             )
         """)
-        # Add column if upgrading from older DB
-        try:
-            await db.execute("ALTER TABLE guild_settings ADD COLUMN next_hand_delay INTEGER DEFAULT 30")
-        except Exception:
-            pass
+        # Add columns if upgrading from older DB
+        for col, default in [
+            ("next_hand_delay", 30),
+            ("turn_timeout", 300),
+            ("resend_after_msgs", 10),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE guild_settings ADD COLUMN {col} INTEGER DEFAULT {default}")
+            except Exception:
+                pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chips_in_play (
                 user_id  INTEGER PRIMARY KEY,
                 username TEXT NOT NULL,
                 amount   INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS poker_bans (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   INTEGER NOT NULL,
+                user_id    INTEGER NOT NULL,
+                username   TEXT NOT NULL,
+                table_name TEXT,       -- NULL = server-wide ban, otherwise table-specific
+                banned_by  INTEGER NOT NULL,
+                ts         TEXT NOT NULL
             )
         """)
         await db.execute("""
@@ -92,23 +110,29 @@ async def get_settings(guild_id: int) -> dict:
                 return dict(row)
             return {"guild_id": guild_id, "small_blind": 25, "big_blind": 50,
                     "min_wallet": 50, "next_hand_delay": 30,
-                    "manager_role_id": None, "log_channel_id": None}
+                    "manager_role_id": None, "log_channel_id": None,
+                    "turn_timeout": 300, "resend_after_msgs": 10}
 
 async def set_settings(guild_id: int, **kwargs):
     current = await get_settings(guild_id)
     current.update({k: v for k, v in kwargs.items() if v is not None})
     async with aiosqlite.connect(DB_PATH) as db:
+        # Ensure new keys have defaults if missing
+        current.setdefault("turn_timeout", 300)
+        current.setdefault("resend_after_msgs", 10)
         await db.execute("""
             INSERT INTO guild_settings
-                (guild_id, small_blind, big_blind, min_wallet, next_hand_delay, manager_role_id, log_channel_id)
-            VALUES (:guild_id, :small_blind, :big_blind, :min_wallet, :next_hand_delay, :manager_role_id, :log_channel_id)
+                (guild_id, small_blind, big_blind, min_wallet, next_hand_delay, manager_role_id, log_channel_id, turn_timeout, resend_after_msgs)
+            VALUES (:guild_id, :small_blind, :big_blind, :min_wallet, :next_hand_delay, :manager_role_id, :log_channel_id, :turn_timeout, :resend_after_msgs)
             ON CONFLICT(guild_id) DO UPDATE SET
-                small_blind     = :small_blind,
-                big_blind       = :big_blind,
-                min_wallet      = :min_wallet,
-                next_hand_delay = :next_hand_delay,
-                manager_role_id = :manager_role_id,
-                log_channel_id  = :log_channel_id
+                small_blind       = :small_blind,
+                big_blind         = :big_blind,
+                min_wallet        = :min_wallet,
+                next_hand_delay   = :next_hand_delay,
+                manager_role_id   = :manager_role_id,
+                log_channel_id    = :log_channel_id,
+                turn_timeout      = :turn_timeout,
+                resend_after_msgs = :resend_after_msgs
         """, current)
         await db.commit()
 
@@ -185,7 +209,7 @@ async def get_leaderboard(limit: int = 10) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
-            SELECT s.username, s.hands_played, s.hands_won, s.chips_won, s.chips_lost,
+            SELECT s.user_id, s.username, s.hands_played, s.hands_won, s.chips_won, s.chips_lost,
                    (s.chips_won - s.chips_lost) AS net_chips,
                    COALESCE(w.balance, 0) AS wallet
             FROM stats s LEFT JOIN wallets w ON s.user_id = w.user_id
@@ -262,6 +286,80 @@ async def write_audit(action: str, user_id: int, user_name: str, detail: str = "
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
+# ── Bans ──────────────────────────────────────────────────────────────────────
+
+async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int, table_name: str | None = None):
+    """Ban user server-wide (table_name=None) or from a specific table."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Avoid duplicate bans
+        async with db.execute(
+            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND (table_name IS ? OR (table_name IS NOT NULL AND table_name=?))",
+            (guild_id, user_id, table_name, table_name)
+        ) as c:
+            if await c.fetchone():
+                return False  # already banned at this scope
+        await db.execute(
+            "INSERT INTO poker_bans (guild_id, user_id, username, table_name, banned_by, ts) VALUES (?,?,?,?,?,?)",
+            (guild_id, user_id, username, table_name, banned_by, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+        )
+        await db.commit()
+    return True
+
+async def unban_player(guild_id: int, user_id: int, table_name: str | None = None) -> int:
+    """Remove ban. Returns number of bans removed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if table_name is None:
+            # Remove ALL bans for this user in this guild
+            async with db.execute(
+                "SELECT COUNT(*) FROM poker_bans WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)
+            ) as c:
+                count = (await c.fetchone())[0]
+            await db.execute("DELETE FROM poker_bans WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        else:
+            # Remove only the table-specific ban
+            async with db.execute(
+                "SELECT COUNT(*) FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                (guild_id, user_id, table_name)
+            ) as c:
+                count = (await c.fetchone())[0]
+            await db.execute(
+                "DELETE FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                (guild_id, user_id, table_name)
+            )
+        await db.commit()
+        return count
+
+async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
+    """True if user is server-wide banned OR banned from specific table_name."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Always check server-wide ban first
+        async with db.execute(
+            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
+            (guild_id, user_id)
+        ) as c:
+            if await c.fetchone():
+                return True
+        # Then check table-specific ban if table_name provided
+        if table_name:
+            async with db.execute(
+                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                (guild_id, user_id, table_name)
+            ) as c:
+                if await c.fetchone():
+                    return True
+    return False
+
+async def delete_player_stats(user_id: int) -> bool:
+    """Remove a player's stats entry from the leaderboard. Returns True if found."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM stats WHERE user_id=?", (user_id,)) as c:
+            if not await c.fetchone():
+                return False
+        await db.execute("DELETE FROM stats WHERE user_id=?", (user_id,))
+        await db.commit()
+    return True
+
 async def reset_database(admin_id: int, admin_name: str):
     """Wipe all gameplay data and log who did it."""
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -272,6 +370,7 @@ async def reset_database(admin_id: int, admin_name: str):
         await db.execute("DELETE FROM chip_log")
         await db.execute("DELETE FROM chips_in_play")
         await db.execute("DELETE FROM guild_settings")
+        await db.execute("DELETE FROM poker_bans")
         # Keep audit_log intact — insert the reset event after clearing everything else
         await db.execute("""
             INSERT INTO audit_log (ts, action, user_id, user_name, detail)

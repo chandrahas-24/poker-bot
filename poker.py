@@ -1,7 +1,4 @@
-"""
-poker.py — Texas Hold'em bot
-All commands under /poker prefix. Tables have names/IDs. Auto-next-hand. Threads for logging.
-"""
+"""poker.py — Texas Hold'em bot"""
 
 import discord
 from discord import app_commands
@@ -10,35 +7,34 @@ from engine import PokerGame, Street, hand_str
 import database as db
 from treys import Evaluator
 import card_images
-import os
-import asyncio
-import uuid
+import os, asyncio, uuid
 from datetime import datetime
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
 
-TURN_TIMEOUT        = 300   # 5 min
-NEXT_HAND_DELAY_DEFAULT = 30  # seconds between hands (overridden per guild)
+TURN_TIMEOUT_DEFAULT    = 300
+NEXT_HAND_DELAY_DEFAULT = 30
+TABLE_RESEND_MSGS       = 10
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# ── TableState ────────────────────────────────────────────────────────────────
 
 class TableState:
-    def __init__(self, name: str):
-        self.id         = str(uuid.uuid4())[:8]   # short unique ID
-        self.name       = name
-        self.game       = PokerGame()
+    def __init__(self, name: str, manager_id: int):
+        self.id           = str(uuid.uuid4())[:8]
+        self.name         = name
+        self.manager_id   = manager_id
+        self.game         = PokerGame()
+        self.hand_msg:    discord.Message | None = None
+        self.board_file: discord.File | None = None  # card strip to attach on next embed edit
+        self.ping_msg:    discord.Message | None = None
+        self.between_msg: discord.Message | None = None
+        self.street_log:  list[str] = []
+        self.closing      = False
+        self.auto_task:   asyncio.Task | None = None
+        self.timer_task:  asyncio.Task | None = None
+        self.msg_count    = 0
 
-        self.hand_msg:  discord.Message | None = None
-        self.board_msg: discord.Message | None = None
-        self.ping_msg:  discord.Message | None = None
-        self.log_thread: discord.Thread | None = None
-        self.street_log: list[str] = []
-        self.closing    = False    # set when /poker close is used
-        self.auto_task: asyncio.Task | None = None
-        self.timer_task: asyncio.Task | None = None
-
-# key = (guild_id, channel_id)
 tables: dict[tuple, TableState] = {}
 
 def get_table(key: tuple) -> TableState | None:
@@ -50,20 +46,31 @@ def slog(t: TableState, text: str):
 def slog_clear(t: TableState):
     t.street_log = []
 
-# ── Permission helper ─────────────────────────────────────────────────────────
+# ── Permissions ───────────────────────────────────────────────────────────────
 
 async def is_manager(interaction: discord.Interaction) -> bool:
-    """Poker Manager = has the configured manager role. No extra server perms needed."""
     settings = await db.get_settings(interaction.guild_id)
     role_id  = settings.get("manager_role_id")
-    if interaction.user.id == 1339935869598961728:
-        return True
     if role_id:
         role = interaction.guild.get_role(int(role_id))
         if role and role in interaction.user.roles:
             return True
-    # Fallback: server admin can always manage
     return interaction.user.guild_permissions.administrator
+
+# ── Message counter ───────────────────────────────────────────────────────────
+
+async def on_channel_message(message: discord.Message):
+    key = (message.guild.id, message.channel.id)
+    t   = get_table(key)
+    if not t or t.game.street == Street.WAITING:
+        return
+    t.msg_count += 1
+    settings = await db.get_settings(message.guild.id)
+    threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
+    if t.msg_count >= threshold:
+        t.msg_count = 0
+        t.hand_msg  = None
+        await refresh(message.channel, t, new_hand=True)
 
 # ── Turn timer ────────────────────────────────────────────────────────────────
 
@@ -80,14 +87,15 @@ def start_timer(t: TableState, channel):
     t.timer_task = asyncio.create_task(_turn_timer(t, channel, cp.user_id))
 
 async def _turn_timer(t: TableState, channel, user_id: int):
+    settings = await db.get_settings(channel.guild.id)
+    timeout  = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
     try:
-        await asyncio.sleep(TURN_TIMEOUT)
+        await asyncio.sleep(timeout)
     except asyncio.CancelledError:
         return
 
     if not t.game.is_turn(user_id):
         return
-
     p = t.game.get_player(user_id)
     if not p:
         return
@@ -103,17 +111,16 @@ async def _turn_timer(t: TableState, channel, user_id: int):
         await db.clear_chips_in_play(user_id)
 
     try:
-        await channel.send(f"⏰ **{name}** timed out — auto-folded and removed. Chips returned to wallet.")
+        await channel.send(f"⏰ **{name}** timed out — auto-folded and removed. Chips returned.")
     except Exception:
         pass
 
-    key = (channel.guild.id, channel.id)
     if t.game._hand_result:
         await _process_result(channel.guild, channel, t)
+    else:
+        await refresh(channel, t)
 
-    await refresh(channel, t)
-
-# ── Auto next hand ─────────────────────────────────────────────────────────────
+# ── Auto next hand ────────────────────────────────────────────────────────────
 
 def schedule_next_hand(t: TableState, channel):
     if t.auto_task and not t.auto_task.done():
@@ -121,13 +128,12 @@ def schedule_next_hand(t: TableState, channel):
     t.auto_task = asyncio.create_task(_auto_next_hand(t, channel))
 
 async def _auto_next_hand(t: TableState, channel):
-    # Fetch configured delay
     settings = await db.get_settings(channel.guild.id)
     delay    = settings.get("next_hand_delay", NEXT_HAND_DELAY_DEFAULT)
 
-    # Post countdown notice
     try:
-        await channel.send(f"⏳ Next hand starting in **{delay}s**...")
+        view = BetweenHandsView(t)
+        t.between_msg = await channel.send(f"⏳ Next hand starting in **{delay}s**...", view=view)
     except Exception:
         pass
 
@@ -136,28 +142,45 @@ async def _auto_next_hand(t: TableState, channel):
     except asyncio.CancelledError:
         return
 
+    if t.between_msg:
+        try:
+            await t.between_msg.delete()
+        except Exception:
+            pass
+        t.between_msg = None
+
     if t.closing:
         await _close_table(channel, t)
         return
 
-    # Process any pending leaves first
+    # Process pending leaves (including kicks)
     for uid in list(t.game.pending_leaves):
         p = t.game.get_player(uid)
         if p:
             await db.return_chips(uid, p.chips)
             await db.clear_chips_in_play(uid)
 
-    # Check if enough players remain (including pending joins)
-    active = [p for p in t.game.players if p.chips > 0]
-    total  = len(active) + len(t.game.pending_joins)
+    # Auto-remove players below big blind
+    bb = t.game.BIG_BLIND
+    for p in list(t.game.players):
+        if p.chips < bb and p.user_id not in t.game.pending_leaves:
+            if p.chips > 0:
+                await db.return_chips(p.user_id, p.chips)
+            await db.clear_chips_in_play(p.user_id)
+            t.game.pending_leaves.append(p.user_id)
+            try:
+                await channel.send(
+                    f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** 🪙) is below the big blind (**{bb}** 🪙). Chips returned to wallet.")
+            except Exception:
+                pass
+
+    active             = [p for p in t.game.players if p.chips >= bb and p.user_id not in t.game.pending_leaves]
+    pending_with_chips = [p for p in t.game.pending_joins if p.chips >= bb]
+    total              = len(active) + len(pending_with_chips)
     if total < 2:
-        await channel.send(
-            "⚠️ Not enough players for another hand. Table is waiting — a Manager can `/poker start` when ready."
-        )
+        await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
 
-    # Load settings
-    settings = await db.get_settings(channel.guild.id)
     t.game.SMALL_BLIND = settings["small_blind"]
     t.game.BIG_BLIND   = settings["big_blind"]
 
@@ -169,32 +192,28 @@ async def _auto_next_hand(t: TableState, channel):
         await channel.send(f"⚠️ Could not start next hand: {msg}")
         return
 
+    t.msg_count = 0
     await refresh(channel, t, new_hand=True)
 
 async def _close_table(channel, t: TableState):
-    """Return all chips and remove table after hand ends."""
     key = (channel.guild.id, channel.id)
+    # Return chips for seated players not already paid out via pending_leaves
     for p in list(t.game.players):
-        if p.chips > 0:
+        if p.user_id not in t.game.pending_leaves and p.chips > 0:
             await db.return_chips(p.user_id, p.chips)
             await db.clear_chips_in_play(p.user_id)
+    # Return chips for pending joins
     for p in list(t.game.pending_joins):
         await db.return_chips(p.user_id, p.chips)
         await db.clear_chips_in_play(p.user_id)
     tables.pop(key, None)
-    await channel.send(f"🚪 **Table '{t.name}'** has been closed. All chips returned to wallets.")
+    await channel.send(f"🚪 **Table '{t.name}'** closed. All chips returned.")
 
-# ── Log to thread ─────────────────────────────────────────────────────────────
+# ── Log thread ────────────────────────────────────────────────────────────────
 
-# One shared log thread per guild (created once, reused forever)
 _log_threads: dict[int, discord.Thread] = {}
 
 async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
-    """
-    Get the single shared poker log thread for this guild.
-    Creates it once if it doesn't exist yet, then reuses it forever.
-    All hand logs are posted as plain messages inside the same thread.
-    """
     settings  = await db.get_settings(channel.guild.id)
     log_ch_id = settings.get("log_channel_id")
     if not log_ch_id:
@@ -202,8 +221,6 @@ async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
     log_ch = channel.guild.get_channel(int(log_ch_id))
     if not log_ch:
         return None
-
-    # Return cached thread if still alive
     existing = _log_threads.get(channel.guild.id)
     if existing:
         try:
@@ -211,31 +228,74 @@ async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
             return existing
         except Exception:
             _log_threads.pop(channel.guild.id, None)
-
-    # Check if a "Poker Hand Log" thread already exists in the channel
     if hasattr(log_ch, 'threads'):
         for thread in log_ch.threads:
             if thread.name == "Poker Hand Log":
                 _log_threads[channel.guild.id] = thread
                 return thread
-
-    # Create it for the first time
     try:
-        thread = await log_ch.create_thread(
-            name="Poker Hand Log",
-            type=discord.ChannelType.public_thread
-        )
+        thread = await log_ch.create_thread(name="Poker Hand Log", type=discord.ChannelType.public_thread)
         _log_threads[channel.guild.id] = thread
         return thread
     except Exception:
         return None
 
-async def post_hand_log(channel, t: TableState, summary: str):
+async def post_hand_log(channel, t: TableState, result):
+    thread = await ensure_log_thread(channel, t)
+    if not thread:
+        return
+    game  = t.game
+    lines = [f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"]
+
+    # Helper: get "username (user_id)" for a user_id
+    async def uid_str(uid):
+        try:
+            m = channel.guild.get_member(uid) or await channel.guild.fetch_member(uid)
+            return f"{m.name} ({uid})"
+        except Exception:
+            p = game.get_player(uid)
+            return f"{p.display_name if p else uid} ({uid})"
+
+    # Community cards
+    if game.community:
+        from engine import hand_str
+        lines.append(f"Board: {hand_str(game.community)}")
+
+    # Each player's hole cards + result
+    pot_results = result.pot_results or []
+    ranks       = result.winner_ranks or {}
+    for p in t.game.players:
+        delta = result.chip_deltas.get(p.user_id, 0)
+        sign  = "+" if delta >= 0 else ""
+        ustr  = await uid_str(p.user_id)
+        rank  = ranks.get(p.user_id)
+        from engine import hand_str as hs
+        cards = hs(p.hole_cards) if p.hole_cards else "folded"
+        rank_part = f" [{rank}]" if rank else ""
+        lines.append(f"  {ustr}: {cards}{rank_part}  {sign}{delta}")
+
+    # Pot outcomes
+    if pot_results:
+        for i, (amt, winners) in enumerate(pot_results):
+            label  = "Main pot" if i == 0 else f"Side pot {i}"
+            wstrs  = [await uid_str(w.user_id) for w in winners]
+            each   = amt // len(winners)
+            lines.append(f"  {label} ({amt}): {', '.join(wstrs)}" + (f" ({each} each)" if len(winners) > 1 else ""))
+    else:
+        # Fold win
+        for w in result.winners:
+            lines.append(f"  Winner (fold): {await uid_str(w.user_id)}")
+
+    body = "\n".join(lines)
+    await thread.send(f"```\n{body}\n```")
+
+async def post_tip_log(channel, t: TableState, tipper: str, amount: int, recipient: str):
     thread = await ensure_log_thread(channel, t)
     if thread:
-        await thread.send(f"**Table: {t.name}** `{t.id}`\n```\n{summary}\n```")
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        await thread.send(f"💸 **Tip** [{ts}] — {tipper} tipped **{amount}** 🪙 to **{recipient}** at table `{t.name}`")
 
-# ── Embed builder ─────────────────────────────────────────────────────────────
+# ── Embed ─────────────────────────────────────────────────────────────────────
 
 STREET_COLOR = {
     Street.WAITING:  0x5865F2,
@@ -255,7 +315,7 @@ STREET_LABEL = {
 }
 
 def player_line(p, game: PokerGame, idx: int) -> str:
-    tag = " 🎰" if idx == game.dealer_idx else ""
+    tag     = " 🎰" if idx == game.dealer_idx else ""
     mention = f"<@{p.user_id}>"
     if p.folded:
         return f"~~{mention}~~ ~~{p.chips} 🪙~~ — folded{tag}"
@@ -275,81 +335,178 @@ def build_embed(t: TableState) -> discord.Embed:
     color = STREET_COLOR.get(game.street, 0x5865F2)
     label = STREET_LABEL.get(game.street, "")
     cp    = game.current_player()
-
     title = f"🃏 {t.name}  ·  Hand #{game.hand_num}" if game.hand_num else f"🃏 {t.name}"
     embed = discord.Embed(title=title, color=color)
-    embed.set_footer(text=f"{label}  ·  Table ID: {t.id}" + ("  ·  Closing after this hand" if t.closing else ""))
+    footer = f"{label}  ·  Table ID: {t.id}"
+    if t.closing:
+        footer += "  ·  Closing after this hand"
+    embed.set_footer(text=footer)
+    if t.board_file:
+        embed.set_image(url="attachment://cards.png")
 
     if game.street == Street.WAITING:
-        embed.description = "Press **Join** to sit down. Host uses `/poker start` to deal."
+        embed.description = "Press **Join** to sit down. Manager uses `/poker start` to deal."
     else:
-        desc = f"**Pot:** {game.pot} 🪙"
-        if game.current_bet:
-            desc += f"  ·  **Bet:** {game.current_bet}"
-        if cp:
-            desc += f"\n⬅️ **{cp.display_name}'s turn**"
-        embed.description = desc
+        embed.description = None
 
     lines = [player_line(p, game, i) for i, p in enumerate(game.players)]
     for p in game.pending_joins:
         lines.append(f"<@{p.user_id}> **{p.chips} 🪙** — ⏳ next hand")
     if lines:
-        embed.add_field(name="Players", value="\n".join(lines), inline=False)
+        embed.add_field(name=f"Players ({len(game.players)}/8)", value="\n".join(lines), inline=False)
 
-    logs = t.street_log
-    if logs:
-        embed.add_field(name="This round", value="\n".join(logs[-8:]), inline=False)
+    if t.street_log:
+        embed.add_field(name="This round", value="\n".join(t.street_log[-8:]), inline=False)
+
+    # Pot / turn as last field — sits right above the board image
+    if game.street not in (Street.WAITING,):
+        pot_line = f"**Pot:** {game.pot} 🪙"
+        if game.current_bet:
+            pot_line += f"  ·  **Bet:** {game.current_bet}"
+        if cp:
+            pot_line += f"\n⬅️ **{cp.display_name}'s turn**"
+        embed.add_field(name="\u200b", value=pot_line, inline=False)
 
     return embed
 
 # ── Board image ───────────────────────────────────────────────────────────────
 
-async def update_board(channel, t: TableState):
+def update_board(t: TableState):
+    """Generate card strip File object — attached directly to the embed message."""
     game = t.game
-    if not USE_IMAGES or game.street in (Street.WAITING, Street.PREFLOP):
+    if not USE_IMAGES or game.street in (Street.WAITING, Street.PREFLOP) or not game.community:
+        t.board_file = None
         return
-    strip   = card_images.make_strip(game.community, backs=5 - len(game.community))
-    names   = {Street.FLOP: "Flop", Street.TURN: "Turn",
-               Street.RIVER: "River", Street.SHOWDOWN: "Showdown"}
-    caption = f"Board — {names.get(game.street, '')}  |  Pot: {game.pot} 🪙"
-    if t.board_msg:
-        try: await t.board_msg.delete()
-        except discord.NotFound: pass
-    t.board_msg = await channel.send(caption, file=strip)
+    backs = max(0, 5 - len(game.community))
+    t.board_file = card_images.make_strip(game.community, backs=backs, )
 
 # ── Turn ping ─────────────────────────────────────────────────────────────────
 
 async def send_turn_ping(channel, t: TableState):
     if t.ping_msg:
-        try: await t.ping_msg.delete()
-        except discord.NotFound: pass
+        try:
+            await t.ping_msg.delete()
+        except discord.NotFound:
+            pass
         t.ping_msg = None
     cp = t.game.current_player()
     if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
         return
     call_amt = t.game.call_amount(cp)
-    hint = f"call **{call_amt}**, raise, or fold" if call_amt else "check or raise"
+    hint     = f"call **{call_amt}**, raise, or fold" if call_amt else "check or raise"
     t.ping_msg = await channel.send(f"<@{cp.user_id}> your turn — {hint}")
 
-# ── Master refresh ────────────────────────────────────────────────────────────
+# ── Refresh ───────────────────────────────────────────────────────────────────
 
 async def refresh(channel, t: TableState, new_hand: bool = False):
-    embed = build_embed(t)
+    update_board(t)          # generate File (sync, no upload needed)
+    embed = build_embed(t)   # sets attachment://board.png if file present
     view  = GameView(t)
-
+    f     = t.board_file
     if new_hand or not t.hand_msg:
-        t.hand_msg = await channel.send(embed=embed, view=view)
+        t.hand_msg = await channel.send(embed=embed, view=view, file=f)
     else:
         try:
-            await t.hand_msg.edit(embed=embed, view=view)
+            # Edit with new attachment — Discord replaces the previous one
+            await t.hand_msg.edit(embed=embed, view=view, attachments=([f] if f else []))
         except (discord.NotFound, discord.HTTPException):
-            t.hand_msg = await channel.send(embed=embed, view=view)
-
-    await update_board(channel, t)
+            t.hand_msg = await channel.send(embed=embed, view=view, file=f)
+    t.board_file = None  # consumed
     await send_turn_ping(channel, t)
     start_timer(t, channel)
 
-# ── Post-hand processing ──────────────────────────────────────────────────────
+# ── Post-hand ─────────────────────────────────────────────────────────────────
+
+def _slog_result(t: TableState, result):
+    """Put a clean winner line into street_log so the embed shows correct info."""
+    game        = t.game
+    ranks       = result.winner_ranks or {}
+    pot_results = result.pot_results
+
+    if not pot_results or len(pot_results) == 1:
+        if len(result.winners) == 1:
+            w      = result.winners[0]
+            gained = result.chip_deltas.get(w.user_id, 0)
+            rank   = ranks.get(w.user_id)
+            rs     = f" ({rank})" if rank else ""
+            slog(t, f"🏆 **{w.display_name}** won **+{gained}** 🪙{rs}")
+        else:
+            split = result.pot // max(len(result.winners), 1)
+            names = ", ".join(f"**{w.display_name}**" for w in result.winners)
+            slog(t, f"🤝 Split: {names} each **+{split}** 🪙")
+    else:
+        for i, (amt, winners) in enumerate(pot_results):
+            label = "Main" if i == 0 else f"Side {i}"
+            if len(winners) == 1:
+                w      = winners[0]
+                rank   = ranks.get(w.user_id)
+                rs     = f" ({rank})" if rank else ""
+                slog(t, f"🏆 **{label}** ({amt}🪙) → **{w.display_name}**{rs}")
+            else:
+                each  = amt // len(winners)
+                names = ", ".join(f"**{w.display_name}**" for w in winners)
+                slog(t, f"🤝 **{label}** ({amt}🪙) split → {names} ({each} each)")
+
+async def _announce_winner(channel, t: TableState, result):
+    game        = t.game
+    ranks       = result.winner_ranks or {}
+    pot_results = result.pot_results  # [(amount, [PokerPlayer, ...]), ...]
+
+    if not pot_results or len(pot_results) == 1:
+        # Single pot (or fold win — no pot_results)
+        if len(result.winners) == 1:
+            w      = result.winners[0]
+            gained = result.chip_deltas.get(w.user_id, 0)
+            rank   = ranks.get(w.user_id)
+            rs     = f" with **{rank}**" if rank else ""
+            await channel.send(
+                f"🏆 **{w.display_name}** won **+{gained}** chips from Hand #{game.hand_num}{rs}! "
+                f"(Pot: **{result.pot}** 🪙 | Stack: **{w.chips}** 🪙)"
+            )
+        else:
+            # True split
+            parts = []
+            for amt, winners in (pot_results or []):
+                each = amt // len(winners)
+                for w in winners:
+                    rank = ranks.get(w.user_id)
+                    parts.append(f"**{w.display_name}**" + (f" ({rank})" if rank else ""))
+            if not parts:
+                parts = [f"**{w.display_name}**" for w in result.winners]
+            split = result.pot // len(result.winners)
+            await channel.send(
+                f"🤝 Split pot — Hand #{game.hand_num}: {', '.join(parts)} each won **{split}** 🪙 "
+                f"(Pot: **{result.pot}** 🪙)"
+            )
+    else:
+        # Multiple side pots — use exact pot_results from engine (guaranteed correct)
+        lines = [f"🃏 **Hand #{game.hand_num} results** — {len(pot_results)} pots:"]
+        for i, (amt, winners) in enumerate(pot_results):
+            label = "Main pot" if i == 0 else f"Side pot {i}"
+            icon  = "🏆" if i == 0 else "🥈"
+            if len(winners) == 1:
+                w    = winners[0]
+                rank = ranks.get(w.user_id)
+                rs   = f" ({rank})" if rank else ""
+                gained = result.chip_deltas.get(w.user_id, 0)
+                lines.append(f"  {icon} **{label}** ({amt} 🪙) → **{w.display_name}**{rs}")
+            else:
+                each  = amt // len(winners)
+                parts = []
+                for w in winners:
+                    rank = ranks.get(w.user_id)
+                    parts.append(f"**{w.display_name}**" + (f" ({rank})" if rank else ""))
+                lines.append(f"  🤝 **{label}** ({amt} 🪙) split → {', '.join(parts)} ({each} 🪙 each)")
+        lines.append("")
+        # Per-winner final stacks
+        seen = set()
+        for _, winners in pot_results:
+            for w in winners:
+                if w.user_id not in seen:
+                    seen.add(w.user_id)
+                    gained = result.chip_deltas.get(w.user_id, 0)
+                    lines.append(f"  💰 **{w.display_name}**: +{gained} → **{w.chips}** 🪙")
+        await channel.send("\n".join(lines))
 
 async def _process_result(guild, channel, t: TableState):
     result = t.game._hand_result
@@ -360,53 +517,263 @@ async def _process_result(guild, channel, t: TableState):
     for p in t.game.players:
         net = result.chip_deltas.get(p.user_id, 0)
         won = any(w.user_id == p.user_id for w in result.winners)
-        await db.record_hand(p.user_id, p.display_name, won, net)
+        # Use global username (not server nickname) for persistent records
+        try:
+            member = guild.get_member(p.user_id) or await guild.fetch_member(p.user_id)
+            uname  = member.name  # global Discord username, never changes with nickname
+        except Exception:
+            uname = p.display_name  # fallback
+        await db.record_hand(p.user_id, uname, won, net)
 
-    # Update in-play amounts
     for p in t.game.players:
         if p.chips > 0:
             await db.update_chips_in_play(p.user_id, p.chips)
         else:
             await db.clear_chips_in_play(p.user_id)
+
     for uid in list(t.game.pending_leaves):
         p = t.game.get_player(uid)
         if p:
             await db.return_chips(uid, p.chips)
             await db.clear_chips_in_play(uid)
 
-    # Log hand
     await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
-    await post_hand_log(channel, t, result.summary)
+    await post_hand_log(channel, t, result)
+    await _announce_winner(channel, t, result)
+    # Put correct winner line into street_log so embed shows right info
+    _slog_result(t, result)
+    await refresh(channel, t)
+    if t.closing:
+        await _close_table(channel, t)
+    else:
+        schedule_next_hand(t, channel)
 
-    # Schedule next hand
-    schedule_next_hand(t, channel)
+# ── Between-hands view ────────────────────────────────────────────────────────
 
-# ── Raise modal ───────────────────────────────────────────────────────────────
+class TipModal(discord.ui.Modal, title="Tip Dealer"):
+    amount = discord.ui.TextInput(label="How many chips to tip?", placeholder="e.g. 50", min_length=1, max_length=7)
 
-class RaiseModal(discord.ui.Modal, title="Raise"):
-    amount = discord.ui.TextInput(label="Raise by how many chips?", placeholder="e.g. 200", min_length=1, max_length=7)
+    def __init__(self, t: TableState, wallet_bal: int = 0, table_chips: int = 0):
+        super().__init__()
+        self.t           = t
+        self.wallet_bal  = wallet_bal
+        self.table_chips = table_chips
+        total = wallet_bal + table_chips
+        self.amount.placeholder = f"e.g. 50  (table: {table_chips} | wallet: {wallet_bal} | total: {total})"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            tip = int(self.amount.value)
+        except ValueError:
+            await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
+        if tip <= 0:
+            await interaction.response.send_message("❌ Tip must be more than 0.", ephemeral=True); return
+
+        # Block self-tipping
+        if interaction.user.id == self.t.manager_id:
+            await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
+
+        p           = self.t.game.get_player(interaction.user.id)
+        table_chips = p.chips if p else 0
+        wallet_bal  = await db.get_balance(interaction.user.id)
+
+        from_table  = min(tip, table_chips)
+        from_wallet = tip - from_table
+
+        if from_wallet > wallet_bal:
+            await interaction.response.send_message(
+                f"❌ Not enough chips. Table: **{table_chips}**, Wallet: **{wallet_bal}**.", ephemeral=True); return
+
+        if from_table > 0 and p:
+            p.chips -= from_table
+            await db.update_chips_in_play(interaction.user.id, p.chips)
+        if from_wallet > 0:
+            ok = await db.deduct_chips(interaction.user.id, from_wallet)
+            if not ok:
+                if from_table > 0 and p:
+                    p.chips += from_table
+                    await db.update_chips_in_play(interaction.user.id, p.chips)
+                await interaction.response.send_message("❌ Failed to deduct wallet chips.", ephemeral=True); return
+
+        manager_id   = self.t.manager_id
+        manager_name = "Dealer"
+        try:
+            member = interaction.guild.get_member(manager_id) or await interaction.guild.fetch_member(manager_id)
+            manager_name = member.display_name
+        except Exception:
+            pass
+
+        await db.add_chips(interaction.user.id, interaction.user.display_name,
+                           manager_id, manager_name, tip, f"Tip from {interaction.user.display_name}")
+        await post_tip_log(interaction.channel, self.t, interaction.user.display_name, tip, manager_name)
+        await interaction.response.send_message(
+            f"💸 **{interaction.user.display_name}** tipped **{tip}** chips to **{manager_name}**!", ephemeral=False)
+
+class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
+    amount = discord.ui.TextInput(label="How many chips to add?", placeholder="e.g. 500", min_length=1, max_length=8)
+
+    def __init__(self, t: TableState, wallet_bal: int):
+        super().__init__()
+        self.t         = t
+        self.wallet_bal = wallet_bal
+        self.amount.placeholder = f"1–{wallet_bal}  (wallet: {wallet_bal})"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            chips = int(self.amount.value)
+        except ValueError:
+            await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
+        if chips <= 0:
+            await interaction.response.send_message("❌ Must be more than 0.", ephemeral=True); return
+        if chips > self.wallet_bal:
+            await interaction.response.send_message(
+                f"❌ You only have **{self.wallet_bal}** in your wallet.", ephemeral=True); return
+
+        ok = await db.deduct_chips(interaction.user.id, chips)
+        if not ok:
+            await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True); return
+
+        msg = self.t.game.queue_rebuy(interaction.user.id, chips)
+        await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+class BetweenHandsView(discord.ui.View):
+    def __init__(self, t: TableState):
+        super().__init__(timeout=None)
+        self.t = t
+
+    @discord.ui.button(label="Tip Dealer 💸", style=discord.ButtonStyle.blurple)
+    async def tip_dealer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        t = self.t
+        # Block self-tip
+        if interaction.user.id == t.manager_id:
+            await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
+        p           = t.game.get_player(interaction.user.id)
+        table_chips = p.chips if p else 0
+        wallet_bal  = await db.get_balance(interaction.user.id)
+        if table_chips == 0 and wallet_bal == 0:
+            await interaction.response.send_message("❌ You have no chips to tip with.", ephemeral=True); return
+        await interaction.response.send_modal(TipModal(t, wallet_bal, table_chips))
+
+    @discord.ui.button(label="Add Chips 💰", style=discord.ButtonStyle.green)
+    async def add_chips(self, interaction: discord.Interaction, button: discord.ui.Button):
+        t = self.t
+        p = t.game.get_player(interaction.user.id)
+        if not p:
+            # Check pending joins
+            pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
+            if not pj:
+                await interaction.response.send_message("❌ You're not at the table.", ephemeral=True); return
+        wallet_bal = await db.get_balance(interaction.user.id)
+        if wallet_bal <= 0:
+            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True); return
+        await interaction.response.send_modal(RebuyModal(t, wallet_bal))
+
+# ── Raise picker view ─────────────────────────────────────────────────────────
+
+class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
+    amount = discord.ui.TextInput(label="Raise BY how many chips?", placeholder="e.g. 200", min_length=1, max_length=7)
 
     def __init__(self, t: TableState, channel, guild):
         super().__init__()
         self.t = t; self.channel = channel; self.guild = guild
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Defer first — only one response allowed
+        await interaction.response.defer(ephemeral=True)
         try:
-            amount = int(self.amount.value)
+            raise_amount = int(self.amount.value)
         except ValueError:
-            await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
-        success, msg = self.t.game.raise_bet(interaction.user.id, amount)
+            await interaction.followup.send("❌ Enter a valid number.", ephemeral=True); return
+        uid = interaction.user.id
+        p   = self.t.game.get_player(uid)
+        if not p or not self.t.game.is_turn(uid):
+            await interaction.followup.send("❌ It's not your turn.", ephemeral=True); return
+        if raise_amount <= 0:
+            await interaction.followup.send("❌ Must be greater than 0.", ephemeral=True); return
+        success, msg = self.t.game.raise_bet(uid, raise_amount)
         if not success:
-            await interaction.response.send_message(msg, ephemeral=True); return
-        if any(m in msg for m in ["🌊", "↩️", "🏁", "🃏 **Showdown"]):
+            await interaction.followup.send(msg, ephemeral=True); return
+        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
             slog_clear(self.t)
         slog(self.t, msg)
+        if self.t.game._hand_result:
+            await _process_result(interaction.guild, self.channel, self.t)
+        else:
+            await refresh(self.channel, self.t)
+
+class RaisePickerView(discord.ui.View):
+    """Shown when player clicks Raise — offers preset options."""
+    def __init__(self, t: TableState, channel, guild):
+        super().__init__(timeout=30)
+        self.t = t; self.channel = channel; self.guild = guild
+
+    async def _do_raise(self, interaction: discord.Interaction, raise_amount: int):
         await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        if not self.t.game.is_turn(uid):
+            await interaction.followup.send("❌ It's not your turn.", ephemeral=True); return
+        success, msg = self.t.game.raise_bet(uid, raise_amount)
+        if not success:
+            await interaction.followup.send(msg, ephemeral=True); return
+        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+            slog_clear(self.t)
+        slog(self.t, msg)
         if self.t.game._hand_result:
             await _process_result(self.guild, self.channel, self.t)
-        await refresh(self.channel, self.t)
+        else:
+            await refresh(self.channel, self.t)
+
+    @discord.ui.button(label="1/3 Pot", style=discord.ButtonStyle.green, row=0)
+    async def third_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
+        amount = max(g.call_amount(p), g.pot // 3)
+        await self._do_raise(interaction, amount)
+
+    @discord.ui.button(label="1/2 Pot", style=discord.ButtonStyle.green, row=0)
+    async def half_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
+        amount = max(g.call_amount(p), g.pot // 2)
+        await self._do_raise(interaction, amount)
+
+    @discord.ui.button(label="1/2 Stack", style=discord.ButtonStyle.blurple, row=0)
+    async def half_stack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
+        amount = max(g.call_amount(p), p.chips // 2)
+        await self._do_raise(interaction, amount)
+
+    @discord.ui.button(label="All In 🚀", style=discord.ButtonStyle.red, row=0)
+    async def all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if not p:
+            await interaction.followup.send("❌ Not your turn.", ephemeral=True); return
+        call_needed  = g.call_amount(p)
+        raise_on_top = p.chips - call_needed
+        if raise_on_top <= 0:
+            success, msg = g.check_or_call(interaction.user.id)
+        else:
+            success, msg = g.raise_bet(interaction.user.id, raise_on_top)
+        if not success:
+            await interaction.followup.send(msg, ephemeral=True); return
+        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+            slog_clear(self.t)
+        slog(self.t, msg)
+        if self.t.game._hand_result:
+            await _process_result(self.guild, self.channel, self.t)
+        else:
+            await refresh(self.channel, self.t)
+
+    @discord.ui.button(label="Custom…", style=discord.ButtonStyle.grey, row=0)
+    async def custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RaiseCustomModal(self.t, self.channel, self.guild))
 
 # ── Join modal ────────────────────────────────────────────────────────────────
 
@@ -415,9 +782,7 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 
     def __init__(self, t: TableState, bal: int, min_w: int):
         super().__init__()
-        self.t     = t
-        self.bal   = bal
-        self.min_w = min_w
+        self.t = t; self.bal = bal; self.min_w = min_w
         self.amount.placeholder = f"min {min_w} — max {bal}  (wallet: {bal})"
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -425,23 +790,29 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
             chips = int(self.amount.value)
         except ValueError:
             await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
-
         if chips < self.min_w:
             await interaction.response.send_message(f"❌ Minimum buy-in is **{self.min_w}** chips.", ephemeral=True); return
         if chips > self.bal:
-            await interaction.response.send_message(f"❌ You only have **{self.bal}** chips in your wallet.", ephemeral=True); return
+            await interaction.response.send_message(f"❌ You only have **{self.bal}** chips.", ephemeral=True); return
 
-        t = self.t
+        t  = self.t
+        # Check ban (DB-backed: server-wide OR table-specific)
+        if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
+            await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
+
         ok = await db.deduct_chips(interaction.user.id, chips)
         if not ok:
             await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True); return
         await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
 
         msg = t.game.add_player(interaction.user.id, interaction.user.display_name, chips)
-        slog(t, msg)
-        await interaction.response.defer(ephemeral=True)
+        if msg.startswith("❌"):
+            await db.return_chips(interaction.user.id, chips)
+            await db.clear_chips_in_play(interaction.user.id)
+            await interaction.response.send_message(msg, ephemeral=True); return
 
-        key = (interaction.guild_id, interaction.channel_id)
+        await interaction.response.defer(ephemeral=True)
+        await interaction.channel.send(f"✅ **{interaction.user.display_name}** joined the table with **{chips}** 🪙!")
         await refresh(interaction.channel, t)
 
 # ── Game View ─────────────────────────────────────────────────────────────────
@@ -449,10 +820,10 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 class GameView(discord.ui.View):
     def __init__(self, t: TableState):
         super().__init__(timeout=None)
-        self.t = t
-        game   = t.game
-        in_hand = game.street not in (Street.WAITING, Street.SHOWDOWN)
-        self.btn_join.disabled  = in_hand
+        self.t      = t
+        in_hand     = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
+        table_full  = (len(t.game.players) + len(t.game.pending_joins)) >= 8
+        self.btn_join.disabled  = in_hand or table_full or t.closing
         for b in [self.btn_call, self.btn_check, self.btn_raise, self.btn_fold]:
             b.disabled = not in_hand
 
@@ -460,33 +831,48 @@ class GameView(discord.ui.View):
         ok, msg = fn(*args)
         if not ok:
             await interaction.response.send_message(msg, ephemeral=True); return
-        if any(m in msg for m in ["🌊", "↩️", "🏁", "🃏 **Showdown"]):
+        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
             slog_clear(self.t)
-        slog(self.t, msg)
+        # Only slog the action line, not any appended win/street result
+        slog(self.t, msg.split("\n")[0])
         await interaction.response.defer(ephemeral=True)
         if self.t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, self.t)
-        await refresh(interaction.channel, self.t)
+        else:
+            await refresh(interaction.channel, self.t)
 
-    @discord.ui.button(label="Join",  style=discord.ButtonStyle.green, row=0)
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.green, row=0)
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await db.upsert_wallet_name(interaction.user.id, interaction.user.display_name)
-        settings  = await db.get_settings(interaction.guild_id)
-        min_w     = settings.get("min_wallet", 50)
-        bal       = await db.get_balance(interaction.user.id)
+        if self.t.closing:
+            await interaction.response.send_message("❌ This table is closing.", ephemeral=True); return
+        if await db.is_banned(interaction.guild_id, interaction.user.id, self.t.name):
+            await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
+        await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
+        settings = await db.get_settings(interaction.guild_id)
+        min_w    = settings.get("min_wallet", 50)
+        bal      = await db.get_balance(interaction.user.id)
         if bal < min_w:
             await interaction.response.send_message(
-                f"❌ Need at least **{min_w}** chips in your wallet to join. Your wallet: **{bal}**.", ephemeral=True); return
+                f"❌ Need at least **{min_w}** chips to join. Wallet: **{bal}**.", ephemeral=True); return
         await interaction.response.send_modal(JoinModal(self.t, bal, min_w))
 
     @discord.ui.button(label="Leave", style=discord.ButtonStyle.red, row=0)
     async def btn_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.t.closing:
+            await interaction.response.send_message("❌ Table is closing — your chips will be returned automatically.", ephemeral=True); return
+        p = self.t.game.get_player(interaction.user.id)
+        pj = next((pj for pj in self.t.game.pending_joins if pj.user_id == interaction.user.id), None)
+        if not p and not pj:
+            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True); return
         chips_back, msg = self.t.game.remove_player(interaction.user.id)
         if chips_back > 0:
             await db.return_chips(interaction.user.id, chips_back)
             await db.clear_chips_in_play(interaction.user.id)
-        slog(self.t, msg)
         await interaction.response.defer(ephemeral=True)
+        if "will leave" in msg:
+            await interaction.channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
+        elif "left" in msg or "cashed out" in msg:
+            await interaction.channel.send(f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
         await refresh(interaction.channel, self.t)
 
     @discord.ui.button(label="Call",  style=discord.ButtonStyle.green,  row=1)
@@ -509,7 +895,17 @@ class GameView(discord.ui.View):
     async def btn_raise(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
-        await interaction.response.send_modal(RaiseModal(self.t, interaction.channel, interaction.guild))
+        view = RaisePickerView(self.t, interaction.channel, interaction.guild)
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        call_amt = g.call_amount(p) if p else 0
+        pot_third  = max(call_amt, g.pot // 3) if p else 0
+        pot_half   = max(call_amt, g.pot // 2) if p else 0
+        stack_half = max(call_amt, p.chips // 2) if p else 0
+        await interaction.response.send_message(
+            f"**Raise options** — Pot: {g.pot} 🪙  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
+            f"· 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}  · 1/2 Stack = +{stack_half}",
+            view=view, ephemeral=True)
 
     @discord.ui.button(label="Fold",  style=discord.ButtonStyle.red,    row=1)
     async def btn_fold(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -517,7 +913,7 @@ class GameView(discord.ui.View):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
         await self._do_action(interaction, self.t.game.fold, interaction.user.id)
 
-    @discord.ui.button(label="My Cards",    style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="My Cards",  style=discord.ButtonStyle.grey, row=2)
     async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = self.t.game.get_player(interaction.user.id)
         if not p or not p.hole_cards:
@@ -534,11 +930,10 @@ class GameView(discord.ui.View):
         else:
             await interaction.response.send_message(f"{caption}\n{hand_str(p.hole_cards)}", ephemeral=True)
 
-    @discord.ui.button(label="Rankings",    style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "**Hand Rankings** *(best → worst)*\n"
-            "```\n"
+            "**Hand Rankings** *(best → worst)*\n```\n"
             "1.  Royal Flush       A K Q J 10 — same suit\n"
             "2.  Straight Flush    5 in a row — same suit\n"
             "3.  Four of a Kind    4 of same rank\n"
@@ -548,15 +943,51 @@ class GameView(discord.ui.View):
             "7.  Three of a Kind   3 of same rank\n"
             "8.  Two Pair          Two different pairs\n"
             "9.  One Pair          Two of same rank\n"
-            "10. High Card         None of the above\n"
-            "```", ephemeral=True)
+            "10. High Card         None of the above\n```", ephemeral=True)
 
-    @discord.ui.button(label="Wallet",      style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="Wallet", style=discord.ButtonStyle.grey, row=2)
     async def btn_wallet(self, interaction: discord.Interaction, button: discord.ui.Button):
         bal = await db.get_balance(interaction.user.id)
         p   = self.t.game.get_player(interaction.user.id)
         table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
         await interaction.response.send_message(f"**Wallet:** {bal} 🪙{table_str}", ephemeral=True)
+
+# ── Confirm DB reset ──────────────────────────────────────────────────────────
+
+class ConfirmResetView1(discord.ui.View):
+    def __init__(self, admin_id: int):
+        super().__init__(timeout=30)
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="Yes, I'm sure", style=discord.ButtonStyle.red)
+    async def step1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True); return
+        view = ConfirmResetView2(self.admin_id)
+        await interaction.response.edit_message(
+            content="⚠️ **Final confirmation.** This CANNOT be undone.", view=view)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+class ConfirmResetView2(discord.ui.View):
+    def __init__(self, admin_id: int):
+        super().__init__(timeout=30)
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="WIPE EVERYTHING", style=discord.ButtonStyle.red)
+    async def step2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True); return
+        await db.reset_database(interaction.user.id, interaction.user.display_name)
+        tables.clear()
+        await interaction.response.edit_message(
+            content=f"✅ Database wiped by **{interaction.user.display_name}**.", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
@@ -566,45 +997,49 @@ class PokerCog(commands.Cog):
 
     poker = app_commands.Group(name="poker", description="Texas Hold'em poker")
 
-    # ── Table commands ────────────────────────────────────────────────────
+    # ── Table management ──────────────────────────────────────────────────
 
-    @poker.command(name="open", description="Open a new poker table in this channel")
-    @app_commands.describe(name="Table name (e.g. 'High Stakes')")
+    @poker.command(name="open", description="[Manager] Open a poker table in this channel")
+    @app_commands.describe(name="Table name")
     async def open_table(self, interaction: discord.Interaction, name: str = "Poker Table"):
-        key = (interaction.guild_id, interaction.channel_id)
-        if key in tables:
-            await interaction.response.send_message("❌ There's already a table in this channel. Use `/poker close` first.", ephemeral=True); return
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Only Poker Managers can open a table.", ephemeral=True); return
-
-        t = TableState(name)
-        tables[key] = t
-
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        for (gid, cid), t in tables.items():
+            if gid == interaction.guild_id:
+                await interaction.response.send_message(
+                    f"❌ A table is already running in <#{cid}>. Close it first.", ephemeral=True); return
+        t = TableState(name, interaction.user.id)
+        tables[(interaction.guild_id, interaction.channel_id)] = t
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
-
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
 
-    @poker.command(name="close", description="[Manager] Close table after current hand finishes")
+    @poker.command(name="close", description="[Manager] Close table after current hand")
     async def close_table(self, interaction: discord.Interaction):
         key = (interaction.guild_id, interaction.channel_id)
         t   = get_table(key)
         if not t:
             await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Only Poker Managers can close a table.", ephemeral=True); return
-
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if t.game.street == Street.WAITING:
-            # No hand in progress — close immediately
+            # No hand running — close immediately
+            await interaction.response.defer(ephemeral=True)
             await _close_table(interaction.channel, t)
-            await interaction.response.send_message("✅ Table closed.", ephemeral=True)
+            await interaction.followup.send("✅ Table closed.", ephemeral=True)
         else:
+            # Hand in progress — flag to close after it ends, cancel any between-hands timer
             t.closing = True
-            await interaction.response.send_message(
-                "✅ Table will close after the current hand completes.", ephemeral=False)
-            await refresh(interaction.channel, t)  # update embed to show "Closing"
+            if t.auto_task and not t.auto_task.done():
+                t.auto_task.cancel()
+            if t.between_msg:
+                try: await t.between_msg.delete()
+                except Exception: pass
+                t.between_msg = None
+            await interaction.response.send_message("✅ Table will close after this hand.", ephemeral=False)
+            await refresh(interaction.channel, t)
 
     @poker.command(name="start", description="[Manager] Deal the first hand")
     async def start(self, interaction: discord.Interaction):
@@ -616,24 +1051,20 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if t.game.street != Street.WAITING:
             await interaction.response.send_message("❌ A hand is already in progress.", ephemeral=True); return
-
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
-
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
             if p:
                 await db.return_chips(uid, p.chips)
                 await db.clear_chips_in_play(uid)
-
         slog_clear(t)
         success, msg = t.game.start_hand()
         slog(t, msg)
-
         if not success:
             await interaction.response.send_message(msg, ephemeral=True); return
-
+        t.msg_count = 0
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
 
@@ -643,9 +1074,138 @@ class PokerCog(commands.Cog):
         t   = get_table(key)
         if not t:
             await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
-        t.board_msg = None; t.ping_msg = None
+        t.hand_msg = None; t.board_file = None; t.ping_msg = None
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
+
+    # ── Manager moderation commands ───────────────────────────────────────
+
+    @poker.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
+    @app_commands.describe(user="Player to kick")
+    async def kick(self, interaction: discord.Interaction, user: discord.Member):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        key = (interaction.guild_id, interaction.channel_id)
+        t   = get_table(key)
+        if not t:
+            await interaction.response.send_message("❌ No table here.", ephemeral=True); return
+        p = t.game.get_player(user.id)
+        if not p:
+            await interaction.response.send_message(f"❌ **{user.display_name}** is not at the table.", ephemeral=True); return
+
+        # Force fold if in hand
+        if t.game.street != Street.WAITING and not p.folded:
+            ok, fold_msg = t.game.force_fold(user.id)
+            if ok:
+                slog(t, fold_msg)
+
+        # Queue for removal after hand
+        if user.id not in t.game.kicked_users:
+            t.game.kicked_users.append(user.id)
+        if user.id not in t.game.pending_leaves:
+            t.game.pending_leaves.append(user.id)
+
+        await interaction.response.send_message(
+            f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
+
+        if t.game._hand_result:
+            await _process_result(interaction.guild, interaction.channel, t)
+        else:
+            await refresh(interaction.channel, t)
+
+    @poker.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
+    @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
+    async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+
+        # Persist ban to DB
+        added = await db.ban_player(interaction.guild_id, user.id, user.display_name,
+                                     interaction.user.id, table_name)
+        scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
+
+        # Also apply in-memory ban + kick from any currently running table(s)
+        kicked_from = []
+        for (gid, cid), t in list(tables.items()):
+            if gid != interaction.guild_id:
+                continue
+            # Apply in-memory ban if scope matches
+            if table_name is None or t.name.lower() == table_name.lower():
+                if user.id not in t.game.banned_users:
+                    t.game.banned_users.append(user.id)
+                p = t.game.get_player(user.id)
+                if p:
+                    if t.game.street != Street.WAITING and not p.folded:
+                        ok, fold_msg = t.game.force_fold(user.id)
+                        if ok:
+                            slog(t, fold_msg)
+                    if user.id not in t.game.pending_leaves:
+                        t.game.pending_leaves.append(user.id)
+                    kicked_from.append(t.name)
+                    channel = interaction.guild.get_channel(cid)
+                    if channel:
+                        if t.game._hand_result:
+                            await _process_result(interaction.guild, channel, t)
+                        else:
+                            await refresh(channel, t)
+
+        kick_note = f" Removed from: {', '.join(kicked_from)}." if kicked_from else ""
+        if not added:
+            await interaction.response.send_message(
+                f"ℹ️ **{user.display_name}** was already banned from {scope}.{kick_note}", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"🔨 **{user.display_name}** banned from {scope}.{kick_note}")
+
+    @poker.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
+    @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
+    async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+
+        removed = await db.unban_player(interaction.guild_id, user.id, table_name)
+        scope   = f"table **{table_name}**" if table_name else "all tables"
+
+        # Remove in-memory ban too
+        for (gid, _), t in tables.items():
+            if gid != interaction.guild_id:
+                continue
+            if table_name is None or t.name.lower() == (table_name or "").lower():
+                if user.id in t.game.banned_users:
+                    t.game.banned_users.remove(user.id)
+
+        if removed:
+            await interaction.response.send_message(f"✅ **{user.display_name}** unbanned from {scope}.")
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ **{user.display_name}** had no bans for {scope}.", ephemeral=True)
+
+    @poker.command(name="forcefold", description="[Manager] Force a player to fold their hand")
+    @app_commands.describe(user="Player to force fold")
+    async def force_fold_cmd(self, interaction: discord.Interaction, user: discord.Member):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        key = (interaction.guild_id, interaction.channel_id)
+        t   = get_table(key)
+        if not t:
+            await interaction.response.send_message("❌ No table here.", ephemeral=True); return
+        if t.game.street == Street.WAITING:
+            await interaction.response.send_message("❌ No hand in progress.", ephemeral=True); return
+        p = t.game.get_player(user.id)
+        if not p:
+            await interaction.response.send_message(f"❌ **{user.display_name}** is not at the table.", ephemeral=True); return
+        if p.folded:
+            await interaction.response.send_message(f"ℹ️ **{user.display_name}** is already folded.", ephemeral=True); return
+
+        ok, msg = t.game.force_fold(user.id)
+        if not ok:
+            await interaction.response.send_message(f"❌ {msg}", ephemeral=True); return
+        slog(t, msg)
+        await interaction.response.send_message(f"✅ Force folded **{user.display_name}**.")
+        if t.game._hand_result:
+            await _process_result(interaction.guild, interaction.channel, t)
+        else:
+            await refresh(interaction.channel, t)
 
     # ── Player commands ───────────────────────────────────────────────────
 
@@ -658,35 +1218,153 @@ class PokerCog(commands.Cog):
         table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
         await interaction.response.send_message(f"**Wallet:** {bal} 🪙{table_str}", ephemeral=True)
 
-    # ── Manager commands ──────────────────────────────────────────────────
+    @poker.command(name="tip", description="Tip the dealer between hands")
+    async def tip_cmd(self, interaction: discord.Interaction):
+        key = (interaction.guild_id, interaction.channel_id)
+        t   = get_table(key)
+        if not t:
+            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
+        if interaction.user.id == t.manager_id:
+            await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
+        bal         = await db.get_balance(interaction.user.id)
+        p           = t.game.get_player(interaction.user.id)
+        table_chips = p.chips if p else 0
+        if bal + table_chips == 0:
+            await interaction.response.send_message("❌ You have no chips to tip with.", ephemeral=True); return
+        await interaction.response.send_modal(TipModal(t, bal, table_chips))
 
-    @poker.command(name="addchips", description="[Manager] Add chips to a player's wallet")
-    @app_commands.describe(user="Player", amount="Chips to add (negative to remove)", note="Optional reason")
-    async def addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+    @poker.command(name="addchips", description="Add chips from your wallet to your table stack (next hand)")
+    async def add_chips_cmd(self, interaction: discord.Interaction):
+        key = (interaction.guild_id, interaction.channel_id)
+        t   = get_table(key)
+        if not t:
+            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
+        p = t.game.get_player(interaction.user.id)
+        pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
+        if not p and not pj:
+            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True); return
+        wallet_bal = await db.get_balance(interaction.user.id)
+        if wallet_bal <= 0:
+            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True); return
+        await interaction.response.send_modal(RebuyModal(t, wallet_bal))
+
+    @poker.command(name="leaderboard", description="Top poker players by net chips")
+    async def leaderboard(self, interaction: discord.Interaction):
+
+        # 1️⃣ ACKNOWLEDGE IMMEDIATELY
+        await interaction.response.defer()
+
+        rows = await db.get_leaderboard(10)
+
+        if not rows:
+            await interaction.followup.send("No stats yet!", ephemeral=True)
+            return
+
+        async def get_uname(uid):
+            try:
+                m = interaction.guild.get_member(uid)
+                if m:
+                    return m.name
+                m = await interaction.guild.fetch_member(uid)  # API call
+                return m.name
+            except Exception:
+                return None
+
+        HDR = f"{'#':<3} {'Username':<20} {'Hands':>5} {'Win%':>5} {'Net':>8} {'Wallet':>8}"
+        SEP = "─" * len(HDR)
+        lines = ["```", HDR, SEP]
+
+        for i, r in enumerate(rows):
+            wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
+            net = r['net_chips']
+            sign = "+" if net >= 0 else ""
+            uid = r.get('user_id', '')
+
+            uname = await get_uname(uid) or r['username']
+
+            num = f"{i + 1}."
+            lines.append(
+                f"{num:<3} {uname:<20} {r['hands_played']:>5} {wp:>5} {sign + str(net):>8} {r['wallet']:>8}"
+            )
+            lines.append(f"    {uid}")
+
+        lines.append("```")
+
+        # 2️⃣ Use followup after defer
+        await interaction.followup.send(
+            "**Poker Leaderboard**\n" + "\n".join(lines)
+        )
+
+    @poker.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
+    @app_commands.describe(user="Player to remove from leaderboard")
+    async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
-        new_bal = await db.add_chips(
-            interaction.user.id, interaction.user.display_name,
-            user.id, user.display_name, amount, note)
-        sign = "+" if amount >= 0 else ""
+        removed = await db.delete_player_stats(user.id)
+        if removed:
+            await interaction.response.send_message(f"✅ Removed **{user.name}** ({user.id}) from the leaderboard.")
+        else:
+            await interaction.response.send_message(f"ℹ️ **{user.name}** has no stats on record.", ephemeral=True)
+
+    @poker.command(name="stats", description="View your poker stats")
+    async def stats(self, interaction: discord.Interaction):
+        row = await db.get_player_stats(interaction.user.id)
+        if not row:
+            await interaction.response.send_message("No stats yet!", ephemeral=True); return
+        net   = row['net_chips']
+        embed = discord.Embed(title=f"Stats — {row['username']}", color=0x2ecc71 if net >= 0 else 0xe74c3c)
+        wp    = f"{row['hands_won']/row['hands_played']*100:.1f}%" if row['hands_played'] else "—"
+        embed.add_field(name="Hands",  value=str(row['hands_played']), inline=True)
+        embed.add_field(name="Won",    value=str(row['hands_won']),    inline=True)
+        embed.add_field(name="Win %",  value=wp,                       inline=True)
+        embed.add_field(name="Net",    value=f"{'+'if net>=0 else ''}{net} 🪙", inline=True)
+        embed.add_field(name="Wallet", value=f"{row['wallet']} 🪙",   inline=True)
+        await interaction.response.send_message(embed=embed)
+
+    # ── Manager settings commands ─────────────────────────────────────────
+
+    @poker.command(name="mgraddchips", description="[Manager] Add chips to a player's wallet")
+    @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
+    async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True); return
+        new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
+                                     user.id, user.display_name, amount, note)
         await interaction.response.send_message(
-            f"✅ **{sign}{amount}** chips → **{user.display_name}**  |  Balance: **{new_bal}** 🪙"
+            f"✅ **+{amount}** chips → **{user.display_name}**  |  Balance: **{new_bal}** 🪙"
+            + (f"\n> {note}" if note else ""))
+
+    @poker.command(name="mgrremovechips", description="[Manager] Remove chips from a player's wallet")
+    @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
+    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True); return
+        new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
+                                     user.id, user.display_name, -amount, note)
+        await interaction.response.send_message(
+            f"✅ **-{amount}** chips from **{user.display_name}**  |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
     @poker.command(name="settings", description="[Manager] View table settings")
     async def settings_view(self, interaction: discord.Interaction):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
-        s = await db.get_settings(interaction.guild_id)
+        s        = await db.get_settings(interaction.guild_id)
         role_str = f"<@&{s['manager_role_id']}>" if s.get("manager_role_id") else "*(not set)*"
         log_str  = f"<#{s['log_channel_id']}>"   if s.get("log_channel_id")  else "*(not set)*"
         embed = discord.Embed(title="⚙️ Poker Settings", color=0x5865F2)
-        embed.add_field(name="Small Blind",    value=str(s["small_blind"]),  inline=True)
-        embed.add_field(name="Big Blind",      value=str(s["big_blind"]),    inline=True)
-        embed.add_field(name="Min Wallet",     value=str(s["min_wallet"]),   inline=True)
-        embed.add_field(name="Next Hand Delay", value=f"{s.get('next_hand_delay', NEXT_HAND_DELAY_DEFAULT)}s", inline=True)
-        embed.add_field(name="Manager Role",   value=role_str,               inline=False)
-        embed.add_field(name="Log Channel",    value=log_str,                inline=False)
+        embed.add_field(name="Small Blind",      value=str(s["small_blind"]),  inline=True)
+        embed.add_field(name="Big Blind",        value=str(s["big_blind"]),    inline=True)
+        embed.add_field(name="Min Wallet",       value=str(s["min_wallet"]),   inline=True)
+        embed.add_field(name="Next Hand Delay",  value=f"{s.get('next_hand_delay', NEXT_HAND_DELAY_DEFAULT)}s", inline=True)
+        embed.add_field(name="Turn Timeout",     value=f"{s.get('turn_timeout', TURN_TIMEOUT_DEFAULT)}s",      inline=True)
+        embed.add_field(name="Resend Embed",     value=f"every {s.get('resend_after_msgs', TABLE_RESEND_MSGS)} msgs", inline=True)
+        embed.add_field(name="Manager Role",     value=role_str, inline=False)
+        embed.add_field(name="Log Channel",      value=log_str,  inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @poker.command(name="setblinds", description="[Manager] Set small and big blind amounts")
@@ -695,7 +1373,7 @@ class PokerCog(commands.Cog):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if small <= 0 or big <= small:
-            await interaction.response.send_message("❌ Big blind must be greater than small blind.", ephemeral=True); return
+            await interaction.response.send_message("❌ Big blind must be > small blind.", ephemeral=True); return
         await db.set_settings(interaction.guild_id, small_blind=small, big_blind=big)
         await interaction.response.send_message(f"✅ Blinds: **{small}** / **{big}**")
 
@@ -715,17 +1393,37 @@ class PokerCog(commands.Cog):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if seconds < 5 or seconds > 300:
-            await interaction.response.send_message("❌ Must be between 5 and 300 seconds.", ephemeral=True); return
+            await interaction.response.send_message("❌ Must be 5–300 seconds.", ephemeral=True); return
         await db.set_settings(interaction.guild_id, next_hand_delay=seconds)
-        await interaction.response.send_message(f"✅ Next hand delay set to **{seconds}s**.")
+        await interaction.response.send_message(f"✅ Next hand delay: **{seconds}s**")
 
-    @poker.command(name="setlogchannel", description="[Manager] Set channel where hand logs are posted (as threads)")
-    @app_commands.describe(channel="The channel to post log threads in")
+    @poker.command(name="setturntimeout", description="[Manager] Set AFK fold timer (default 5 min)")
+    @app_commands.describe(seconds="Seconds before auto-fold (30–600)")
+    async def set_turn_timeout(self, interaction: discord.Interaction, seconds: int):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        if seconds < 30 or seconds > 600:
+            await interaction.response.send_message("❌ Must be 30–600 seconds.", ephemeral=True); return
+        await db.set_settings(interaction.guild_id, turn_timeout=seconds)
+        await interaction.response.send_message(f"✅ Turn timeout (AFK fold): **{seconds}s**")
+
+    @poker.command(name="setresend", description="[Manager] Set how many messages before embed is resent")
+    @app_commands.describe(count="Number of messages (3–50)")
+    async def set_resend(self, interaction: discord.Interaction, count: int):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        if count < 3 or count > 50:
+            await interaction.response.send_message("❌ Must be 3–50.", ephemeral=True); return
+        await db.set_settings(interaction.guild_id, resend_after_msgs=count)
+        await interaction.response.send_message(f"✅ Embed resend threshold: **{count}** messages")
+
+    @poker.command(name="setlogchannel", description="[Manager] Set channel for hand logs")
+    @app_commands.describe(channel="The channel to post log thread in")
     async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         await db.set_settings(interaction.guild_id, log_channel_id=channel.id)
-        await interaction.response.send_message(f"✅ Log channel set to {channel.mention}. Each table gets its own thread.")
+        await interaction.response.send_message(f"✅ Log channel: {channel.mention}")
 
     @poker.command(name="setmanagerrole", description="[Admin] Set the Poker Manager role")
     @app_commands.describe(role="Role that gets poker manager access")
@@ -733,69 +1431,16 @@ class PokerCog(commands.Cog):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True); return
         await db.set_settings(interaction.guild_id, manager_role_id=role.id)
-        await interaction.response.send_message(f"✅ Poker Manager role set to **{role.name}**.")
+        await interaction.response.send_message(f"✅ Poker Manager role: **{role.name}**")
 
     @poker.command(name="resetdb", description="[Admin] Wipe all poker data from the database")
     async def reset_db(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True); return
-        # Confirmation step
-        view = ConfirmResetView(interaction.user.id)
+        view = ConfirmResetView1(interaction.user.id)
         await interaction.response.send_message(
             "⚠️ **This will permanently delete all wallets, stats, logs and settings.**\nAre you sure?",
             view=view, ephemeral=True)
-
-    # ── Stats / leaderboard ───────────────────────────────────────────────
-
-    @poker.command(name="leaderboard", description="Top poker players by net chips")
-    async def leaderboard(self, interaction: discord.Interaction):
-        rows = await db.get_leaderboard(10)
-        if not rows:
-            await interaction.response.send_message("No stats yet!", ephemeral=True); return
-        lines = ["**Poker Leaderboard**", "```"]
-        lines.append(f"{'#':<3} {'Player':<18} {'Hands':>6} {'Win%':>5} {'Net':>8} {'Wallet':>8}")
-        lines.append("─" * 54)
-        for i, r in enumerate(rows):
-            wp  = f"{r['hands_won']/r['hands_played']*100:.0f}%" if r['hands_played'] else "—"
-            net = r['net_chips']; sign = "+" if net >= 0 else ""
-            lines.append(f"{str(i+1)+'.':<3} {r['username']:<18} {r['hands_played']:>6} {wp:>5} {sign+str(net):>8} {r['wallet']:>8}")
-        lines.append("```")
-        await interaction.response.send_message("\n".join(lines))
-
-    @poker.command(name="stats", description="View your poker stats")
-    async def stats(self, interaction: discord.Interaction):
-        row = await db.get_player_stats(interaction.user.id)
-        if not row:
-            await interaction.response.send_message("No stats yet!", ephemeral=True); return
-        net   = row['net_chips']
-        embed = discord.Embed(title=f"Stats — {row['username']}", color=0x2ecc71 if net >= 0 else 0xe74c3c)
-        wp    = f"{row['hands_won']/row['hands_played']*100:.1f}%" if row['hands_played'] else "—"
-        embed.add_field(name="Hands",  value=str(row['hands_played']), inline=True)
-        embed.add_field(name="Won",    value=str(row['hands_won']),    inline=True)
-        embed.add_field(name="Win %",  value=wp,                        inline=True)
-        embed.add_field(name="Net",    value=f"{'+'if net>=0 else ''}{net} 🪙", inline=True)
-        embed.add_field(name="Wallet", value=f"{row['wallet']} 🪙",    inline=True)
-        await interaction.response.send_message(embed=embed)
-
-# ── Confirm reset view ────────────────────────────────────────────────────────
-
-class ConfirmResetView(discord.ui.View):
-    def __init__(self, admin_id: int):
-        super().__init__(timeout=30)
-        self.admin_id = admin_id
-
-    @discord.ui.button(label="Yes, wipe everything", style=discord.ButtonStyle.red)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message("❌ Not your button.", ephemeral=True); return
-        await db.reset_database(interaction.user.id, interaction.user.display_name)
-        tables.clear()
-        await interaction.response.edit_message(
-            content=f"✅ Database reset by **{interaction.user.display_name}**. All data wiped.", view=None)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled.", view=None)
 
 async def setup(bot):
     await bot.add_cog(PokerCog(bot))

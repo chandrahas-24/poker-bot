@@ -19,6 +19,16 @@ TABLE_RESEND_MSGS       = 10
 
 # ── TableState ────────────────────────────────────────────────────────────────
 
+def parse_chips(value: str) -> int | None:
+    """Parse chip amounts like 500, 2k, 1.5k, 2e3, 2000."""
+    try:
+        v = value.strip().lower().replace(",", "")
+        if v.endswith("k"):
+            return int(float(v[:-1]) * 1000)
+        return int(float(v))
+    except (ValueError, TypeError):
+        return None
+
 class TableState:
     def __init__(self, name: str, manager_id: int):
         self.id           = str(uuid.uuid4())[:8]
@@ -101,20 +111,25 @@ async def _turn_timer(t: TableState, channel, user_id: int):
         return
 
     name = p.display_name
-    ok, msg = t.game.fold(user_id)
-    if ok:
-        slog(t, msg)
 
-    chips_back, _ = t.game.remove_player(user_id)
-    if chips_back > 0:
-        await db.return_chips(user_id, chips_back)
-        await db.clear_chips_in_play(user_id)
+    if user_id not in t.game.kicked_users:
+        t.game.kicked_users.append(user_id)
+    if user_id not in t.game.pending_leaves:
+        t.game.pending_leaves.append(user_id)
 
-    try:
-        await channel.send(f"⏰ **{name}** timed out — auto-folded and removed. Chips returned.")
-    except Exception:
-        pass
+    if not p.folded:
+        ok, fold_msg = t.game.force_fold(user_id)
+        if ok:
+            parts = fold_msg.split("\n")
+            if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                slog_clear(t)
+            for part in parts:
+                if part.strip():
+                    slog(t, part)
 
+    await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
+
+    print(f"[timer] _hand_result={t.game._hand_result is not None}, street={t.game.street}, channel_type={type(channel).__name__}")
     if t.game._hand_result:
         await _process_result(channel.guild, channel, t)
     else:
@@ -153,12 +168,8 @@ async def _auto_next_hand(t: TableState, channel):
         await _close_table(channel, t)
         return
 
-    # Process pending leaves (including kicks)
-    for uid in list(t.game.pending_leaves):
-        p = t.game.get_player(uid)
-        if p:
-            await db.return_chips(uid, p.chips)
-            await db.clear_chips_in_play(uid)
+    # pending_leaves chips were already returned in _process_result.
+    # Don't return again — just let start_hand->_process_pending remove them from game.players.
 
     # Auto-remove players below big blind
     bb = t.game.BIG_BLIND
@@ -256,10 +267,10 @@ async def post_hand_log(channel, t: TableState, result):
             p = game.get_player(uid)
             return f"{p.display_name if p else uid} ({uid})"
 
-    # Community cards
-    if game.community:
-        from engine import hand_str
-        lines.append(f"Board: {hand_str(game.community)}")
+    # Community cards — read from result since game.community is cleared by _end_hand
+    from engine import hand_str
+    if hasattr(result, 'community') and result.community:
+        lines.append(f"Board: {hand_str(result.community)}")
 
     # Each player's hole cards + result
     pot_results = result.pot_results or []
@@ -422,6 +433,10 @@ def _slog_result(t: TableState, result):
     game        = t.game
     ranks       = result.winner_ranks or {}
     pot_results = result.pot_results
+    # Use result.community — game.community is already cleared by _end_hand at this point.
+    if result.community:
+        from engine import hand_str
+        slog(t, f"🃏 Board: {hand_str(result.community)}")
 
     if not pot_results or len(pot_results) == 1:
         if len(result.winners) == 1:
@@ -452,6 +467,9 @@ async def _announce_winner(channel, t: TableState, result):
     ranks       = result.winner_ranks or {}
     pot_results = result.pot_results  # [(amount, [PokerPlayer, ...]), ...]
 
+    # Board line — present whenever there were community cards (fold wins mid-street included)
+    board_str = f"\n🃏 Board: {hand_str(result.community)}" if result.community else ""
+
     if not pot_results or len(pot_results) == 1:
         # Single pot (or fold win — no pot_results)
         if len(result.winners) == 1:
@@ -460,7 +478,7 @@ async def _announce_winner(channel, t: TableState, result):
             rank   = ranks.get(w.user_id)
             rs     = f" with **{rank}**" if rank else ""
             await channel.send(
-                f"🏆 **{w.display_name}** won **+{gained}** chips from Hand #{game.hand_num}{rs}! "
+                f"🏆 **{w.display_name}** won **+{gained}** chips from Hand #{game.hand_num}{rs}!{board_str} "
                 f"(Pot: **{result.pot}** 🪙 | Stack: **{w.chips}** 🪙)"
             )
         else:
@@ -475,12 +493,14 @@ async def _announce_winner(channel, t: TableState, result):
                 parts = [f"**{w.display_name}**" for w in result.winners]
             split = result.pot // len(result.winners)
             await channel.send(
-                f"🤝 Split pot — Hand #{game.hand_num}: {', '.join(parts)} each won **{split}** 🪙 "
+                f"🤝 Split pot — Hand #{game.hand_num}: {', '.join(parts)} each won **{split}** 🪙{board_str} "
                 f"(Pot: **{result.pot}** 🪙)"
             )
     else:
         # Multiple side pots — use exact pot_results from engine (guaranteed correct)
         lines = [f"🃏 **Hand #{game.hand_num} results** — {len(pot_results)} pots:"]
+        if result.community:
+            lines.append(f"🃏 Board: {hand_str(result.community)}")
         for i, (amt, winners) in enumerate(pot_results):
             label = "Main pot" if i == 0 else f"Side pot {i}"
             icon  = "🏆" if i == 0 else "🥈"
@@ -513,36 +533,77 @@ async def _process_result(guild, channel, t: TableState):
     if not result:
         return
     cancel_timer(t)
+    # Cancel any pending auto-next-hand task — if it fires before we finish
+    # processing, it calls start_hand() which clears _hand_result and starts
+    # a new hand, causing _process_result to silently bail out.
+    if t.auto_task and not t.auto_task.done():
+        t.auto_task.cancel()
+    t.auto_task = None
 
-    for p in t.game.players:
-        net = result.chip_deltas.get(p.user_id, 0)
-        won = any(w.user_id == p.user_id for w in result.winners)
-        # Use global username (not server nickname) for persistent records
-        try:
-            member = guild.get_member(p.user_id) or await guild.fetch_member(p.user_id)
-            uname  = member.name  # global Discord username, never changes with nickname
-        except Exception:
-            uname = p.display_name  # fallback
-        await db.record_hand(p.user_id, uname, won, net)
+    # Stats + DB — wrapped individually so a failure doesn't kill the announcement
+    try:
+        for p in t.game.players:
+            net = result.chip_deltas.get(p.user_id, 0)
+            won = any(w.user_id == p.user_id for w in result.winners)
+            try:
+                member = guild.get_member(p.user_id) or await guild.fetch_member(p.user_id)
+                uname  = member.name
+            except Exception:
+                uname = p.display_name
+            await db.record_hand(p.user_id, uname, won, net)
+    except Exception as e:
+        print(f"[poker] record_hand error: {e}")
 
-    for p in t.game.players:
-        if p.chips > 0:
-            await db.update_chips_in_play(p.user_id, p.chips)
-        else:
-            await db.clear_chips_in_play(p.user_id)
+    try:
+        for p in t.game.players:
+            if p.chips > 0:
+                await db.update_chips_in_play(p.user_id, p.chips)
+            else:
+                await db.clear_chips_in_play(p.user_id)
+    except Exception as e:
+        print(f"[poker] chips_in_play error: {e}")
 
-    for uid in list(t.game.pending_leaves):
-        p = t.game.get_player(uid)
-        if p:
-            await db.return_chips(uid, p.chips)
-            await db.clear_chips_in_play(uid)
+    try:
+        for uid in list(t.game.pending_leaves):
+            p = t.game.get_player(uid)
+            if p and p.chips > 0:
+                await db.return_chips(uid, p.chips)
+                await db.clear_chips_in_play(uid)
+        # Remove them from game.players now so the post-hand embed is clean.
+        # _process_pending in start_hand will find pending_leaves already empty and skip.
+        for uid in list(t.game.pending_leaves):
+            p = t.game.get_player(uid)
+            if p:
+                t.game.players.remove(p)
+        t.game.pending_leaves.clear()
+        t.game.kicked_users.clear()
+    except Exception as e:
+        print(f"[poker] pending_leaves return error: {e}")
 
-    await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
-    await post_hand_log(channel, t, result)
-    await _announce_winner(channel, t, result)
-    # Put correct winner line into street_log so embed shows right info
-    _slog_result(t, result)
-    await refresh(channel, t)
+    try:
+        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
+    except Exception as e:
+        print(f"[poker] log_hand error: {e}")
+
+    try:
+        await post_hand_log(channel, t, result)
+    except Exception as e:
+        print(f"[poker] post_hand_log error: {e}")
+
+    # These must always run — winner announcement + embed update
+    try:
+        print(f"[poker] calling _announce_winner")
+        await _announce_winner(channel, t, result)
+        print(f"[poker] _announce_winner done")
+    except Exception as e:
+        print(f"[poker] _announce_winner error: {e}")
+    try:
+        print(f"[poker] calling refresh")
+        _slog_result(t, result)
+        await refresh(channel, t)
+        print(f"[poker] refresh done")
+    except Exception as e:
+        print(f"[poker] refresh error: {e}")
     if t.closing:
         await _close_table(channel, t)
     else:
@@ -619,12 +680,9 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
         self.amount.placeholder = f"1–{wallet_bal}  (wallet: {wallet_bal})"
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            chips = int(self.amount.value)
-        except ValueError:
-            await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
-        if chips <= 0:
-            await interaction.response.send_message("❌ Must be more than 0.", ephemeral=True); return
+        chips = parse_chips(self.amount.value)
+        if chips is None or chips <= 0:
+            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
         if chips > self.wallet_bal:
             await interaction.response.send_message(
                 f"❌ You only have **{self.wallet_bal}** in your wallet.", ephemeral=True); return
@@ -634,8 +692,42 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
             await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True); return
 
         msg = self.t.game.queue_rebuy(interaction.user.id, chips)
+        if msg.startswith("❌"):
+            # Player left the table between clicking the button and submitting —
+            # return the chips we just deducted.
+            await db.return_chips(interaction.user.id, chips)
+            await interaction.response.send_message(msg, ephemeral=True); return
+
         await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
         await interaction.response.send_message(msg, ephemeral=True)
+
+class WalletLookupModal(discord.ui.Modal, title="Check Wallet"):
+    user_input = discord.ui.TextInput(label="User (leave blank for yourself)", placeholder="@username, display name, or user ID", required=False, max_length=50)
+
+    def __init__(self, t: TableState):
+        super().__init__()
+        self.t = t
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.user_input.value.strip()
+        if not raw:
+            target = interaction.user
+        else:
+            uid_str = raw.lstrip("<@!>")
+            try:
+                uid    = int(uid_str)
+                target = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
+            except Exception:
+                target = discord.utils.find(
+                    lambda m: m.name.lower() == raw.lower() or m.display_name.lower() == raw.lower(),
+                    interaction.guild.members)
+            if not target:
+                await interaction.response.send_message("❌ User not found.", ephemeral=True); return
+        bal   = await db.get_balance(target.id)
+        p     = self.t.game.get_player(target.id) if self.t else None
+        table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
+        label = f"**{target.display_name}'s Wallet**" if target.id != interaction.user.id else "**Your Wallet**"
+        await interaction.response.send_message(f"{label}: {bal} 🪙{table_str}", ephemeral=True)
 
 class BetweenHandsView(discord.ui.View):
     def __init__(self, t: TableState):
@@ -681,10 +773,9 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
     async def on_submit(self, interaction: discord.Interaction):
         # Defer first — only one response allowed
         await interaction.response.defer(ephemeral=True)
-        try:
-            raise_amount = int(self.amount.value)
-        except ValueError:
-            await interaction.followup.send("❌ Enter a valid number.", ephemeral=True); return
+        raise_amount = parse_chips(self.amount.value)
+        if raise_amount is None:
+            await interaction.followup.send("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
         uid = interaction.user.id
         p   = self.t.game.get_player(uid)
         if not p or not self.t.game.is_turn(uid):
@@ -786,10 +877,9 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
         self.amount.placeholder = f"min {min_w} — max {bal}  (wallet: {bal})"
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            chips = int(self.amount.value)
-        except ValueError:
-            await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
+        chips = parse_chips(self.amount.value)
+        if chips is None:
+            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
         if chips < self.min_w:
             await interaction.response.send_message(f"❌ Minimum buy-in is **{self.min_w}** chips.", ephemeral=True); return
         if chips > self.bal:
@@ -831,10 +921,14 @@ class GameView(discord.ui.View):
         ok, msg = fn(*args)
         if not ok:
             await interaction.response.send_message(msg, ephemeral=True); return
-        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+        parts = msg.split("\n")
+        street_markers = ["🌊", "↩️", "🏁"]
+        if any(m in msg for m in street_markers + ["Showdown"]):
             slog_clear(self.t)
-        # Only slog the action line, not any appended win/street result
-        slog(self.t, msg.split("\n")[0])
+        slog(self.t, parts[0])
+        for part in parts[1:]:
+            if any(m in part for m in street_markers):
+                slog(self.t, part); break
         await interaction.response.defer(ephemeral=True)
         if self.t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, self.t)
@@ -845,6 +939,8 @@ class GameView(discord.ui.View):
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.t.closing:
             await interaction.response.send_message("❌ This table is closing.", ephemeral=True); return
+        if interaction.user.id in self.t.game.kicked_users:
+            await interaction.response.send_message("❌ You have been kicked and cannot rejoin until the next table.", ephemeral=True); return
         if await db.is_banned(interaction.guild_id, interaction.user.id, self.t.name):
             await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
         await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
@@ -860,6 +956,10 @@ class GameView(discord.ui.View):
     async def btn_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.t.closing:
             await interaction.response.send_message("❌ Table is closing — your chips will be returned automatically.", ephemeral=True); return
+        if interaction.user.id in self.t.game.kicked_users:
+            await interaction.response.send_message("❌ You have been kicked and will be removed after this hand.", ephemeral=True); return
+        if interaction.user.id in self.t.game.pending_leaves:
+            await interaction.response.send_message("❌ You are already queued to leave after this hand.", ephemeral=True); return
         p = self.t.game.get_player(interaction.user.id)
         pj = next((pj for pj in self.t.game.pending_joins if pj.user_id == interaction.user.id), None)
         if not p and not pj:
@@ -947,10 +1047,7 @@ class GameView(discord.ui.View):
 
     @discord.ui.button(label="Wallet", style=discord.ButtonStyle.grey, row=2)
     async def btn_wallet(self, interaction: discord.Interaction, button: discord.ui.Button):
-        bal = await db.get_balance(interaction.user.id)
-        p   = self.t.game.get_player(interaction.user.id)
-        table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
-        await interaction.response.send_message(f"**Wallet:** {bal} 🪙{table_str}", ephemeral=True)
+        await interaction.response.send_modal(WalletLookupModal(self.t))
 
 # ── Confirm DB reset ──────────────────────────────────────────────────────────
 
@@ -1056,9 +1153,11 @@ class PokerCog(commands.Cog):
         t.game.BIG_BLIND   = settings["big_blind"]
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
-            if p:
+            if p and p.chips > 0:
                 await db.return_chips(uid, p.chips)
                 await db.clear_chips_in_play(uid)
+        # Clear the list so a failed start doesn't double-pay on the next attempt
+        t.game.pending_leaves.clear()
         slog_clear(t)
         success, msg = t.game.start_hand()
         slog(t, msg)
@@ -1093,17 +1192,30 @@ class PokerCog(commands.Cog):
         if not p:
             await interaction.response.send_message(f"❌ **{user.display_name}** is not at the table.", ephemeral=True); return
 
-        # Force fold if in hand
-        if t.game.street != Street.WAITING and not p.folded:
-            ok, fold_msg = t.game.force_fold(user.id)
-            if ok:
-                slog(t, fold_msg)
+        if t.game.street == Street.WAITING:
+            t.game.players.remove(p)
+            if p.chips > 0:
+                await db.return_chips(user.id, p.chips)
+                await db.clear_chips_in_play(user.id)
+            await interaction.response.send_message(
+                f"🦵 **{user.display_name}** has been kicked and removed from the table.")
+            await refresh(interaction.channel, t)
+            return
 
-        # Queue for removal after hand
         if user.id not in t.game.kicked_users:
             t.game.kicked_users.append(user.id)
         if user.id not in t.game.pending_leaves:
             t.game.pending_leaves.append(user.id)
+
+        if not p.folded:
+            ok, fold_msg = t.game.force_fold(user.id)
+            if ok:
+                parts = fold_msg.split("\n")
+                if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                    slog_clear(t)
+                for part in parts:
+                    if part.strip():
+                        slog(t, part)
 
         await interaction.response.send_message(
             f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
@@ -1124,38 +1236,59 @@ class PokerCog(commands.Cog):
                                      interaction.user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
 
-        # Also apply in-memory ban + kick from any currently running table(s)
+        # Defer ephemerally — we'll decide whether to go public after checking tables.
+        # Using a public defer when the user isn't seated causes a blank public message
+        # that Discord renders confusingly alongside between-hands views.
+        await interaction.response.defer(ephemeral=True)
+
         kicked_from = []
         for (gid, cid), t in list(tables.items()):
             if gid != interaction.guild_id:
                 continue
-            # Apply in-memory ban if scope matches
             if table_name is None or t.name.lower() == table_name.lower():
                 if user.id not in t.game.banned_users:
                     t.game.banned_users.append(user.id)
-                p = t.game.get_player(user.id)
+                p  = t.game.get_player(user.id)
+                pj = next((x for x in t.game.pending_joins if x.user_id == user.id), None)
+                if pj:
+                    t.game.pending_joins.remove(pj)
+                    if pj.chips > 0:
+                        await db.return_chips(user.id, pj.chips)
+                        await db.clear_chips_in_play(user.id)
                 if p:
-                    if t.game.street != Street.WAITING and not p.folded:
-                        ok, fold_msg = t.game.force_fold(user.id)
-                        if ok:
-                            slog(t, fold_msg)
-                    if user.id not in t.game.pending_leaves:
-                        t.game.pending_leaves.append(user.id)
+                    if t.game.street == Street.WAITING:
+                        # No hand running — remove immediately and return chips now.
+                        t.game.players.remove(p)
+                        if p.chips > 0:
+                            await db.return_chips(user.id, p.chips)
+                            await db.clear_chips_in_play(user.id)
+                    else:
+                        # Hand in progress — force fold then queue removal for after hand.
+                        if not p.folded and t.game.street != Street.SHOWDOWN:
+                            ok, fold_msg = t.game.force_fold(user.id)
+                            if ok:
+                                slog(t, fold_msg.split("\n")[0])
+                        if user.id not in t.game.pending_leaves:
+                            t.game.pending_leaves.append(user.id)
+                if p or pj:
                     kicked_from.append(t.name)
-                    channel = interaction.guild.get_channel(cid)
-                    if channel:
-                        if t.game._hand_result:
-                            await _process_result(interaction.guild, channel, t)
+                    ch = interaction.guild.get_channel(cid)
+                    if ch:
+                        if t.game.street == Street.WAITING:
+                            await ch.send(f"🔨 **{user.display_name}** has been banned and removed from the table.")
+                            await refresh(ch, t)
                         else:
-                            await refresh(channel, t)
+                            await ch.send(f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
+                            if t.game._hand_result:
+                                await _process_result(interaction.guild, ch, t)
+                            else:
+                                await refresh(ch, t)
 
-        kick_note = f" Removed from: {', '.join(kicked_from)}." if kicked_from else ""
+        kick_note = f" Kicked from: {', '.join(kicked_from)}." if kicked_from else ""
         if not added:
-            await interaction.response.send_message(
-                f"ℹ️ **{user.display_name}** was already banned from {scope}.{kick_note}", ephemeral=True)
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kick_note}", ephemeral=True)
         else:
-            await interaction.response.send_message(
-                f"🔨 **{user.display_name}** banned from {scope}.{kick_note}")
+            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kick_note}", ephemeral=not kicked_from)
 
     @poker.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
@@ -1210,13 +1343,16 @@ class PokerCog(commands.Cog):
     # ── Player commands ───────────────────────────────────────────────────
 
     @poker.command(name="wallet", description="Check your chip wallet balance")
-    async def wallet(self, interaction: discord.Interaction):
-        bal = await db.get_balance(interaction.user.id)
-        key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
-        p   = t.game.get_player(interaction.user.id) if t else None
+    @app_commands.describe(user="Player to check (leave blank for yourself)")
+    async def wallet(self, interaction: discord.Interaction, user: discord.Member = None):
+        target = user or interaction.user
+        bal    = await db.get_balance(target.id)
+        key    = (interaction.guild_id, interaction.channel_id)
+        t      = get_table(key)
+        p      = t.game.get_player(target.id) if t else None
         table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
-        await interaction.response.send_message(f"**Wallet:** {bal} 🪙{table_str}", ephemeral=True)
+        label  = f"**{target.display_name}'s Wallet**" if user else "**Your Wallet**"
+        await interaction.response.send_message(f"{label}: {bal} 🪙{table_str}", ephemeral=True)
 
     @poker.command(name="tip", description="Tip the dealer between hands")
     async def tip_cmd(self, interaction: discord.Interaction):
@@ -1250,50 +1386,34 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="leaderboard", description="Top poker players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):
-
-        # 1️⃣ ACKNOWLEDGE IMMEDIATELY
-        await interaction.response.defer()
-
         rows = await db.get_leaderboard(10)
-
         if not rows:
-            await interaction.followup.send("No stats yet!", ephemeral=True)
-            return
+            await interaction.response.send_message("No stats yet!", ephemeral=True); return
 
+        # Fetch current global usernames from Discord (may differ from stored ones)
         async def get_uname(uid):
             try:
-                m = interaction.guild.get_member(uid)
-                if m:
-                    return m.name
-                m = await interaction.guild.fetch_member(uid)  # API call
+                m = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
                 return m.name
             except Exception:
                 return None
 
-        HDR = f"{'#':<3} {'Username':<20} {'Hands':>5} {'Win%':>5} {'Net':>8} {'Wallet':>8}"
-        SEP = "─" * len(HDR)
+        HDR   = f"{'#':<3} {'Username':<20} {'Hands':>5} {'Win%':>5} {'Net':>8} {'Wallet':>8}"
+        SEP   = "─" * len(HDR)
         lines = ["```", HDR, SEP]
-
         for i, r in enumerate(rows):
-            wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
-            net = r['net_chips']
-            sign = "+" if net >= 0 else ""
-            uid = r.get('user_id', '')
-
-            uname = await get_uname(uid) or r['username']
-
-            num = f"{i + 1}."
-            lines.append(
-                f"{num:<3} {uname:<20} {r['hands_played']:>5} {wp:>5} {sign + str(net):>8} {r['wallet']:>8}"
-            )
+            wp      = f"{r['hands_won']/r['hands_played']*100:.0f}%" if r['hands_played'] else "—"
+            net     = r['net_chips']
+            sign    = "+" if net >= 0 else ""
+            uid     = r.get('user_id', '')
+            uname   = await get_uname(uid) or r['username']
+            num     = f"{i+1}."
+            # Row 1: rank + username + stats
+            lines.append(f"{num:<3} {uname:<20} {r['hands_played']:>5} {wp:>5} {sign+str(net):>8} {r['wallet']:>8}")
+            # Row 2: indented user ID
             lines.append(f"    {uid}")
-
         lines.append("```")
-
-        # 2️⃣ Use followup after defer
-        await interaction.followup.send(
-            "**Poker Leaderboard**\n" + "\n".join(lines)
-        )
+        await interaction.response.send_message("**Poker Leaderboard**\n" + "\n".join(lines))
 
     @poker.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")
@@ -1333,7 +1453,7 @@ class PokerCog(commands.Cog):
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, amount, note)
         await interaction.response.send_message(
-            f"✅ **+{amount}** chips → **{user.display_name}**  |  Balance: **{new_bal}** 🪙"
+            f"✅ **+{amount}** chips → **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
     @poker.command(name="mgrremovechips", description="[Manager] Remove chips from a player's wallet")
@@ -1346,7 +1466,7 @@ class PokerCog(commands.Cog):
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, -amount, note)
         await interaction.response.send_message(
-            f"✅ **-{amount}** chips from **{user.display_name}**  |  Balance: **{new_bal}** 🪙"
+            f"✅ **-{amount}** chips from **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
     @poker.command(name="settings", description="[Manager] View table settings")

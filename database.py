@@ -291,10 +291,20 @@ async def write_audit(action: str, user_id: int, user_name: str, detail: str = "
 async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int, table_name: str | None = None):
     """Ban user server-wide (table_name=None) or from a specific table."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # Ensure table exists (migration safety)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS poker_bans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                username TEXT NOT NULL, table_name TEXT,
+                banned_by INTEGER NOT NULL, ts TEXT NOT NULL
+            )
+        """)
+        await db.commit()
         # Avoid duplicate bans
         async with db.execute(
-            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND (table_name IS ? OR (table_name IS NOT NULL AND table_name=?))",
-            (guild_id, user_id, table_name, table_name)
+            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS ?",
+            (guild_id, user_id, table_name)
         ) as c:
             if await c.fetchone():
                 return False  # already banned at this scope
@@ -332,22 +342,25 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
 
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
     """True if user is server-wide banned OR banned from specific table_name."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Always check server-wide ban first
-        async with db.execute(
-            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
-            (guild_id, user_id)
-        ) as c:
-            if await c.fetchone():
-                return True
-        # Then check table-specific ban if table_name provided
-        if table_name:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Server-wide ban
             async with db.execute(
-                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
-                (guild_id, user_id, table_name)
+                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
+                (guild_id, user_id)
             ) as c:
                 if await c.fetchone():
                     return True
+            # Table-specific ban
+            if table_name:
+                async with db.execute(
+                    "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                    (guild_id, user_id, table_name)
+                ) as c:
+                    if await c.fetchone():
+                        return True
+    except Exception as e:
+        print(f"[db] is_banned error: {e}")
     return False
 
 async def delete_player_stats(user_id: int) -> bool:

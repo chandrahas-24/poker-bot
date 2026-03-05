@@ -60,6 +60,7 @@ class HandResult:
     pot:          int
     summary:      str
     chip_deltas:  dict        # {user_id: net gain/loss}
+    community:    list = None # board cards at time of result
     winner_ranks: dict = None # {user_id: "Flush"} etc
     pot_results:  list = None # [(amount, [winner,...]), ...] one entry per side pot
     is_over:      bool = False
@@ -82,6 +83,7 @@ class PokerGame:
         self.current_idx:    int               = 0
         self.current_bet:    int               = 0
         self.last_raiser:    Optional[int]     = None
+        self.last_raise_size: int             = 0
         self.hand_num:       int               = 0
         self._hand_result:   Optional[HandResult] = None
         self.side_pots:      list[SidePot]     = []
@@ -160,6 +162,12 @@ class PokerGame:
             return False, "❌ Need at least 2 players with chips to start."
         self.players   = active
         self.side_pots = []
+
+        # Rotate dealer now, after _process_pending has trimmed the player list.
+        # Doing it in _end_hand uses the stale pre-leave list and can corrupt the index.
+        if self.players:
+            self.dealer_idx = (self.dealer_idx % len(self.players) + 1) % len(self.players)
+
         for p in self.players:
             p.reset_for_hand()
 
@@ -169,6 +177,7 @@ class PokerGame:
         self.pot          = 0
         self.current_bet  = 0
         self.last_raiser  = None
+        self.last_raise_size = 0
         self._hand_result = None
         self.hand_num    += 1
 
@@ -286,11 +295,28 @@ class PokerGame:
         )
         if not others_can_call:
             return False, "❌ Everyone else is all-in. You can only call or fold."
-        total_needed = self.current_bet - p.bet + amount
-        if total_needed > p.chips:
-            total_needed = p.chips
         if amount <= 0:
             return False, "❌ Raise amount must be greater than 0."
+
+        # Minimum raise = size of the last raise, or big blind if no raise yet.
+        min_raise = self.last_raise_size if self.last_raise_size > 0 else self.BIG_BLIND
+        call_needed  = self.current_bet - p.bet
+        total_needed = call_needed + amount
+        going_all_in = total_needed >= p.chips
+
+        # Only enforce min-raise if the player has enough chips to meet it.
+        if not going_all_in and amount < min_raise:
+            return False, f"❌ Minimum raise is **{min_raise}** chips. (Use All-In to go all-in for less.)"
+
+        if total_needed > p.chips:
+            total_needed = p.chips
+
+        new_bet = p.bet + total_needed
+        actual_raise = new_bet - self.current_bet
+        # Track raise size for future min-raise enforcement (only if a full raise)
+        if actual_raise >= min_raise:
+            self.last_raise_size = actual_raise
+
         p.chips     -= total_needed
         p.bet       += total_needed
         p.total_bet += total_needed
@@ -354,6 +380,7 @@ class PokerGame:
             p.reset_for_street()
         self.current_bet = 0
         self.last_raiser = None
+        self.last_raise_size = 0
         n     = len(self.players)
         start = (self.dealer_idx + 1) % n
         self.current_idx = self._next_active_idx(start)
@@ -476,6 +503,7 @@ class PokerGame:
             pot          = self.pot,
             summary      = "\n".join(lines),
             chip_deltas  = chip_deltas,
+            community    = list(self.community),
             winner_ranks = winner_ranks,
             pot_results  = pot_results,
         )
@@ -489,13 +517,19 @@ class PokerGame:
             return False, "Player not found."
         if p.folded:
             return False, "Already folded."
+
+        # 1. Capture turn status BEFORE setting them to folded
+        was_turn = self.is_turn(user_id)
+
         p.folded = True
-        p.acted  = True
+        p.acted = True
         msg = f"🏳️ **{p.display_name}** was force-folded."
-        # If it was their turn, advance
-        if self.is_turn(user_id) or not self.current_player():
+
+        # 2. Use was_turn, and check if this leaves only 1 active player
+        if was_turn or not self.current_player() or len(self.players_in_hand) == 1:
             end = self._advance()
             return True, msg + ("\n" + end if end else "")
+
         # If not their turn, check if folding them closes betting
         if self._betting_closed():
             end = self._next_street()
@@ -511,12 +545,16 @@ class PokerGame:
             d = deltas[p.user_id]
             lines.append(f"  {p.display_name}: {'+' if d >= 0 else ''}{d}")
         return HandResult(winners=[winner], pot=self.pot,
-                          summary="\n".join(lines), chip_deltas=deltas)
+                          summary="\n".join(lines), chip_deltas=deltas,
+                          community=list(self.community))
 
     def _end_hand(self):
         self.street = Street.WAITING
-        if self.players:
-            self.dealer_idx = (self.dealer_idx + 1) % len(self.players)
+        # NOTE: dealer_idx is intentionally NOT rotated here.
+        # Rotation happens at the top of start_hand(), AFTER _process_pending()
+        # has removed any pending-leave players. Rotating here would use the
+        # pre-leave player list, causing the index to point at the wrong player
+        # or go out-of-bounds once leavers are removed.
         self.community = []
         self.pot       = 0
         for p in self.players:

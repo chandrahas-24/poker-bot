@@ -253,6 +253,10 @@ async def _auto_next_hand(t: TableState, channel):
 
 async def _close_table(channel, t: TableState):
     key = (channel.guild.id, channel.id)
+    cancel_timer(t)
+    if t.auto_task and not t.auto_task.done():
+        t.auto_task.cancel()
+    tables.pop(key, None)
     # Return chips for seated players not already paid out via pending_leaves
     for p in list(t.game.players):
         if p.user_id not in t.game.pending_leaves:

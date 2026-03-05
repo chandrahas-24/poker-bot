@@ -399,6 +399,18 @@ async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) 
         print(f"[db] is_banned error: {e}")
     return False
 
+async def get_all_bans(guild_id: int) -> list[dict]:
+    """Fetch all active bans for a given guild."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT user_id, username, table_name, banned_by, ts 
+            FROM poker_bans 
+            WHERE guild_id = ?
+            ORDER BY ts DESC
+        """, (guild_id,)) as c:
+            return [dict(r) for r in await c.fetchall()]
+
 
 async def delete_player_stats(user_id: int) -> bool:
     """Remove a player's stats entry from the leaderboard. Returns True if found."""

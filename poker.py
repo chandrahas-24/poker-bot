@@ -1220,6 +1220,7 @@ class PokerCog(commands.Cog):
         self.bot = bot
 
     poker = app_commands.Group(name="poker", description="Texas Hold'em poker")
+    pokerlist = app_commands.Group(name="pokerlist", description="Poker banned list")
 
     # ── Table management ──────────────────────────────────────────────────
 
@@ -1637,6 +1638,42 @@ class PokerCog(commands.Cog):
         await interaction.response.send_message(
             f"✅ **-{amount}** chips from **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
+
+    @pokerlist.command(name="bans", description="[Manager] List all currently banned players")
+    async def list_bans(self, interaction: discord.Interaction):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
+
+        # Defer so the database has time to fetch without timing out
+        await interaction.response.defer(ephemeral=True)
+
+        bans = await db.get_all_bans(interaction.guild_id)
+
+        if not bans:
+            await interaction.followup.send("✅ There are currently no banned players in this server.", ephemeral=True)
+            return
+
+        lines = []
+        for b in bans:
+            # Check if it's a table ban or server-wide ban
+            scope = f"Table: **{b['table_name']}**" if b['table_name'] else "**Server-wide**"
+            date_str = b['ts'].split(" ")[0]  # Just grab the YYYY-MM-DD part for cleanliness
+
+            lines.append(f"• **{b['username']}** (`{b['user_id']}`) — {scope} *(on {date_str})*")
+
+        # Discord has a 4096 character limit for embed descriptions.
+        # This safely joins them and truncates if the list is absurdly massive.
+        description = "\n".join(lines)[:4096]
+
+        embed = discord.Embed(
+            title="🔨 Active Poker Bans",
+            description=description,
+            color=0xED4245
+        )
+        embed.set_footer(text=f"Total bans: {len(bans)}")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @poker.command(name="settings", description="[Manager] View table settings")
     async def settings_view(self, interaction: discord.Interaction):

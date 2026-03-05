@@ -226,6 +226,21 @@ async def get_leaderboard(limit: int = 10) -> list[dict]:
         """, (limit,)) as c:
             return [dict(r) for r in await c.fetchall()]
 
+async def get_player_rank(user_id: int) -> int | None:
+    """Returns 1-based rank by net chips, or None if not in stats."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM stats WHERE user_id=?", (user_id,)) as c:
+            if not await c.fetchone():
+                return None
+        async with db.execute("""
+            SELECT COUNT(*) + 1 FROM stats
+            WHERE (chips_won - chips_lost) > (
+                SELECT chips_won - chips_lost FROM stats WHERE user_id = ?
+            )
+        """, (user_id,)) as c:
+            row = await c.fetchone()
+            return row[0] if row else None
+
 
 async def get_player_stats(user_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:

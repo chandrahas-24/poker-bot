@@ -9,6 +9,7 @@ from treys import Evaluator
 import card_images
 import os, asyncio, uuid
 from datetime import datetime
+import time
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -42,8 +43,9 @@ class TableState:
         self.street_log:  list[str] = []
         self.closing      = False
         self.auto_task:   asyncio.Task | None = None
-        self.timer_task:  asyncio.Task | None = None
-        self.msg_count    = 0
+        self.timer_task: asyncio.Task | None = None
+        self.ping_user_id: int | None = None
+        self.msg_count = 0
 
 tables: dict[tuple, TableState] = {}
 
@@ -105,10 +107,14 @@ def start_timer(t: TableState, channel):
     t.timer_task = asyncio.create_task(_turn_timer(t, channel, cp.user_id))
 
 async def _turn_timer(t: TableState, channel, user_id: int):
-    settings = await db.get_settings(channel.guild.id)
-    timeout  = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
+    settings   = await db.get_settings(channel.guild.id)
+    timeout    = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
+    deadline   = int(time.time()) + timeout
+    warn_after = timeout - max(timeout // 5, 15)  # warn with ~1/5 remaining, floor of 15s notice
+
+    # ── Warning phase ──────────────────────────────────────────────────────
     try:
-        await asyncio.sleep(timeout)
+        await asyncio.sleep(warn_after)
     except asyncio.CancelledError:
         return
 
@@ -118,13 +124,36 @@ async def _turn_timer(t: TableState, channel, user_id: int):
     if not p:
         return
 
-    name = p.display_name
+    warn_msg = await channel.send(
+        f"⚠️ <@{user_id}> — act now! You'll be auto-folded <t:{deadline}:R>."
+    )
 
+    # ── Fold phase ─────────────────────────────────────────────────────────
+    try:
+        await asyncio.sleep(timeout - warn_after)
+    except asyncio.CancelledError:
+        try:
+            await warn_msg.delete()
+        except Exception:
+            pass
+        return
+
+    try:
+        await warn_msg.delete()
+    except Exception:
+        pass
+
+    if not t.game.is_turn(user_id):
+        return
+    p = t.game.get_player(user_id)
+    if not p:
+        return
+
+    name = p.display_name
     if user_id not in t.game.kicked_users:
         t.game.kicked_users.append(user_id)
     if user_id not in t.game.pending_leaves:
         t.game.pending_leaves.append(user_id)
-
     if not p.folded:
         ok, fold_msg = t.game.force_fold(user_id)
         if ok:
@@ -134,9 +163,7 @@ async def _turn_timer(t: TableState, channel, user_id: int):
             for part in parts:
                 if part.strip():
                     slog(t, part)
-
     await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
-
     print(f"[timer] _hand_result={t.game._hand_result is not None}, street={t.game.street}, channel_type={type(channel).__name__}")
     if t.game._hand_result:
         await _process_result(channel.guild, channel, t)
@@ -408,9 +435,19 @@ async def send_turn_ping(channel, t: TableState):
         except discord.NotFound:
             pass
         t.ping_msg = None
+
     cp = t.game.current_player()
     if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
+        t.ping_user_id = None
         return
+
+    # If we already sent a ping for this player, don't send another.
+    # This guards against concurrent refresh calls (e.g. a button click and
+    # an on_channel_message resend racing each other).
+    if t.ping_user_id == cp.user_id:
+        return
+
+    t.ping_user_id = cp.user_id  # claim BEFORE the await so concurrent calls see it
     call_amt = t.game.call_amount(cp)
     hint     = f"call **{call_amt}**, raise, or fold" if call_amt else "check or raise"
     t.ping_msg = await channel.send(f"<@{cp.user_id}> your turn — {hint}")
@@ -803,8 +840,8 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
 
 class RaisePickerView(discord.ui.View):
     """Shown when player clicks Raise — offers preset options."""
-    def __init__(self, t: TableState, channel, guild):
-        super().__init__(timeout=30)
+    def __init__(self, t: TableState, channel, guild, timeout: float):
+        super().__init__(timeout=timeout)
         self.t = t; self.channel = channel; self.guild = guild
 
     async def _do_raise(self, interaction: discord.Interaction, raise_amount: int):
@@ -1002,13 +1039,21 @@ class GameView(discord.ui.View):
     @discord.ui.button(label="Raise", style=discord.ButtonStyle.green, row=1)
     async def btn_raise(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
-        view = RaisePickerView(self.t, interaction.channel, interaction.guild)
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True);
+            return
+
+        # Fetch the actual AFK timer from your database settings
+        settings = await db.get_settings(interaction.guild_id)
+        afk_time = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
+
+        # Pass it into your view
+        view = RaisePickerView(self.t, interaction.channel, interaction.guild, timeout=afk_time)
+
         g = self.t.game
         p = g.get_player(interaction.user.id)
         call_amt = g.call_amount(p) if p else 0
-        pot_third  = max(call_amt, g.pot // 3) if p else 0
-        pot_half   = max(call_amt, g.pot // 2) if p else 0
+        pot_third = max(call_amt, g.pot // 3) if p else 0
+        pot_half = max(call_amt, g.pot // 2) if p else 0
         stack_half = max(call_amt, p.chips // 2) if p else 0
         await interaction.response.send_message(
             f"**Raise options** — Pot: {g.pot} 🪙  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
@@ -1181,7 +1226,7 @@ class PokerCog(commands.Cog):
         t   = get_table(key)
         if not t:
             await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
-        t.hand_msg = None; t.board_file = None; t.ping_msg = None
+        t.hand_msg = None; t.board_file = None; t.ping_msg = None; t.ping_user_id = None; t.msg_count = 0
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
 
@@ -1493,7 +1538,7 @@ class PokerCog(commands.Cog):
         embed.add_field(name="Resend Embed",     value=f"every {s.get('resend_after_msgs', TABLE_RESEND_MSGS)} msgs", inline=True)
         embed.add_field(name="Manager Role",     value=role_str, inline=False)
         embed.add_field(name="Log Channel",      value=log_str,  inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
     @poker.command(name="setblinds", description="[Manager] Set small and big blind amounts")
     @app_commands.describe(small="Small blind", big="Big blind")

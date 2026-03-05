@@ -673,7 +673,82 @@ async def _process_result(guild, channel, t: TableState):
     if t.closing:
         await _close_table(channel, t)
     else:
+        if result.showdown_players:
+            await _reveal_phase(channel, t, result)
         schedule_next_hand(t, channel)
+
+# ── Showdown reveal (muck / show) ─────────────────────────────────────────────
+
+class ShowdownRevealView(discord.ui.View):
+    """Non-winners can show or muck after a showdown. Winners are auto-shown by the engine."""
+    def __init__(self, t: TableState, result, pending_user_ids: list[int], timeout: int = TURN_TIMEOUT_DEFAULT):
+        super().__init__(timeout=timeout)
+        self.t       = t
+        self.result  = result
+        self.pending = set(pending_user_ids)
+        self._done   = asyncio.Event()
+
+    async def _resolve(self, user_id: int):
+        self.pending.discard(user_id)
+        if not self.pending:
+            self._done.set()
+
+    async def on_timeout(self):
+        self._done.set()
+
+    @discord.ui.button(label="Show Hand 👁️", style=discord.ButtonStyle.green)
+    async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in self.pending:
+            await interaction.response.send_message("❌ Nothing to show.", ephemeral=True); return
+        sp = next((p for p in self.result.showdown_players if p.user_id == interaction.user.id), None)
+        if not sp or not sp.hole_cards:
+            await interaction.response.send_message("❌ No cards found.", ephemeral=True); return
+        score    = evaluator.evaluate(sp.hole_cards, self.result.community)
+        rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
+        caption  = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)} — *{rank_str}*"
+        if USE_IMAGES:
+            await interaction.response.send_message(caption, file=card_images.make_strip(sp.hole_cards))
+        else:
+            await interaction.response.send_message(caption)
+        await self._resolve(interaction.user.id)
+
+    @discord.ui.button(label="Muck 🗑️", style=discord.ButtonStyle.grey)
+    async def muck(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in self.pending:
+            await interaction.response.send_message("❌ Nothing to muck.", ephemeral=True); return
+        await interaction.response.send_message(
+            f"🗑️ **{interaction.user.display_name}** mucked their hand.")
+        await self._resolve(interaction.user.id)
+
+async def _reveal_phase(channel, t: TableState, result):
+    """
+    After a showdown, winners' hands were already shown by the engine.
+    Non-winners get a window to optionally show or muck before the next hand starts.
+    """
+    winner_ids = {w.user_id for w in result.winners}
+    candidates = [p for p in result.showdown_players if p.user_id not in winner_ids]
+    if not candidates:
+        return  # Chop — everyone won, nothing to reveal
+
+    settings    = await db.get_settings(channel.guild.id)
+    timeout     = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
+    deadline    = int(time.time()) + timeout
+
+    pending_ids = [p.user_id for p in candidates]
+    mentions    = " ".join(f"<@{uid}>" for uid in pending_ids)
+    view        = ShowdownRevealView(t, result, pending_ids, timeout=timeout)
+    msg         = await channel.send(
+        f"👁️ {mentions} — show your hand or muck? *(auto-mucks <t:{deadline}:R>)*",
+        view=view
+    )
+    try:
+        await asyncio.wait_for(view._done.wait(), timeout=timeout + 1)
+    except asyncio.TimeoutError:
+        pass
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 # ── Between-hands view ────────────────────────────────────────────────────────
 

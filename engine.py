@@ -62,8 +62,9 @@ class HandResult:
     chip_deltas:  dict        # {user_id: net gain/loss}
     community:    list = None # board cards at time of result
     winner_ranks: dict = None # {user_id: "Flush"} etc
-    pot_results:  list = None # [(amount, [winner,...]), ...] one entry per side pot
-    is_over:      bool = False
+    pot_results: list = None  # [(amount, [winner,...]), ...] one entry per side pot
+    showdown_players: list = None  # snapshot of all non-folded players at showdown
+    is_over: bool = False
 
 class PokerGame:
     SMALL_BLIND = 25
@@ -504,13 +505,14 @@ class PokerGame:
 
         self.side_pots    = pots
         self._hand_result = HandResult(
-            winners      = all_winners,
-            pot          = self.pot,
-            summary      = "\n".join(lines),
-            chip_deltas  = chip_deltas,
-            community    = list(self.community),
-            winner_ranks = winner_ranks,
-            pot_results  = pot_results,
+            winners=all_winners,
+            pot=self.pot,
+            summary="\n".join(lines),
+            chip_deltas=chip_deltas,
+            community=list(self.community),
+            winner_ranks=winner_ranks,
+            pot_results=pot_results,
+            showdown_players=list(alive),  # snapshot before _end_hand clears state
         )
         self._end_hand()
         return "\n".join(lines)

@@ -1440,10 +1440,14 @@ class PokerCog(commands.Cog):
     @poker.command(name="leaderboard", description="Top poker players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):
         rows = await db.get_leaderboard(10)
+        caller_id = interaction.user.id
+        caller_row = await db.get_player_stats(caller_id)
         if not rows:
-            await interaction.response.send_message("No stats yet!", ephemeral=True); return
+            await interaction.response.send_message("No stats yet!", ephemeral=True);
+            return
 
-        # Fetch current global usernames from Discord (may differ from stored ones)
+        await interaction.response.defer()
+
         async def get_uname(uid):
             try:
                 m = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
@@ -1451,22 +1455,52 @@ class PokerCog(commands.Cog):
             except Exception:
                 return None
 
-        HDR   = f"{'#':<3} {'Username':<20} {'Hands':>5} {'Win%':>5} {'Net':>8} {'Wallet':>8}"
-        SEP   = "─" * len(HDR)
-        lines = ["```", HDR, SEP]
+        MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+        top_ids = {r['user_id'] for r in rows}
+
+        table_lines = ["```"]
+        table_lines.append(f"{'':4}{'Player':<18} {'Win%':>5} {'Net':>9} {'Wallet':>8}")
+        table_lines.append("─" * 47)
         for i, r in enumerate(rows):
-            wp      = f"{r['hands_won']/r['hands_played']*100:.0f}%" if r['hands_played'] else "—"
-            net     = r['net_chips']
-            sign    = "+" if net >= 0 else ""
-            uid     = r.get('user_id', '')
-            uname   = await get_uname(uid) or r['username']
-            num     = f"{i+1}."
-            # Row 1: rank + username + stats
-            lines.append(f"{num:<3} {uname:<20} {r['hands_played']:>5} {wp:>5} {sign+str(net):>8} {r['wallet']:>8}")
-            # Row 2: indented user ID
-            lines.append(f"    {uid}")
-        lines.append("```")
-        await interaction.response.send_message("**Poker Leaderboard**\n" + "\n".join(lines))
+            rank = i + 1
+            wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
+            net = r['net_chips']
+            sign = "+" if net >= 0 else ""
+            uname = (await get_uname(r['user_id']) or r['username'])[:17]
+            medal = MEDALS.get(rank, f"{rank}. ")
+            you_tag = " ◀" if r['user_id'] == caller_id else ""
+            table_lines.append(f"{medal:<4}{uname:<18} {wp:>5} {sign + str(net):>9} {r['wallet']:>8}{you_tag}")
+        table_lines.append("```")
+
+        embed = discord.Embed(
+            title="🏆 Poker Leaderboard",
+            description="\n".join(table_lines),
+            color=0xF1C40F
+        )
+
+        # Caller's stats — shown at the bottom whether or not they're in the top 10
+        if caller_row:
+            caller_rank = await db.get_player_rank(caller_id)
+            caller_net = caller_row['net_chips']
+            caller_wp = f"{caller_row['hands_won'] / caller_row['hands_played'] * 100:.1f}%" if caller_row[
+                'hands_played'] else "—"
+            caller_sign = "+" if caller_net >= 0 else ""
+            in_top = caller_id in top_ids
+            rank_str = f"#{caller_rank}" if caller_rank else "—"
+            label = f"📊 Your Stats  ·  {rank_str}" + (" *(in top 10)*" if in_top else "")
+            embed.add_field(
+                name=label,
+                value=(
+                    f"Win% **{caller_wp}**  ·  "
+                    f"Net **{caller_sign}{caller_net}** 🪙  ·  "
+                    f"Wallet **{caller_row['wallet']}** 🪙"
+                ),
+                inline=False
+            )
+        else:
+            embed.add_field(name="📊 Your Stats", value="No hands played yet.", inline=False)
+
+        await interaction.followup.send(embed=embed)
 
     @poker.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")

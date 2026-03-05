@@ -4,6 +4,7 @@ from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "poker.db")
 
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -99,6 +100,7 @@ async def init_db():
         """)
         await db.commit()
 
+
 # ── Guild settings ────────────────────────────────────────────────────────────
 
 async def get_settings(guild_id: int) -> dict:
@@ -112,6 +114,7 @@ async def get_settings(guild_id: int) -> dict:
                     "min_wallet": 50, "next_hand_delay": 30,
                     "manager_role_id": None, "log_channel_id": None,
                     "turn_timeout": 300, "resend_after_msgs": 10}
+
 
 async def set_settings(guild_id: int, **kwargs):
     current = await get_settings(guild_id)
@@ -136,6 +139,7 @@ async def set_settings(guild_id: int, **kwargs):
         """, current)
         await db.commit()
 
+
 # ── Wallet ────────────────────────────────────────────────────────────────────
 
 async def get_balance(user_id: int) -> int:
@@ -143,6 +147,7 @@ async def get_balance(user_id: int) -> int:
         async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
             row = await c.fetchone()
             return row[0] if row else 0
+
 
 async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str,
                     amount: int, note: str = "") -> int:
@@ -162,15 +167,16 @@ async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str
             row = await c.fetchone()
             return row[0] if row else 0
 
+
 async def deduct_chips(user_id: int, amount: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone()
-            if not row or row[0] < amount:
-                return False
-        await db.execute("UPDATE wallets SET balance = balance - ? WHERE user_id=?", (amount, user_id))
+        await db.execute("UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+                         (amount, user_id, amount))
         await db.commit()
-        return True
+        async with db.execute("SELECT changes()") as c:
+            row = await c.fetchone()
+            return bool(row and row[0] > 0)
+
 
 async def return_chips(user_id: int, amount: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -180,6 +186,7 @@ async def return_chips(user_id: int, amount: int):
         """, (user_id, amount, amount))
         await db.commit()
 
+
 async def upsert_wallet_name(user_id: int, username: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -187,6 +194,7 @@ async def upsert_wallet_name(user_id: int, username: str):
             ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
         """, (user_id, username))
         await db.commit()
+
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -205,6 +213,7 @@ async def record_hand(user_id: int, username: str, won: bool, net_chips: int):
               1 if won else 0, net_chips, -net_chips))
         await db.commit()
 
+
 async def get_leaderboard(limit: int = 10) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -216,6 +225,7 @@ async def get_leaderboard(limit: int = 10) -> list[dict]:
             ORDER BY net_chips DESC LIMIT ?
         """, (limit,)) as c:
             return [dict(r) for r in await c.fetchall()]
+
 
 async def get_player_stats(user_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -230,6 +240,7 @@ async def get_player_stats(user_id: int) -> dict | None:
             row = await c.fetchone()
             return dict(row) if row else None
 
+
 # ── Hand log ──────────────────────────────────────────────────────────────────
 
 async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str):
@@ -240,25 +251,31 @@ async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int,
         """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), guild_id, table_id, table_name, hand_num, summary))
         await db.commit()
 
+
 # ── In-play chip recovery ─────────────────────────────────────────────────────
 
 async def mark_chips_in_play(user_id: int, username: str, amount: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO chips_in_play (user_id, username, amount) VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, amount=excluded.amount
+            ON CONFLICT(user_id) DO UPDATE SET 
+                username=excluded.username, 
+                amount=chips_in_play.amount + excluded.amount
         """, (user_id, username, amount))
         await db.commit()
+
 
 async def update_chips_in_play(user_id: int, amount: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE chips_in_play SET amount=? WHERE user_id=?", (amount, user_id))
         await db.commit()
 
+
 async def clear_chips_in_play(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (user_id,))
         await db.commit()
+
 
 async def recover_chips_in_play() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -274,6 +291,7 @@ async def recover_chips_in_play() -> list[dict]:
         await db.commit()
         return rows
 
+
 # ── Audit log ─────────────────────────────────────────────────────────────────
 
 async def write_audit(action: str, user_id: int, user_name: str, detail: str = ""):
@@ -283,6 +301,7 @@ async def write_audit(action: str, user_id: int, user_name: str, detail: str = "
             VALUES (?, ?, ?, ?, ?)
         """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), action, user_id, user_name, detail))
         await db.commit()
+
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 
@@ -303,8 +322,8 @@ async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int,
         await db.commit()
         # Avoid duplicate bans
         async with db.execute(
-            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS ?",
-            (guild_id, user_id, table_name)
+                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS ?",
+                (guild_id, user_id, table_name)
         ) as c:
             if await c.fetchone():
                 return False  # already banned at this scope
@@ -315,22 +334,23 @@ async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int,
         await db.commit()
     return True
 
+
 async def unban_player(guild_id: int, user_id: int, table_name: str | None = None) -> int:
     """Remove ban. Returns number of bans removed."""
     async with aiosqlite.connect(DB_PATH) as db:
         if table_name is None:
             # Remove ALL bans for this user in this guild
             async with db.execute(
-                "SELECT COUNT(*) FROM poker_bans WHERE guild_id=? AND user_id=?",
-                (guild_id, user_id)
+                    "SELECT COUNT(*) FROM poker_bans WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id)
             ) as c:
                 count = (await c.fetchone())[0]
             await db.execute("DELETE FROM poker_bans WHERE guild_id=? AND user_id=?", (guild_id, user_id))
         else:
             # Remove only the table-specific ban
             async with db.execute(
-                "SELECT COUNT(*) FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
-                (guild_id, user_id, table_name)
+                    "SELECT COUNT(*) FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                    (guild_id, user_id, table_name)
             ) as c:
                 count = (await c.fetchone())[0]
             await db.execute(
@@ -340,28 +360,30 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
         await db.commit()
         return count
 
+
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
     """True if user is server-wide banned OR banned from specific table_name."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             # Server-wide ban
             async with db.execute(
-                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
-                (guild_id, user_id)
+                    "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
+                    (guild_id, user_id)
             ) as c:
                 if await c.fetchone():
                     return True
             # Table-specific ban
             if table_name:
                 async with db.execute(
-                    "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
-                    (guild_id, user_id, table_name)
+                        "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                        (guild_id, user_id, table_name)
                 ) as c:
                     if await c.fetchone():
                         return True
     except Exception as e:
         print(f"[db] is_banned error: {e}")
     return False
+
 
 async def delete_player_stats(user_id: int) -> bool:
     """Remove a player's stats entry from the leaderboard. Returns True if found."""
@@ -372,6 +394,7 @@ async def delete_player_stats(user_id: int) -> bool:
         await db.execute("DELETE FROM stats WHERE user_id=?", (user_id,))
         await db.commit()
     return True
+
 
 async def reset_database(admin_id: int, admin_name: str):
     """Wipe all gameplay data and log who did it."""

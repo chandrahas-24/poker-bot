@@ -420,7 +420,6 @@ async def reset_database(admin_id: int, admin_name: str):
         await db.execute("DELETE FROM hand_log")
         await db.execute("DELETE FROM chip_log")
         await db.execute("DELETE FROM chips_in_play")
-        await db.execute("DELETE FROM guild_settings")
         await db.execute("DELETE FROM poker_bans")
         # Keep audit_log intact — insert the reset event after clearing everything else
         await db.execute("""

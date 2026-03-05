@@ -44,6 +44,7 @@ class TableState:
         self.closing      = False
         self.auto_task:   asyncio.Task | None = None
         self.timer_task: asyncio.Task | None = None
+        self.timer_user_id: int | None = None
         self.ping_user_id: int | None = None
         self.msg_count = 0
 
@@ -92,18 +93,23 @@ def cancel_timer(t: TableState):
             current = asyncio.current_task()
         except RuntimeError:
             current = None
-
         # Prevent the task from committing suicide
         if t.timer_task != current:
             t.timer_task.cancel()
-
     t.timer_task = None
+    t.timer_user_id = None
 
 def start_timer(t: TableState, channel):
-    cancel_timer(t)
     cp = t.game.current_player()
     if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
+        cancel_timer(t)
         return
+    # Same player's timer is already running — leave it completely alone
+    if (t.timer_task and not t.timer_task.done()
+            and t.timer_user_id == cp.user_id):
+        return
+    cancel_timer(t)
+    t.timer_user_id = cp.user_id
     t.timer_task = asyncio.create_task(_turn_timer(t, channel, cp.user_id))
 
 async def _turn_timer(t: TableState, channel, user_id: int):
@@ -210,10 +216,14 @@ async def _auto_next_hand(t: TableState, channel):
     bb = t.game.BIG_BLIND
     for p in list(t.game.players):
         if p.chips < bb and p.user_id not in t.game.pending_leaves:
-            if p.chips > 0:
-                await db.return_chips(p.user_id, p.chips)
+            # FIX: Include pending_rebuy and remove them immediately
+            total_to_return = p.chips + p.pending_rebuy
+            if total_to_return > 0:
+                await db.return_chips(p.user_id, total_to_return)
             await db.clear_chips_in_play(p.user_id)
-            t.game.pending_leaves.append(p.user_id)
+
+            t.game.players.remove(p)  # <-- Remove them right now
+
             try:
                 await channel.send(
                     f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** 🪙) is below the big blind (**{bb}** 🪙). Chips returned to wallet.")
@@ -245,14 +255,17 @@ async def _close_table(channel, t: TableState):
     key = (channel.guild.id, channel.id)
     # Return chips for seated players not already paid out via pending_leaves
     for p in list(t.game.players):
-        if p.user_id not in t.game.pending_leaves and p.chips > 0:
-            await db.return_chips(p.user_id, p.chips)
-            await db.clear_chips_in_play(p.user_id)
+        if p.user_id not in t.game.pending_leaves:
+            total_to_return = p.chips + p.pending_rebuy
+            if total_to_return > 0:
+                await db.return_chips(p.user_id, total_to_return)
+                await db.clear_chips_in_play(p.user_id)
     # Return chips for pending joins
     for p in list(t.game.pending_joins):
-        await db.return_chips(p.user_id, p.chips)
-        await db.clear_chips_in_play(p.user_id)
-    tables.pop(key, None)
+        total_to_return = p.chips + p.pending_rebuy
+        if total_to_return > 0:
+            await db.return_chips(p.user_id, total_to_return)
+            await db.clear_chips_in_play(p.user_id)
     await channel.send(f"🚪 **Table '{t.name}'** closed. All chips returned.")
 
 # ── Log thread ────────────────────────────────────────────────────────────────
@@ -460,6 +473,8 @@ async def refresh(channel, t: TableState, new_hand: bool = False):
     view  = GameView(t)
     f     = t.board_file
     if new_hand or not t.hand_msg:
+        if new_hand:
+            t.ping_user_id = None  # allow ping to re-send beneath the new embed
         t.hand_msg = await channel.send(embed=embed, view=view, file=f)
     else:
         try:
@@ -611,9 +626,11 @@ async def _process_result(guild, channel, t: TableState):
     try:
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
-            if p and p.chips > 0:
-                await db.return_chips(uid, p.chips)
-                await db.clear_chips_in_play(uid)
+            if p:
+                total_to_return = p.chips + p.pending_rebuy
+                if total_to_return > 0:
+                    await db.return_chips(uid, total_to_return)
+                    await db.clear_chips_in_play(uid)
         # Remove them from game.players now so the post-hand embed is clean.
         # _process_pending in start_hand will find pending_leaves already empty and skip.
         for uid in list(t.game.pending_leaves):
@@ -1206,11 +1223,16 @@ class PokerCog(commands.Cog):
         t.game.BIG_BLIND   = settings["big_blind"]
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
-            if p and p.chips > 0:
-                await db.return_chips(uid, p.chips)
-                await db.clear_chips_in_play(uid)
-        # Clear the list so a failed start doesn't double-pay on the next attempt
+            if p:
+                total_to_return = p.chips + p.pending_rebuy
+                if total_to_return > 0:
+                    await db.return_chips(uid, total_to_return)
+                    await db.clear_chips_in_play(uid)
+                t.game.players.remove(p)
+
         t.game.pending_leaves.clear()
+        t.game.kicked_users.clear()
+
         slog_clear(t)
         success, msg = t.game.start_hand()
         slog(t, msg)
@@ -1247,8 +1269,10 @@ class PokerCog(commands.Cog):
 
         if t.game.street == Street.WAITING:
             t.game.players.remove(p)
-            if p.chips > 0:
-                await db.return_chips(user.id, p.chips)
+            # FIX: Add pending_rebuy to the refund
+            total_to_return = p.chips + p.pending_rebuy
+            if total_to_return > 0:
+                await db.return_chips(user.id, total_to_return)
                 await db.clear_chips_in_play(user.id)
             await interaction.response.send_message(
                 f"🦵 **{user.display_name}** has been kicked and removed from the table.")
@@ -1310,10 +1334,10 @@ class PokerCog(commands.Cog):
                         await db.clear_chips_in_play(user.id)
                 if p:
                     if t.game.street == Street.WAITING:
-                        # No hand running — remove immediately and return chips now.
                         t.game.players.remove(p)
-                        if p.chips > 0:
-                            await db.return_chips(user.id, p.chips)
+                        total = p.chips + p.pending_rebuy
+                        if total > 0:
+                            await db.return_chips(user.id, total)
                             await db.clear_chips_in_play(user.id)
                     else:
                         # Hand in progress — force fold then queue removal for after hand.
@@ -1439,14 +1463,15 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="leaderboard", description="Top poker players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):
+
+        await interaction.response.defer()
+
         rows = await db.get_leaderboard(10)
         caller_id = interaction.user.id
         caller_row = await db.get_player_stats(caller_id)
         if not rows:
             await interaction.response.send_message("No stats yet!", ephemeral=True);
             return
-
-        await interaction.response.defer()
 
         async def get_uname(uid):
             try:

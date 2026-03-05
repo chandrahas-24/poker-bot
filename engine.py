@@ -123,8 +123,9 @@ class PokerGame:
             if user_id not in self.pending_leaves:
                 self.pending_leaves.append(user_id)
             return 0, f"👋 **{p.display_name}** will leave after this hand."
+        total = p.chips + p.pending_rebuy
         self.players.remove(p)
-        return p.chips, f"👋 **{p.display_name}** cashed out **{p.chips}** chips."
+        return total, f"👋 **{p.display_name}** cashed out **{total}** chips."
 
     def queue_rebuy(self, user_id: int, amount: int) -> str:
         p = self.get_player(user_id)

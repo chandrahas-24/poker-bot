@@ -842,34 +842,6 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
         await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
         await interaction.response.send_message(msg, ephemeral=True)
 
-class WalletLookupModal(discord.ui.Modal, title="Check Wallet"):
-    user_input = discord.ui.TextInput(label="User (leave blank for yourself)", placeholder="@username, display name, or user ID", required=False, max_length=50)
-
-    def __init__(self, t: TableState):
-        super().__init__()
-        self.t = t
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = self.user_input.value.strip()
-        if not raw:
-            target = interaction.user
-        else:
-            uid_str = raw.lstrip("<@!>")
-            try:
-                uid    = int(uid_str)
-                target = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
-            except Exception:
-                target = discord.utils.find(
-                    lambda m: m.name.lower() == raw.lower() or m.display_name.lower() == raw.lower(),
-                    interaction.guild.members)
-            if not target:
-                await interaction.response.send_message("❌ User not found.", ephemeral=True); return
-        bal   = await db.get_balance(target.id)
-        p     = self.t.game.get_player(target.id) if self.t else None
-        table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
-        label = f"**{target.display_name}'s Wallet**" if target.id != interaction.user.id else "**Your Wallet**"
-        await interaction.response.send_message(f"{label}: {bal} 🪙{table_str}", ephemeral=True)
-
 class BetweenHandsView(discord.ui.View):
     def __init__(self, t: TableState):
         super().__init__(timeout=None)
@@ -1196,7 +1168,13 @@ class GameView(discord.ui.View):
 
     @discord.ui.button(label="Wallet", style=discord.ButtonStyle.grey, row=2)
     async def btn_wallet(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(WalletLookupModal(self.t))
+        uid = interaction.user.id
+        bal = await db.get_balance(uid)
+        p = self.t.game.get_player(uid)
+        table_str = f"  |  **At table:** {p.chips} 🪙" if p else ""
+
+        # Sends an ephemeral message instantly without a modal
+        await interaction.response.send_message(f"**Your Wallet:** {bal} 🪙{table_str}", ephemeral=True)
 
 # ── Confirm DB reset ──────────────────────────────────────────────────────────
 
@@ -1508,7 +1486,7 @@ class PokerCog(commands.Cog):
         p      = t.game.get_player(target.id) if t else None
         table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
         label  = f"**{target.display_name}'s Wallet**" if user else "**Your Wallet**"
-        await interaction.response.send_message(f"{label}: {bal} 🪙{table_str}", ephemeral=True)
+        await interaction.response.send_message(f"{label}: {bal} 🪙{table_str}", ephemeral=False)
 
     @poker.command(name="tip", description="Tip the dealer between hands")
     async def tip_cmd(self, interaction: discord.Interaction):

@@ -86,7 +86,15 @@ async def on_channel_message(message: discord.Message):
 
 def cancel_timer(t: TableState):
     if t.timer_task and not t.timer_task.done():
-        t.timer_task.cancel()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+
+        # Prevent the task from committing suicide
+        if t.timer_task != current:
+            t.timer_task.cancel()
+
     t.timer_task = None
 
 def start_timer(t: TableState, channel):

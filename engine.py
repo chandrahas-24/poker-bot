@@ -338,11 +338,15 @@ class PokerGame:
     def _advance(self) -> str:
         alive = self.players_in_hand
         if len(alive) == 1:
-            winner        = alive[0]
+            winner = alive[0]
             winner.chips += self.pot
             self._hand_result = self._build_fold_result(winner)
+
+            # Capture the pot value BEFORE the hand is cleared
+            pot_won = self.pot
+
             self._end_hand()
-            return f"🏆 **{winner.display_name}** wins **{self.pot}** chips (all others folded)!"
+            return f"🏆 **{winner.display_name}** wins **{pot_won}** chips (all others folded)!"
 
         if self._betting_closed():
             return self._next_street()

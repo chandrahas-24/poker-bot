@@ -553,7 +553,8 @@ class PokerGame:
             lines.append(f"  {p.display_name}: {'+' if d >= 0 else ''}{d}")
         return HandResult(winners=[winner], pot=self.pot,
                           summary="\n".join(lines), chip_deltas=deltas,
-                          community=list(self.community))
+                          community=list(self.community),
+                          showdown_players=[winner])
 
     def _end_hand(self):
         self.street = Street.WAITING

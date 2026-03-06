@@ -65,6 +65,7 @@ async def init_db():
             ("next_hand_delay", 30),
             ("turn_timeout", 300),
             ("resend_after_msgs", 10),
+            ("muck_time", 15),
         ]:
             try:
                 await db.execute(f"ALTER TABLE guild_settings ADD COLUMN {col} INTEGER DEFAULT {default}")
@@ -113,7 +114,7 @@ async def get_settings(guild_id: int) -> dict:
             return {"guild_id": guild_id, "small_blind": 25, "big_blind": 50,
                     "min_wallet": 50, "next_hand_delay": 30,
                     "manager_role_id": None, "log_channel_id": None,
-                    "turn_timeout": 300, "resend_after_msgs": 10}
+                    "turn_timeout": 300, "resend_after_msgs": 10, "muck_time": 15}
 
 
 async def set_settings(guild_id: int, **kwargs):
@@ -123,10 +124,11 @@ async def set_settings(guild_id: int, **kwargs):
         # Ensure new keys have defaults if missing
         current.setdefault("turn_timeout", 300)
         current.setdefault("resend_after_msgs", 10)
+        current.setdefault("muck_time", 15)
         await db.execute("""
             INSERT INTO guild_settings
-                (guild_id, small_blind, big_blind, min_wallet, next_hand_delay, manager_role_id, log_channel_id, turn_timeout, resend_after_msgs)
-            VALUES (:guild_id, :small_blind, :big_blind, :min_wallet, :next_hand_delay, :manager_role_id, :log_channel_id, :turn_timeout, :resend_after_msgs)
+                (guild_id, small_blind, big_blind, min_wallet, next_hand_delay, manager_role_id, log_channel_id, turn_timeout, resend_after_msgs, muck_time)
+            VALUES (:guild_id, :small_blind, :big_blind, :min_wallet, :next_hand_delay, :manager_role_id, :log_channel_id, :turn_timeout, :resend_after_msgs, :muck_time)
             ON CONFLICT(guild_id) DO UPDATE SET
                 small_blind       = :small_blind,
                 big_blind         = :big_blind,
@@ -135,7 +137,8 @@ async def set_settings(guild_id: int, **kwargs):
                 manager_role_id   = :manager_role_id,
                 log_channel_id    = :log_channel_id,
                 turn_timeout      = :turn_timeout,
-                resend_after_msgs = :resend_after_msgs
+                resend_after_msgs = :resend_after_msgs,
+                muck_time         = :muck_time
         """, current)
         await db.commit()
 

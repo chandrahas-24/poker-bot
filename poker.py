@@ -675,7 +675,11 @@ async def _process_result(guild, channel, t: TableState):
     else:
         if result.showdown_players:
             await _reveal_phase(channel, t, result)
-        schedule_next_hand(t, channel)
+
+        # Verify the table wasn't closed while we were waiting for the Muck buttons
+        key = (channel.guild.id, channel.id)
+        if get_table(key) is t and not t.closing:
+            schedule_next_hand(t, channel)
 
 # ── Showdown reveal (muck / show) ─────────────────────────────────────────────
 
@@ -715,32 +719,65 @@ class ShowdownRevealView(discord.ui.View):
     @discord.ui.button(label="Muck 🗑️", style=discord.ButtonStyle.grey)
     async def muck(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in self.pending:
-            await interaction.response.send_message("❌ Nothing to muck.", ephemeral=True); return
-        await interaction.response.send_message(
-            f"🗑️ **{interaction.user.display_name}** mucked their hand.")
+            await interaction.response.send_message("❌ Nothing to muck.", ephemeral=True);
+            return
+        await interaction.response.defer(ephemeral=True)
         await self._resolve(interaction.user.id)
 
+
 async def _reveal_phase(channel, t: TableState, result):
-    """
-    After a showdown, winners' hands were already shown by the engine.
-    Non-winners get a window to optionally show or muck before the next hand starts.
-    """
+    settings = await db.get_settings(channel.guild.id)
+    timeout = settings.get("muck_time", 15)  # Fetches custom time, defaults to 15s
+
+    # ── 1. Uncontested Win (Everyone Folded) ──────────────
+    if not result.pot_results:
+        winner = result.winners[0] if result.winners else None
+        if winner and winner.hole_cards:
+            deadline = int(time.time()) + timeout
+            view = ShowdownRevealView(t, result, [winner.user_id], timeout=timeout)
+            msg = await channel.send(
+                f"👁️ <@{winner.user_id}> — everyone folded! Show your hand or muck? *(auto-mucks <t:{deadline}:R>)*",
+                view=view
+            )
+            try:
+                await asyncio.wait_for(view._done.wait(), timeout=timeout + 1)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        return
+
+    # ── 2. Contested Showdown ─────────────────────────────
     winner_ids = {w.user_id for w in result.winners}
-    candidates = [p for p in result.showdown_players if p.user_id not in winner_ids]
+
+    # A. Automatically reveal winners' cards directly to the channel (No buttons)
+    for w in result.winners:
+        if w.hole_cards:
+            score = evaluator.evaluate(w.hole_cards, result.community)
+            rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
+            caption = f"🏆 **{w.display_name}** wins and shows: {hand_str(w.hole_cards)} — *{rank_str}*"
+            if USE_IMAGES:
+                await channel.send(caption, file=card_images.make_strip(w.hole_cards))
+            else:
+                await channel.send(caption)
+
+    # B. Prompt losers with a Show/Muck button
+    candidates = [p for p in (result.showdown_players or []) if p.user_id not in winner_ids]
     if not candidates:
-        return  # Chop — everyone won, nothing to reveal
+        return  # Chop pot — everyone tied and won, so everyone already showed automatically
 
-    settings    = await db.get_settings(channel.guild.id)
-    timeout     = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
-    deadline    = int(time.time()) + timeout
-
+    deadline = int(time.time()) + timeout
     pending_ids = [p.user_id for p in candidates]
-    mentions    = " ".join(f"<@{uid}>" for uid in pending_ids)
-    view        = ShowdownRevealView(t, result, pending_ids, timeout=timeout)
-    msg         = await channel.send(
-        f"👁️ {mentions} — show your hand or muck? *(auto-mucks <t:{deadline}:R>)*",
+    mentions = " ".join(f"<@{uid}>" for uid in pending_ids)
+
+    view = ShowdownRevealView(t, result, pending_ids, timeout=timeout)
+    msg = await channel.send(
+        f"👁️ {mentions} — show or muck? *(auto-mucks <t:{deadline}:R>)*",
         view=view
     )
+
     try:
         await asyncio.wait_for(view._done.wait(), timeout=timeout + 1)
     except asyncio.TimeoutError:
@@ -1220,8 +1257,8 @@ class PokerCog(commands.Cog):
         self.bot = bot
 
     poker = app_commands.Group(name="poker", description="Texas Hold'em poker")
-    pokerlist = app_commands.Group(name="pokerlist", description="Poker banned list")
-
+    pokerset = app_commands.Group(name="pokerset", description="Configure poker settings")
+    pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands")
     # ── Table management ──────────────────────────────────────────────────
 
     @poker.command(name="open", description="[Manager] Open a poker table in this channel")
@@ -1238,6 +1275,7 @@ class PokerCog(commands.Cog):
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
+        t.game.MIN_BUYIN = settings.get("min_wallet", 50)
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
 
@@ -1279,6 +1317,7 @@ class PokerCog(commands.Cog):
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
+        t.game.MIN_BUYIN = settings.get("min_wallet", 50)
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
             if p:
@@ -1312,7 +1351,7 @@ class PokerCog(commands.Cog):
 
     # ── Manager moderation commands ───────────────────────────────────────
 
-    @poker.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
+    @pokermgr.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
     @app_commands.describe(user="Player to kick")
     async def kick(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
@@ -1360,7 +1399,7 @@ class PokerCog(commands.Cog):
         else:
             await refresh(interaction.channel, t)
 
-    @poker.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
+    @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
     async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
         if not await is_manager(interaction):
@@ -1425,7 +1464,7 @@ class PokerCog(commands.Cog):
         else:
             await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kick_note}", ephemeral=not kicked_from)
 
-    @poker.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
+    @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
     async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
         if not await is_manager(interaction):
@@ -1448,7 +1487,7 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message(
                 f"ℹ️ **{user.display_name}** had no bans for {scope}.", ephemeral=True)
 
-    @poker.command(name="forcefold", description="[Manager] Force a player to fold their hand")
+    @pokermgr.command(name="forcefold", description="[Manager] Force a player to fold their hand")
     @app_commands.describe(user="Player to force fold")
     async def force_fold_cmd(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
@@ -1585,7 +1624,7 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(embed=embed)
 
-    @poker.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
+    @pokermgr.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")
     async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
@@ -1613,7 +1652,7 @@ class PokerCog(commands.Cog):
 
     # ── Manager settings commands ─────────────────────────────────────────
 
-    @poker.command(name="mgraddchips", description="[Manager] Add chips to a player's wallet")
+    @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
     async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
         if not await is_manager(interaction):
@@ -1626,7 +1665,7 @@ class PokerCog(commands.Cog):
             f"✅ **+{amount}** chips → **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
-    @poker.command(name="mgrremovechips", description="[Manager] Remove chips from a player's wallet")
+    @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
     async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
         if not await is_manager(interaction):
@@ -1639,7 +1678,7 @@ class PokerCog(commands.Cog):
             f"✅ **-{amount}** chips from **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
-    @pokerlist.command(name="bans", description="[Manager] List all currently banned players")
+    @pokermgr.command(name="bans", description="[Manager] List all currently banned players")
     async def list_bans(self, interaction: discord.Interaction):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
@@ -1685,15 +1724,16 @@ class PokerCog(commands.Cog):
         embed = discord.Embed(title="⚙️ Poker Settings", color=0x5865F2)
         embed.add_field(name="Small Blind",      value=str(s["small_blind"]),  inline=True)
         embed.add_field(name="Big Blind",        value=str(s["big_blind"]),    inline=True)
-        embed.add_field(name="Min Wallet",       value=str(s["min_wallet"]),   inline=True)
+        embed.add_field(name="Min Buy-in",       value=str(s["min_wallet"]),   inline=True)
         embed.add_field(name="Next Hand Delay",  value=f"{s.get('next_hand_delay', NEXT_HAND_DELAY_DEFAULT)}s", inline=True)
         embed.add_field(name="Turn Timeout",     value=f"{s.get('turn_timeout', TURN_TIMEOUT_DEFAULT)}s",      inline=True)
+        embed.add_field(name="Muck Timeout", value=f"{s.get('muck_time', 15)}s", inline=True)
         embed.add_field(name="Resend Embed",     value=f"every {s.get('resend_after_msgs', TABLE_RESEND_MSGS)} msgs", inline=True)
         embed.add_field(name="Manager Role",     value=role_str, inline=False)
         embed.add_field(name="Log Channel",      value=log_str,  inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
-    @poker.command(name="setblinds", description="[Manager] Set small and big blind amounts")
+    @pokerset.command(name="blinds", description="[Manager] Set small and big blind amounts")
     @app_commands.describe(small="Small blind", big="Big blind")
     async def set_blinds(self, interaction: discord.Interaction, small: int, big: int):
         if not await is_manager(interaction):
@@ -1703,17 +1743,20 @@ class PokerCog(commands.Cog):
         await db.set_settings(interaction.guild_id, small_blind=small, big_blind=big)
         await interaction.response.send_message(f"✅ Blinds: **{small}** / **{big}**")
 
-    @poker.command(name="setminwallet", description="[Manager] Set minimum wallet to join")
+    @pokerset.command(name="minbuyin", description="[Manager] Set minimum buy-in required to join")
     @app_commands.describe(amount="Minimum chips required")
-    async def set_min_wallet(self, interaction: discord.Interaction, amount: int):
+    async def set_min_buyin(self, interaction: discord.Interaction, amount: int):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
         if amount < 0:
-            await interaction.response.send_message("❌ Must be 0 or more.", ephemeral=True); return
+            await interaction.response.send_message("❌ Must be 0 or more.", ephemeral=True);
+            return
+        # We leave the DB key as "min_wallet" so it doesn't break your database
         await db.set_settings(interaction.guild_id, min_wallet=amount)
-        await interaction.response.send_message(f"✅ Min wallet: **{amount}** chips")
+        await interaction.response.send_message(f"✅ Minimum buy-in: **{amount}** chips")
 
-    @poker.command(name="setnexthanddelay", description="[Manager] Set the delay between hands (seconds)")
+    @pokerset.command(name="nexthanddelay", description="[Manager] Set the delay between hands (seconds)")
     @app_commands.describe(seconds="Seconds to wait between hands (5–300)")
     async def set_next_hand_delay(self, interaction: discord.Interaction, seconds: int):
         if not await is_manager(interaction):
@@ -1723,7 +1766,7 @@ class PokerCog(commands.Cog):
         await db.set_settings(interaction.guild_id, next_hand_delay=seconds)
         await interaction.response.send_message(f"✅ Next hand delay: **{seconds}s**")
 
-    @poker.command(name="setturntimeout", description="[Manager] Set AFK fold timer (default 5 min)")
+    @pokerset.command(name="turntimeout", description="[Manager] Set AFK fold timer (default 5 min)")
     @app_commands.describe(seconds="Seconds before auto-fold (30–600)")
     async def set_turn_timeout(self, interaction: discord.Interaction, seconds: int):
         if not await is_manager(interaction):
@@ -1733,7 +1776,7 @@ class PokerCog(commands.Cog):
         await db.set_settings(interaction.guild_id, turn_timeout=seconds)
         await interaction.response.send_message(f"✅ Turn timeout (AFK fold): **{seconds}s**")
 
-    @poker.command(name="setresend", description="[Manager] Set how many messages before embed is resent")
+    @pokerset.command(name="resend", description="[Manager] Set how many messages before embed is resent")
     @app_commands.describe(count="Number of messages (3–50)")
     async def set_resend(self, interaction: discord.Interaction, count: int):
         if not await is_manager(interaction):
@@ -1743,7 +1786,19 @@ class PokerCog(commands.Cog):
         await db.set_settings(interaction.guild_id, resend_after_msgs=count)
         await interaction.response.send_message(f"✅ Embed resend threshold: **{count}** messages")
 
-    @poker.command(name="setlogchannel", description="[Manager] Set channel for hand logs")
+    @pokerset.command(name="mucktime", description="[Manager] Set time limit for players to show/muck")
+    @app_commands.describe(seconds="Seconds to wait (5–60)")
+    async def set_muck_time(self, interaction: discord.Interaction, seconds: int):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
+        if seconds < 5 or seconds > 60:
+            await interaction.response.send_message("❌ Must be 5–60 seconds.", ephemeral=True);
+            return
+        await db.set_settings(interaction.guild_id, muck_time=seconds)
+        await interaction.response.send_message(f"✅ Showdown muck timer: **{seconds}s**")
+
+    @pokerset.command(name="logchannel", description="[Manager] Set channel for hand logs")
     @app_commands.describe(channel="The channel to post log thread in")
     async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if not await is_manager(interaction):
@@ -1751,7 +1806,7 @@ class PokerCog(commands.Cog):
         await db.set_settings(interaction.guild_id, log_channel_id=channel.id)
         await interaction.response.send_message(f"✅ Log channel: {channel.mention}")
 
-    @poker.command(name="setmanagerrole", description="[Admin] Set the Poker Manager role")
+    @pokerset.command(name="managerrole", description="[Admin] Set the Poker Manager role")
     @app_commands.describe(role="Role that gets poker manager access")
     async def set_manager_role(self, interaction: discord.Interaction, role: discord.Role):
         if not interaction.user.guild_permissions.administrator:

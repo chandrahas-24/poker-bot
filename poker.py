@@ -703,25 +703,25 @@ class ShowdownRevealView(discord.ui.View):
     @discord.ui.button(label="Show Hand 👁️", style=discord.ButtonStyle.green)
     async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in self.pending:
-            await interaction.response.send_message("❌ Nothing to show.", ephemeral=True); return
+            await interaction.response.send_message("❌ Nothing to show.", ephemeral=True);
+            return
         sp = next((p for p in self.result.showdown_players if p.user_id == interaction.user.id), None)
         if not sp or not sp.hole_cards:
-            await interaction.response.send_message("❌ No cards found.", ephemeral=True); return
-        score    = evaluator.evaluate(sp.hole_cards, self.result.community)
-        rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
-        caption  = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)} — *{rank_str}*"
+            await interaction.response.send_message("❌ No cards found.", ephemeral=True);
+            return
+
+        # FIX: Only calculate poker hand rank if there are enough community cards (Flop or later)
+        if len(self.result.community) >= 3:
+            score = evaluator.evaluate(sp.hole_cards, self.result.community)
+            rank_str = f" — *{evaluator.class_to_string(evaluator.get_rank_class(score))}*"
+        else:
+            rank_str = ""
+
+        caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{rank_str}"
         if USE_IMAGES:
             await interaction.response.send_message(caption, file=card_images.make_strip(sp.hole_cards))
         else:
             await interaction.response.send_message(caption)
-        await self._resolve(interaction.user.id)
-
-    @discord.ui.button(label="Muck 🗑️", style=discord.ButtonStyle.grey)
-    async def muck(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in self.pending:
-            await interaction.response.send_message("❌ Nothing to muck.", ephemeral=True);
-            return
-        await interaction.response.defer(ephemeral=True)
         await self._resolve(interaction.user.id)
 
 

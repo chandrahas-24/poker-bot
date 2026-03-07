@@ -215,7 +215,7 @@ async def _auto_next_hand(t: TableState, channel):
     # Auto-remove players below big blind
     bb = t.game.BIG_BLIND
     for p in list(t.game.players):
-        if p.chips < bb and p.user_id not in t.game.pending_leaves:
+        if (p.chips + p.pending_rebuy) < bb and p.user_id not in t.game.pending_leaves:
             # FIX: Include pending_rebuy and remove them immediately
             total_to_return = p.chips + p.pending_rebuy
             if total_to_return > 0:
@@ -230,10 +230,12 @@ async def _auto_next_hand(t: TableState, channel):
             except Exception:
                 pass
 
-    active             = [p for p in t.game.players if p.chips >= bb and p.user_id not in t.game.pending_leaves]
-    pending_with_chips = [p for p in t.game.pending_joins if p.chips >= bb]
-    total              = len(active) + len(pending_with_chips)
+    active = [p for p in t.game.players if (p.chips + p.pending_rebuy) >= bb and p.user_id not in t.game.pending_leaves]
+    pending_with_chips = [p for p in t.game.pending_joins if (p.chips + p.pending_rebuy) >= bb]
+    total = len(active) + len(pending_with_chips)
+
     if total < 2:
+        await refresh(channel, t)  # <--- ADD THIS so the embed updates before sleeping!
         await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
 
@@ -620,8 +622,9 @@ async def _process_result(guild, channel, t: TableState):
 
     try:
         for p in t.game.players:
-            if p.chips > 0:
-                await db.update_chips_in_play(p.user_id, p.chips)
+            total_chips = p.chips + p.pending_rebuy  # <--- FIX: Include queued chips
+            if total_chips > 0:
+                await db.update_chips_in_play(p.user_id, total_chips)
             else:
                 await db.clear_chips_in_play(p.user_id)
     except Exception as e:
@@ -848,36 +851,49 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
         await interaction.response.send_message(
             f"💸 **{interaction.user.display_name}** tipped **{tip}** chips to **{manager_name}**!", ephemeral=False)
 
-class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
-    amount = discord.ui.TextInput(label="How many chips to add?", placeholder="e.g. 500", min_length=1, max_length=8)
 
-    def __init__(self, t: TableState, wallet_bal: int):
+class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
+    amount = discord.ui.TextInput(label="How many chips to add?", min_length=1, max_length=8)
+
+    def __init__(self, t: TableState, wallet_bal: int, max_w: int, current_stack: int):
         super().__init__()
-        self.t         = t
+        self.t = t
         self.wallet_bal = wallet_bal
-        self.amount.placeholder = f"1–{wallet_bal}  (wallet: {wallet_bal})"
+        self.max_w = max_w
+        self.current_stack = current_stack
+
+        allowed = max_w - current_stack if max_w > 0 else wallet_bal
+        self.actual_max = min(allowed, wallet_bal)
+        self.amount.placeholder = f"1–{self.actual_max}  (wallet: {wallet_bal})"
 
     async def on_submit(self, interaction: discord.Interaction):
         chips = parse_chips(self.amount.value)
         if chips is None or chips <= 0:
-            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
+            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k).", ephemeral=True);
+            return
         if chips > self.wallet_bal:
+            await interaction.response.send_message(f"❌ You only have **{self.wallet_bal}** in your wallet.",
+                                                    ephemeral=True);
+            return
+        if self.max_w > 0 and (self.current_stack + chips) > self.max_w:
             await interaction.response.send_message(
-                f"❌ You only have **{self.wallet_bal}** in your wallet.", ephemeral=True); return
+                f"❌ Maximum table stack is **{self.max_w}**. You can only add up to **{self.actual_max}** more chips.",
+                ephemeral=True);
+            return
 
         ok = await db.deduct_chips(interaction.user.id, chips)
         if not ok:
-            await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True); return
+            await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True);
+            return
 
         msg = self.t.game.queue_rebuy(interaction.user.id, chips)
         if msg.startswith("❌"):
-            # Player left the table between clicking the button and submitting —
-            # return the chips we just deducted.
             await db.return_chips(interaction.user.id, chips)
-            await interaction.response.send_message(msg, ephemeral=True); return
+            await interaction.response.send_message(msg, ephemeral=True);
+            return
 
         await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(msg, ephemeral=False)
 
 class BetweenHandsView(discord.ui.View):
     def __init__(self, t: TableState):
@@ -900,16 +916,38 @@ class BetweenHandsView(discord.ui.View):
     @discord.ui.button(label="Add Chips 💰", style=discord.ButtonStyle.green)
     async def add_chips(self, interaction: discord.Interaction, button: discord.ui.Button):
         t = self.t
+
+        # 1. Define 'p' (seated player) and 'pj' (pending joiner)
         p = t.game.get_player(interaction.user.id)
-        if not p:
-            # Check pending joins
-            pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
-            if not pj:
-                await interaction.response.send_message("❌ You're not at the table.", ephemeral=True); return
+        pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
+
+        if not p and not pj:
+            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True);
+            return
+
         wallet_bal = await db.get_balance(interaction.user.id)
         if wallet_bal <= 0:
-            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True); return
-        await interaction.response.send_modal(RebuyModal(t, wallet_bal))
+            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True);
+            return
+
+        # 2. Calculate current table chips safely
+        current_stack = 0
+        if p:
+            current_stack = p.chips + p.pending_rebuy
+        elif pj:
+            current_stack = pj.chips + pj.pending_rebuy
+
+        # 3. Fetch max limit and enforce it
+        settings = await db.get_settings(interaction.guild_id)
+        max_w = settings.get("max_wallet", 2000)
+
+        if max_w > 0 and current_stack >= max_w:
+            await interaction.response.send_message(
+                f"❌ You are already at or above the maximum table stack of **{max_w}**.", ephemeral=True);
+            return
+
+        # 4. Launch the new 4-argument modal
+        await interaction.response.send_modal(RebuyModal(t, wallet_bal, max_w, current_stack))
 
 # ── Raise picker view ─────────────────────────────────────────────────────────
 
@@ -1019,24 +1057,26 @@ class RaisePickerView(discord.ui.View):
 # ── Join modal ────────────────────────────────────────────────────────────────
 
 class JoinModal(discord.ui.Modal, title="Buy In"):
-    amount = discord.ui.TextInput(label="How many chips to bring to table?", placeholder="e.g. 500", min_length=1, max_length=8)
+    amount = discord.ui.TextInput(label="How many chips to bring to table?", min_length=1, max_length=8)
 
-    def __init__(self, t: TableState, bal: int, min_w: int):
+    def __init__(self, t: TableState, bal: int, min_w: int, max_w: int):
         super().__init__()
-        self.t = t; self.bal = bal; self.min_w = min_w
-        self.amount.placeholder = f"min {min_w} — max {bal}  (wallet: {bal})"
+        self.t = t; self.bal = bal; self.min_w = min_w; self.max_w = max_w
+        limit_str = f"{max_w}" if max_w > 0 else "None"
+        self.amount.placeholder = f"min {min_w} — max {limit_str}  (wallet: {bal})"
 
     async def on_submit(self, interaction: discord.Interaction):
         chips = parse_chips(self.amount.value)
         if chips is None:
-            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
+            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k).", ephemeral=True); return
         if chips < self.min_w:
             await interaction.response.send_message(f"❌ Minimum buy-in is **{self.min_w}** chips.", ephemeral=True); return
+        if self.max_w > 0 and chips > self.max_w:
+            await interaction.response.send_message(f"❌ Maximum buy-in is **{self.max_w}** chips.", ephemeral=True); return
         if chips > self.bal:
             await interaction.response.send_message(f"❌ You only have **{self.bal}** chips.", ephemeral=True); return
 
         t  = self.t
-        # Check ban (DB-backed: server-wide OR table-specific)
         if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
             await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
 
@@ -1095,12 +1135,14 @@ class GameView(discord.ui.View):
             await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
         await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
         settings = await db.get_settings(interaction.guild_id)
-        min_w    = settings.get("min_wallet", 50)
-        bal      = await db.get_balance(interaction.user.id)
+        min_w = settings.get("min_wallet", 50)
+        max_w = settings.get("max_wallet", 0)  # <--- Fetch Max
+        bal = await db.get_balance(interaction.user.id)
         if bal < min_w:
             await interaction.response.send_message(
-                f"❌ Need at least **{min_w}** chips to join. Wallet: **{bal}**.", ephemeral=True); return
-        await interaction.response.send_modal(JoinModal(self.t, bal, min_w))
+                f"❌ Need at least **{min_w}** chips to join. Wallet: **{bal}**.", ephemeral=True);
+            return
+        await interaction.response.send_modal(JoinModal(self.t, bal, min_w, max_w))  # <--- Pass Max
 
     @discord.ui.button(label="Leave", style=discord.ButtonStyle.red, row=0)
     async def btn_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1560,21 +1602,6 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ You have no chips to tip with.", ephemeral=True); return
         await interaction.response.send_modal(TipModal(t, bal, table_chips))
 
-    @poker.command(name="addchips", description="Add chips from your wallet to your table stack (next hand)")
-    async def add_chips_cmd(self, interaction: discord.Interaction):
-        key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
-        if not t:
-            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
-        p = t.game.get_player(interaction.user.id)
-        pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
-        if not p and not pj:
-            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True); return
-        wallet_bal = await db.get_balance(interaction.user.id)
-        if wallet_bal <= 0:
-            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True); return
-        await interaction.response.send_modal(RebuyModal(t, wallet_bal))
-
     @poker.command(name="leaderboard", description="Top poker players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):
 
@@ -1734,20 +1761,42 @@ class PokerCog(commands.Cog):
     @poker.command(name="settings", description="[Manager] View table settings")
     async def settings_view(self, interaction: discord.Interaction):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
-        s        = await db.get_settings(interaction.guild_id)
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
+
+        s = await db.get_settings(interaction.guild_id)
         role_str = f"<@&{s['manager_role_id']}>" if s.get("manager_role_id") else "*(not set)*"
-        log_str  = f"<#{s['log_channel_id']}>"   if s.get("log_channel_id")  else "*(not set)*"
+        log_str = f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "*(not set)*"
+
         embed = discord.Embed(title="⚙️ Poker Settings", color=0x5865F2)
-        embed.add_field(name="Small Blind",      value=str(s["small_blind"]),  inline=True)
-        embed.add_field(name="Big Blind",        value=str(s["big_blind"]),    inline=True)
-        embed.add_field(name="Min Buy-in",       value=str(s["min_wallet"]),   inline=True)
-        embed.add_field(name="Next Hand Delay",  value=f"{s.get('next_hand_delay', NEXT_HAND_DELAY_DEFAULT)}s", inline=True)
-        embed.add_field(name="Turn Timeout",     value=f"{s.get('turn_timeout', TURN_TIMEOUT_DEFAULT)}s",      inline=True)
+
+        # Row 1: Blinds
+        embed.add_field(name="Small Blind", value=str(s["small_blind"]), inline=True)
+        embed.add_field(name="Big Blind", value=str(s["big_blind"]), inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # Invisible 3rd slot
+
+        # Row 2: Buy-ins
+        embed.add_field(name="Min Buy-in", value=str(s["min_wallet"]), inline=True)
+        max_val = str(s.get("max_wallet", 2000)) if s.get("max_wallet", 2000) > 0 else "None (No Limit)"
+        embed.add_field(name="Max Buy-in", value=max_val, inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # Invisible 3rd slot
+
+        # Row 3: Timers
+        embed.add_field(name="Turn Timeout", value=f"{s.get('turn_timeout', TURN_TIMEOUT_DEFAULT)}s", inline=True)
         embed.add_field(name="Muck Timeout", value=f"{s.get('muck_time', 15)}s", inline=True)
-        embed.add_field(name="Resend Embed",     value=f"every {s.get('resend_after_msgs', TABLE_RESEND_MSGS)} msgs", inline=True)
-        embed.add_field(name="Manager Role",     value=role_str, inline=False)
-        embed.add_field(name="Log Channel",      value=log_str,  inline=False)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # Invisible 3rd slot
+
+        # Row 4: Misc
+        embed.add_field(name="Next Hand Delay", value=f"{s.get('next_hand_delay', NEXT_HAND_DELAY_DEFAULT)}s",
+                        inline=True)
+        embed.add_field(name="Resend Embed", value=f"every {s.get('resend_after_msgs', TABLE_RESEND_MSGS)} msgs",
+                        inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # Invisible 3rd slot
+
+        # Row 5: Roles
+        embed.add_field(name="Manager Role", value=role_str, inline=True)
+        embed.add_field(name="Log Channel", value=log_str, inline=True)
+
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
     @pokerset.command(name="blinds", description="[Manager] Set small and big blind amounts")
@@ -1772,6 +1821,19 @@ class PokerCog(commands.Cog):
         # We leave the DB key as "min_wallet" so it doesn't break your database
         await db.set_settings(interaction.guild_id, min_wallet=amount)
         await interaction.response.send_message(f"✅ Minimum buy-in: **{amount}** chips")
+
+    @pokerset.command(name="maxbuyin", description="[Manager] Set maximum table stack (0 for unlimited)")
+    @app_commands.describe(amount="Max chips allowed (0 = no limit)")
+    async def set_max_buyin(self, interaction: discord.Interaction, amount: int):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
+        if amount < 0:
+            await interaction.response.send_message("❌ Must be 0 or more.", ephemeral=True);
+            return
+        await db.set_settings(interaction.guild_id, max_wallet=amount)
+        msg = f"**{amount}** chips" if amount > 0 else "**None** (Unlimited)"
+        await interaction.response.send_message(f"✅ Maximum buy-in set to: {msg}")
 
     @pokerset.command(name="nexthanddelay", description="[Manager] Set the delay between hands (seconds)")
     @app_commands.describe(seconds="Seconds to wait between hands (5–300)")

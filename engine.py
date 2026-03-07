@@ -132,11 +132,11 @@ class PokerGame:
         p = self.get_player(user_id)
         if p:
             p.pending_rebuy += amount
-            return f"✅ **{amount}** chips queued — added to your stack next hand. (Pending: **{p.pending_rebuy}**)"
+            return f"✅ **{p.display_name}** queued **{amount}** chips for the next hand. (Pending: **{p.pending_rebuy}**)"
         for pj in self.pending_joins:
             if pj.user_id == user_id:
                 pj.chips += amount
-                return f"✅ Added **{amount}** chips. Stack at join: **{pj.chips}**."
+                return f"✅ **{pj.display_name}** added **{amount}** chips. Stack at join: **{pj.chips}**."
         return "❌ You're not at the table."
 
     def _process_pending(self):

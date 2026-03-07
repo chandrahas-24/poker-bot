@@ -1701,6 +1701,16 @@ class PokerCog(commands.Cog):
     async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+
+        allowed_str = os.getenv("ADD_CHIPS_CHANNELS", "")
+        if allowed_str:
+            # Convert comma-separated string from .env into a list of integers
+            allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
+            if allowed_channels and interaction.channel_id not in allowed_channels:
+                mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
+                await interaction.response.send_message(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+                return
+
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True); return
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
@@ -1714,6 +1724,16 @@ class PokerCog(commands.Cog):
     async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+
+        allowed_str = os.getenv("REMOVE_CHIPS_CHANNELS", "")
+        if allowed_str:
+            # Convert comma-separated string from .env into a list of integers
+            allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
+            if allowed_channels and interaction.channel_id not in allowed_channels:
+                mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
+                await interaction.response.send_message(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+                return
+
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True); return
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,

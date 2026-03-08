@@ -436,15 +436,16 @@ def build_embed(t: TableState) -> discord.Embed:
 
 # ── Board image ───────────────────────────────────────────────────────────────
 
-def update_board(t: TableState):
+async def update_board(t: TableState):
     """Generate card strip File object — attached directly to the embed message."""
     game = t.game
     if not USE_IMAGES or game.street in (Street.WAITING, Street.PREFLOP) or not game.community:
         t.board_file = None
         return
     backs = max(0, 5 - len(game.community))
-    t.board_file = card_images.make_strip(game.community, backs=backs, )
 
+    # Push image generation to a background thread!
+    t.board_file = await asyncio.to_thread(card_images.make_strip, game.community, backs)
 # ── Turn ping ─────────────────────────────────────────────────────────────────
 
 async def send_turn_ping(channel, t: TableState):
@@ -474,7 +475,7 @@ async def send_turn_ping(channel, t: TableState):
 # ── Refresh ───────────────────────────────────────────────────────────────────
 
 async def refresh(channel, t: TableState, new_hand: bool = False):
-    update_board(t)          # generate File (sync, no upload needed)
+    await update_board(t)          # generate File (sync, no upload needed)
     embed = build_embed(t)   # sets attachment://board.png if file present
     view  = GameView(t)
     f     = t.board_file
@@ -722,7 +723,9 @@ class ShowdownRevealView(discord.ui.View):
 
         caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{rank_str}"
         if USE_IMAGES:
-            await interaction.response.send_message(caption, file=card_images.make_strip(sp.hole_cards))
+            await interaction.response.defer()
+            file = await asyncio.to_thread(card_images.make_strip, sp.hole_cards)
+            await interaction.followup.send(caption, file=file)
         else:
             await interaction.response.send_message(caption)
         await self._resolve(interaction.user.id)
@@ -762,7 +765,8 @@ async def _reveal_phase(channel, t: TableState, result):
             rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
             caption = f"🏆 **{w.display_name}** wins and shows: {hand_str(w.hole_cards)} — *{rank_str}*"
             if USE_IMAGES:
-                await channel.send(caption, file=card_images.make_strip(w.hole_cards))
+                file = await asyncio.to_thread(card_images.make_strip, w.hole_cards)
+                await channel.send(caption, file=file)
             else:
                 await channel.send(caption)
 
@@ -810,10 +814,11 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
             await interaction.response.send_message("❌ Enter a valid number.", ephemeral=True); return
         if tip <= 0:
             await interaction.response.send_message("❌ Tip must be more than 0.", ephemeral=True); return
-
-        # Block self-tipping
         if interaction.user.id == self.t.manager_id:
             await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
+
+        # Defer before any DB work
+        await interaction.response.defer(ephemeral=False)
 
         p           = self.t.game.get_player(interaction.user.id)
         table_chips = p.chips if p else 0
@@ -823,7 +828,7 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
         from_wallet = tip - from_table
 
         if from_wallet > wallet_bal:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Not enough chips. Table: **{table_chips}**, Wallet: **{wallet_bal}**.", ephemeral=True); return
 
         if from_table > 0 and p:
@@ -835,7 +840,7 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
                 if from_table > 0 and p:
                     p.chips += from_table
                     await db.update_chips_in_play(interaction.user.id, p.chips)
-                await interaction.response.send_message("❌ Failed to deduct wallet chips.", ephemeral=True); return
+                await interaction.followup.send("❌ Failed to deduct wallet chips.", ephemeral=True); return
 
         manager_id   = self.t.manager_id
         manager_name = "Dealer"
@@ -848,7 +853,7 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
         await db.add_chips(interaction.user.id, interaction.user.display_name,
                            manager_id, manager_name, tip, f"Tip from {interaction.user.display_name}")
         await post_tip_log(interaction.channel, self.t, interaction.user.display_name, tip, manager_name)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"💸 **{interaction.user.display_name}** tipped **{tip}** chips to **{manager_name}**!", ephemeral=False)
 
 
@@ -881,19 +886,22 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
                 ephemeral=True);
             return
 
+        # Defer before DB writes
+        await interaction.response.defer(ephemeral=False)
+
         ok = await db.deduct_chips(interaction.user.id, chips)
         if not ok:
-            await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True);
+            await interaction.followup.send("❌ Failed to deduct chips.", ephemeral=True);
             return
 
         msg = self.t.game.queue_rebuy(interaction.user.id, chips)
         if msg.startswith("❌"):
             await db.return_chips(interaction.user.id, chips)
-            await interaction.response.send_message(msg, ephemeral=True);
+            await interaction.followup.send(msg, ephemeral=True);
             return
 
         await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
-        await interaction.response.send_message(msg, ephemeral=False)
+        await interaction.followup.send(msg, ephemeral=False)
 
 class BetweenHandsView(discord.ui.View):
     def __init__(self, t: TableState):
@@ -903,21 +911,16 @@ class BetweenHandsView(discord.ui.View):
     @discord.ui.button(label="Tip Dealer 💸", style=discord.ButtonStyle.blurple)
     async def tip_dealer(self, interaction: discord.Interaction, button: discord.ui.Button):
         t = self.t
-        # Block self-tip
         if interaction.user.id == t.manager_id:
             await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
         p           = t.game.get_player(interaction.user.id)
         table_chips = p.chips if p else 0
-        wallet_bal  = await db.get_balance(interaction.user.id)
-        if table_chips == 0 and wallet_bal == 0:
-            await interaction.response.send_message("❌ You have no chips to tip with.", ephemeral=True); return
-        await interaction.response.send_modal(TipModal(t, wallet_bal, table_chips))
+        # wallet_bal and zero-chips check moved into TipModal.on_submit (which defers first)
+        await interaction.response.send_modal(TipModal(t, 0, table_chips))
 
     @discord.ui.button(label="Add Chips 💰", style=discord.ButtonStyle.green)
     async def add_chips(self, interaction: discord.Interaction, button: discord.ui.Button):
         t = self.t
-
-        # 1. Define 'p' (seated player) and 'pj' (pending joiner)
         p = t.game.get_player(interaction.user.id)
         pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
 
@@ -925,28 +928,26 @@ class BetweenHandsView(discord.ui.View):
             await interaction.response.send_message("❌ You're not at the table.", ephemeral=True);
             return
 
-        wallet_bal = await db.get_balance(interaction.user.id)
-        if wallet_bal <= 0:
-            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True);
-            return
-
-        # 2. Calculate current table chips safely
+        # Calculate current stack without any DB call
         current_stack = 0
         if p:
             current_stack = p.chips + p.pending_rebuy
         elif pj:
             current_stack = pj.chips + pj.pending_rebuy
 
-        # 3. Fetch max limit and enforce it
+        # All DB reads (wallet, settings) happen inside RebuyModal.on_submit after defer()
+        # We need wallet_bal and max_w for the modal placeholder — fetch them now but
+        # send_modal is the FIRST await on interaction.response so we're within 3 s.
+        wallet_bal = await db.get_balance(interaction.user.id)
+        if wallet_bal <= 0:
+            await interaction.response.send_message("❌ Your wallet is empty.", ephemeral=True);
+            return
         settings = await db.get_settings(interaction.guild_id)
-        max_w = settings.get("max_wallet", 2000)
-
+        max_w = settings.get("max_wallet", 0)
         if max_w > 0 and current_stack >= max_w:
             await interaction.response.send_message(
                 f"❌ You are already at or above the maximum table stack of **{max_w}**.", ephemeral=True);
             return
-
-        # 4. Launch the new 4-argument modal
         await interaction.response.send_modal(RebuyModal(t, wallet_bal, max_w, current_stack))
 
 # ── Raise picker view ─────────────────────────────────────────────────────────
@@ -980,6 +981,8 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
             await _process_result(interaction.guild, self.channel, self.t)
         else:
             await refresh(self.channel, self.t)
+            
+        await interaction.followup.send("✅ Custom raise placed.", ephemeral=True)
 
 class RaisePickerView(discord.ui.View):
     """Shown when player clicks Raise — offers preset options."""
@@ -1002,6 +1005,8 @@ class RaisePickerView(discord.ui.View):
             await _process_result(self.guild, self.channel, self.t)
         else:
             await refresh(self.channel, self.t)
+
+        await interaction.followup.send("✅ Raise placed.", ephemeral=True)
 
     @discord.ui.button(label="1/3 Pot", style=discord.ButtonStyle.green, row=0)
     async def third_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1050,6 +1055,8 @@ class RaisePickerView(discord.ui.View):
         else:
             await refresh(self.channel, self.t)
 
+        await interaction.followup.send("✅ Went All-In! 🚀", ephemeral=True)
+
     @discord.ui.button(label="Custom…", style=discord.ButtonStyle.grey, row=0)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RaiseCustomModal(self.t, self.channel, self.guild))
@@ -1076,24 +1083,29 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
         if chips > self.bal:
             await interaction.response.send_message(f"❌ You only have **{self.bal}** chips.", ephemeral=True); return
 
-        t  = self.t
+        # Defer before all DB work
+        await interaction.response.defer(ephemeral=True)
+
+        await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
+
+        t = self.t
         if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
-            await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
+            await interaction.followup.send("❌ You are banned from this table.", ephemeral=True); return
 
         ok = await db.deduct_chips(interaction.user.id, chips)
         if not ok:
-            await interaction.response.send_message("❌ Failed to deduct chips.", ephemeral=True); return
+            await interaction.followup.send("❌ Failed to deduct chips.", ephemeral=True); return
         await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
 
         msg = t.game.add_player(interaction.user.id, interaction.user.display_name, chips)
         if msg.startswith("❌"):
             await db.return_chips(interaction.user.id, chips)
             await db.clear_chips_in_play(interaction.user.id)
-            await interaction.response.send_message(msg, ephemeral=True); return
+            await interaction.followup.send(msg, ephemeral=True); return
 
-        await interaction.response.defer(ephemeral=True)
         await interaction.channel.send(f"✅ **{interaction.user.display_name}** joined the table with **{chips}** 🪙!")
         await refresh(interaction.channel, t)
+        await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
 
 # ── Game View ─────────────────────────────────────────────────────────────────
 
@@ -1125,6 +1137,8 @@ class GameView(discord.ui.View):
         else:
             await refresh(interaction.channel, self.t)
 
+        await interaction.followup.send("✅ Action recorded.", ephemeral=True)
+
     @discord.ui.button(label="Join", style=discord.ButtonStyle.green, row=0)
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.t.closing:
@@ -1133,7 +1147,6 @@ class GameView(discord.ui.View):
             await interaction.response.send_message("❌ You have been kicked and cannot rejoin until the next table.", ephemeral=True); return
         if await db.is_banned(interaction.guild_id, interaction.user.id, self.t.name):
             await interaction.response.send_message("❌ You are banned from this table.", ephemeral=True); return
-        await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
         settings = await db.get_settings(interaction.guild_id)
         min_w = settings.get("min_wallet", 50)
         max_w = settings.get("max_wallet", 0)  # <--- Fetch Max
@@ -1147,25 +1160,41 @@ class GameView(discord.ui.View):
     @discord.ui.button(label="Leave", style=discord.ButtonStyle.red, row=0)
     async def btn_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.t.closing:
-            await interaction.response.send_message("❌ Table is closing — your chips will be returned automatically.", ephemeral=True); return
+            await interaction.response.send_message("❌ Table is closing — your chips will be returned automatically.",
+                                                    ephemeral=True);
+            return
         if interaction.user.id in self.t.game.kicked_users:
-            await interaction.response.send_message("❌ You have been kicked and will be removed after this hand.", ephemeral=True); return
+            await interaction.response.send_message("❌ You have been kicked and will be removed after this hand.",
+                                                    ephemeral=True);
+            return
         if interaction.user.id in self.t.game.pending_leaves:
-            await interaction.response.send_message("❌ You are already queued to leave after this hand.", ephemeral=True); return
+            await interaction.response.send_message("❌ You are already queued to leave after this hand.",
+                                                    ephemeral=True);
+            return
         p = self.t.game.get_player(interaction.user.id)
         pj = next((pj for pj in self.t.game.pending_joins if pj.user_id == interaction.user.id), None)
         if not p and not pj:
-            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True); return
+            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True);
+            return
+
         chips_back, msg = self.t.game.remove_player(interaction.user.id)
+
+        # 1. DEFER IMMEDIATELY BEFORE DB WRITES
+        await interaction.response.defer(ephemeral=True)
+
+        # 2. Safely write to DB
         if chips_back > 0:
             await db.return_chips(interaction.user.id, chips_back)
             await db.clear_chips_in_play(interaction.user.id)
-        await interaction.response.defer(ephemeral=True)
+
         if "will leave" in msg:
             await interaction.channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
         elif "left" in msg or "cashed out" in msg:
-            await interaction.channel.send(f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
+            await interaction.channel.send(
+                f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
         await refresh(interaction.channel, self.t)
+
+        await interaction.followup.send("✅ You left the table.", ephemeral=True)
 
     @discord.ui.button(label="Call",  style=discord.ButtonStyle.green,  row=1)
     async def btn_call(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1189,11 +1218,11 @@ class GameView(discord.ui.View):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True);
             return
 
-        # Fetch the actual AFK timer from your database settings
+        await interaction.response.defer(ephemeral=True)
+
         settings = await db.get_settings(interaction.guild_id)
         afk_time = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
 
-        # Pass it into your view
         view = RaisePickerView(self.t, interaction.channel, interaction.guild, timeout=afk_time)
 
         g = self.t.game
@@ -1202,7 +1231,7 @@ class GameView(discord.ui.View):
         pot_third = max(call_amt, g.pot // 3) if p else 0
         pot_half = max(call_amt, g.pot // 2) if p else 0
         stack_half = max(call_amt, p.chips // 2) if p else 0
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"**Raise options** — Pot: {g.pot} 🪙  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
             f"· 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}  · 1/2 Stack = +{stack_half}",
             view=view, ephemeral=True)
@@ -1213,23 +1242,31 @@ class GameView(discord.ui.View):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
         await self._do_action(interaction, self.t.game.fold, interaction.user.id)
 
-    @discord.ui.button(label="My Cards",  style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="My Cards", style=discord.ButtonStyle.grey, row=2)
     async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 1. Instantly defer to prevent the 404 Unknown Interaction crash
+        await interaction.response.defer(ephemeral=True)
+
         p = self.t.game.get_player(interaction.user.id)
         if not p or not p.hole_cards:
-            await interaction.response.send_message("❌ No cards right now.", ephemeral=True); return
+            await interaction.followup.send("❌ No cards right now.", ephemeral=True);
+            return
+
         strength = ""
         if self.t.game.community and not p.folded:
-            score    = evaluator.evaluate(p.hole_cards, self.t.game.community)
-            rank     = evaluator.class_to_string(evaluator.get_rank_class(score))
-            pct      = round((1 - score / 7462) * 100, 1)
-            strength = f"\n**Hand:** {rank} (top {100-pct:.0f}%)"
-        caption = f"Your hole cards — {p.chips} 🪙 at table{strength}"
-        if USE_IMAGES:
-            await interaction.response.send_message(caption, file=card_images.make_strip(p.hole_cards), ephemeral=True)
-        else:
-            await interaction.response.send_message(f"{caption}\n{hand_str(p.hole_cards)}", ephemeral=True)
+            score = evaluator.evaluate(p.hole_cards, self.t.game.community)
+            rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+            pct = round((1 - score / 7462) * 100, 1)
+            strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
 
+        caption = f"Your hole cards — {p.chips} 🪙 at table{strength}"
+
+        if USE_IMAGES:
+            # 2. Push the heavy image processing to the background
+            file = await asyncio.to_thread(card_images.make_strip, p.hole_cards)
+            await interaction.followup.send(caption, file=file, ephemeral=True)
+        else:
+            await interaction.followup.send(f"{caption}\n{hand_str(p.hole_cards)}", ephemeral=True)
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
@@ -1247,13 +1284,16 @@ class GameView(discord.ui.View):
 
     @discord.ui.button(label="Wallet", style=discord.ButtonStyle.grey, row=2)
     async def btn_wallet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 1. DEFER FIRST
+        await interaction.response.defer(ephemeral=True)
+
         uid = interaction.user.id
         bal = await db.get_balance(uid)
         p = self.t.game.get_player(uid)
         table_str = f"  |  **At table:** {p.chips} 🪙" if p else ""
 
-        # Sends an ephemeral message instantly without a modal
-        await interaction.response.send_message(f"**Your Wallet:** {bal} 🪙{table_str}", ephemeral=True)
+        # 2. USE FOLLOWUP.SEND
+        await interaction.followup.send(f"**Your Wallet:** {bal} 🪙{table_str}", ephemeral=True)
 
 # ── Confirm DB reset ──────────────────────────────────────────────────────────
 
@@ -1282,15 +1322,19 @@ class ConfirmResetView2(discord.ui.View):
     @discord.ui.button(label="WIPE EVERYTHING", style=discord.ButtonStyle.red)
     async def step2(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.admin_id:
-            await interaction.response.send_message("❌ Not your button.", ephemeral=True); return
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True);
+            return
+
+        # 1. DEFER FIRST
+        await interaction.response.defer()
+
+        # 2. DO THE WIPE
         await db.reset_database(interaction.user.id, interaction.user.display_name)
         tables.clear()
-        await interaction.response.edit_message(
-            content=f"✅ Database wiped by **{interaction.user.display_name}**.", view=None)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled.", view=None)
+        # 3. USE FOLLOWUP FOR EDITS
+        await interaction.edit_original_response(
+            content=f"✅ Database wiped by **{interaction.user.display_name}**.", view=None)
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
@@ -1337,6 +1381,7 @@ class PokerCog(commands.Cog):
         t.game.MIN_BUYIN = settings.get("min_wallet", 50)
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
+        await interaction.followup.send("✅ Table opened!", ephemeral=True)  # <-- ADD THIS
 
     @poker.command(name="close", description="[Manager] Close table after current hand")
     async def close_table(self, interaction: discord.Interaction):
@@ -1366,13 +1411,19 @@ class PokerCog(commands.Cog):
     @poker.command(name="start", description="[Manager] Deal the first hand")
     async def start(self, interaction: discord.Interaction):
         key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
+        t = get_table(key)
         if not t:
-            await interaction.response.send_message("❌ No table here. Use `/poker open` first.", ephemeral=True); return
+            await interaction.response.send_message("❌ No table here. Use `/poker open` first.", ephemeral=True);
+            return
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
         if t.game.street != Street.WAITING:
-            await interaction.response.send_message("❌ A hand is already in progress.", ephemeral=True); return
+            await interaction.response.send_message("❌ A hand is already in progress.", ephemeral=True);
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
@@ -1395,8 +1446,8 @@ class PokerCog(commands.Cog):
         if not success:
             await interaction.response.send_message(msg, ephemeral=True); return
         t.msg_count = 0
-        await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
+        await interaction.followup.send("✅ Hand started!", ephemeral=True)
 
     @poker.command(name="table", description="Re-post the game panel")
     async def table_cmd(self, interaction: discord.Interaction):
@@ -1407,6 +1458,7 @@ class PokerCog(commands.Cog):
         t.hand_msg = None; t.board_file = None; t.ping_msg = None; t.ping_user_id = None; t.msg_count = 0
         await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
+        await interaction.followup.send("✅ Table refreshed!", ephemeral=True)
 
     # ── Manager moderation commands ───────────────────────────────────────
 
@@ -1427,10 +1479,11 @@ class PokerCog(commands.Cog):
             t.game.players.remove(p)
             # FIX: Add pending_rebuy to the refund
             total_to_return = p.chips + p.pending_rebuy
+            await interaction.response.defer(ephemeral=False)
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
                 await db.clear_chips_in_play(user.id)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🦵 **{user.display_name}** has been kicked and removed from the table.")
             await refresh(interaction.channel, t)
             return
@@ -1462,17 +1515,20 @@ class PokerCog(commands.Cog):
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
     async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
 
-        # Persist ban to DB
+        # 1. DEFER FIRST
+        await interaction.response.defer(ephemeral=True)
+
+        # 2. Persist ban to DB
         added = await db.ban_player(interaction.guild_id, user.id, user.display_name,
-                                     interaction.user.id, table_name)
+                                    interaction.user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
 
         # Defer ephemerally — we'll decide whether to go public after checking tables.
         # Using a public defer when the user isn't seated causes a blank public message
         # that Discord renders confusingly alongside between-hands views.
-        await interaction.response.defer(ephemeral=True)
 
         kicked_from = []
         for (gid, cid), t in list(tables.items()):
@@ -1529,6 +1585,7 @@ class PokerCog(commands.Cog):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
 
+        await interaction.response.defer(ephemeral=True)
         removed = await db.unban_player(interaction.guild_id, user.id, table_name)
         scope   = f"table **{table_name}**" if table_name else "all tables"
 
@@ -1541,9 +1598,9 @@ class PokerCog(commands.Cog):
                     t.game.banned_users.remove(user.id)
 
         if removed:
-            await interaction.response.send_message(f"✅ **{user.display_name}** unbanned from {scope}.")
+            await interaction.followup.send(f"✅ **{user.display_name}** unbanned from {scope}.")
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"ℹ️ **{user.display_name}** had no bans for {scope}.", ephemeral=True)
 
     @pokermgr.command(name="forcefold", description="[Manager] Force a player to fold their hand")
@@ -1578,6 +1635,7 @@ class PokerCog(commands.Cog):
     @poker.command(name="wallet", description="Check your chip wallet balance")
     @app_commands.describe(user="Player to check (leave blank for yourself)")
     async def wallet(self, interaction: discord.Interaction, user: discord.Member = None):
+        await interaction.response.defer(ephemeral=False)
         target = user or interaction.user
         bal    = await db.get_balance(target.id)
         key    = (interaction.guild_id, interaction.channel_id)
@@ -1585,7 +1643,7 @@ class PokerCog(commands.Cog):
         p      = t.game.get_player(target.id) if t else None
         table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
         label  = f"**{target.display_name}'s Wallet**" if user else "**Your Wallet**"
-        await interaction.response.send_message(f"{label}: {bal} 🪙{table_str}", ephemeral=False)
+        await interaction.followup.send(f"{label}: {bal} 🪙{table_str}", ephemeral=False)
 
     @poker.command(name="tip", description="Tip the dealer between hands")
     async def tip_cmd(self, interaction: discord.Interaction):
@@ -1595,12 +1653,10 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
         if interaction.user.id == t.manager_id:
             await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
-        bal         = await db.get_balance(interaction.user.id)
         p           = t.game.get_player(interaction.user.id)
         table_chips = p.chips if p else 0
-        if bal + table_chips == 0:
-            await interaction.response.send_message("❌ You have no chips to tip with.", ephemeral=True); return
-        await interaction.response.send_modal(TipModal(t, bal, table_chips))
+        # Balance check and zero-check happen inside TipModal.on_submit after defer()
+        await interaction.response.send_modal(TipModal(t, 0, table_chips))
 
     @poker.command(name="leaderboard", description="Top poker players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):
@@ -1611,7 +1667,7 @@ class PokerCog(commands.Cog):
         caller_id = interaction.user.id
         caller_row = await db.get_player_stats(caller_id)
         if not rows:
-            await interaction.response.send_message("No stats yet!", ephemeral=True);
+            await interaction.followup.send("No stats yet!", ephemeral=True)
             return
 
         async def get_uname(uid):
@@ -1673,17 +1729,19 @@ class PokerCog(commands.Cog):
     async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
         removed = await db.delete_player_stats(user.id)
         if removed:
-            await interaction.response.send_message(f"✅ Removed **{user.name}** ({user.id}) from the leaderboard.")
+            await interaction.followup.send(f"✅ Removed **{user.name}** ({user.id}) from the leaderboard.")
         else:
-            await interaction.response.send_message(f"ℹ️ **{user.name}** has no stats on record.", ephemeral=True)
+            await interaction.followup.send(f"ℹ️ **{user.name}** has no stats on record.", ephemeral=True)
 
     @poker.command(name="stats", description="View your poker stats")
     async def stats(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         row = await db.get_player_stats(interaction.user.id)
         if not row:
-            await interaction.response.send_message("No stats yet!", ephemeral=True); return
+            await interaction.followup.send("No stats yet!", ephemeral=True); return
         net   = row['net_chips']
         embed = discord.Embed(title=f"Stats — {row['username']}", color=0x2ecc71 if net >= 0 else 0xe74c3c)
         wp    = f"{row['hands_won']/row['hands_played']*100:.1f}%" if row['hands_played'] else "—"
@@ -1692,7 +1750,7 @@ class PokerCog(commands.Cog):
         embed.add_field(name="Win %",  value=wp,                       inline=True)
         embed.add_field(name="Net",    value=f"{'+'if net>=0 else ''}{net} 🪙", inline=True)
         embed.add_field(name="Wallet", value=f"{row['wallet']} 🪙",   inline=True)
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── Manager settings commands ─────────────────────────────────────────
 
@@ -1700,11 +1758,11 @@ class PokerCog(commands.Cog):
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
     async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
 
         allowed_str = os.getenv("ADD_CHIPS_CHANNELS", "")
         if allowed_str:
-            # Convert comma-separated string from .env into a list of integers
             allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
             if allowed_channels and interaction.channel_id not in allowed_channels:
                 mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
@@ -1712,22 +1770,30 @@ class PokerCog(commands.Cog):
                 return
 
         if amount <= 0:
-            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True); return
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
+            return
+
+        # 1. DEFER PUBLICLY BEFORE DB WRITE
+        await interaction.response.defer(ephemeral=False)
+
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, amount, note)
-        await interaction.response.send_message(
+
+        # 2. USE FOLLOWUP.SEND
+        await interaction.followup.send(
             f"✅ **+{amount}** chips → **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
-    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int,
+                              note: str = ""):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
 
         allowed_str = os.getenv("REMOVE_CHIPS_CHANNELS", "")
         if allowed_str:
-            # Convert comma-separated string from .env into a list of integers
             allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
             if allowed_channels and interaction.channel_id not in allowed_channels:
                 mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
@@ -1735,10 +1801,17 @@ class PokerCog(commands.Cog):
                 return
 
         if amount <= 0:
-            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True); return
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
+            return
+
+        # 1. DEFER PUBLICLY BEFORE DB WRITE
+        await interaction.response.defer(ephemeral=False)
+
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, -amount, note)
-        await interaction.response.send_message(
+
+        # 2. USE FOLLOWUP.SEND
+        await interaction.followup.send(
             f"✅ **-{amount}** chips from **{user.display_name}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
@@ -1784,6 +1857,7 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
             return
 
+        await interaction.response.defer(ephemeral=False)
         s = await db.get_settings(interaction.guild_id)
         role_str = f"<@&{s['manager_role_id']}>" if s.get("manager_role_id") else "*(not set)*"
         log_str = f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "*(not set)*"
@@ -1817,7 +1891,7 @@ class PokerCog(commands.Cog):
         embed.add_field(name="Manager Role", value=role_str, inline=True)
         embed.add_field(name="Log Channel", value=log_str, inline=True)
 
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
     @pokerset.command(name="blinds", description="[Manager] Set small and big blind amounts")
     @app_commands.describe(small="Small blind", big="Big blind")
@@ -1826,8 +1900,9 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if small <= 0 or big <= small:
             await interaction.response.send_message("❌ Big blind must be > small blind.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, small_blind=small, big_blind=big)
-        await interaction.response.send_message(f"✅ Blinds: **{small}** / **{big}**")
+        await interaction.followup.send(f"✅ Blinds: **{small}** / **{big}**")
 
     @pokerset.command(name="minbuyin", description="[Manager] Set minimum buy-in required to join")
     @app_commands.describe(amount="Minimum chips required")
@@ -1839,8 +1914,9 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Must be 0 or more.", ephemeral=True);
             return
         # We leave the DB key as "min_wallet" so it doesn't break your database
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, min_wallet=amount)
-        await interaction.response.send_message(f"✅ Minimum buy-in: **{amount}** chips")
+        await interaction.followup.send(f"✅ Minimum buy-in: **{amount}** chips")
 
     @pokerset.command(name="maxbuyin", description="[Manager] Set maximum table stack (0 for unlimited)")
     @app_commands.describe(amount="Max chips allowed (0 = no limit)")
@@ -1851,9 +1927,10 @@ class PokerCog(commands.Cog):
         if amount < 0:
             await interaction.response.send_message("❌ Must be 0 or more.", ephemeral=True);
             return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, max_wallet=amount)
         msg = f"**{amount}** chips" if amount > 0 else "**None** (Unlimited)"
-        await interaction.response.send_message(f"✅ Maximum buy-in set to: {msg}")
+        await interaction.followup.send(f"✅ Maximum buy-in set to: {msg}")
 
     @pokerset.command(name="nexthanddelay", description="[Manager] Set the delay between hands (seconds)")
     @app_commands.describe(seconds="Seconds to wait between hands (5–300)")
@@ -1862,8 +1939,9 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if seconds < 5 or seconds > 300:
             await interaction.response.send_message("❌ Must be 5–300 seconds.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, next_hand_delay=seconds)
-        await interaction.response.send_message(f"✅ Next hand delay: **{seconds}s**")
+        await interaction.followup.send(f"✅ Next hand delay: **{seconds}s**")
 
     @pokerset.command(name="turntimeout", description="[Manager] Set AFK fold timer (default 5 min)")
     @app_commands.describe(seconds="Seconds before auto-fold (30–600)")
@@ -1872,8 +1950,9 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if seconds < 30 or seconds > 600:
             await interaction.response.send_message("❌ Must be 30–600 seconds.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, turn_timeout=seconds)
-        await interaction.response.send_message(f"✅ Turn timeout (AFK fold): **{seconds}s**")
+        await interaction.followup.send(f"✅ Turn timeout (AFK fold): **{seconds}s**")
 
     @pokerset.command(name="resend", description="[Manager] Set how many messages before embed is resent")
     @app_commands.describe(count="Number of messages (3–50)")
@@ -1882,8 +1961,9 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         if count < 3 or count > 50:
             await interaction.response.send_message("❌ Must be 3–50.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, resend_after_msgs=count)
-        await interaction.response.send_message(f"✅ Embed resend threshold: **{count}** messages")
+        await interaction.followup.send(f"✅ Embed resend threshold: **{count}** messages")
 
     @pokerset.command(name="mucktime", description="[Manager] Set time limit for players to show/muck")
     @app_commands.describe(seconds="Seconds to wait (5–60)")
@@ -1894,24 +1974,27 @@ class PokerCog(commands.Cog):
         if seconds < 5 or seconds > 60:
             await interaction.response.send_message("❌ Must be 5–60 seconds.", ephemeral=True);
             return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, muck_time=seconds)
-        await interaction.response.send_message(f"✅ Showdown muck timer: **{seconds}s**")
+        await interaction.followup.send(f"✅ Showdown muck timer: **{seconds}s**")
 
     @pokerset.command(name="logchannel", description="[Manager] Set channel for hand logs")
     @app_commands.describe(channel="The channel to post log thread in")
     async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, log_channel_id=channel.id)
-        await interaction.response.send_message(f"✅ Log channel: {channel.mention}")
+        await interaction.followup.send(f"✅ Log channel: {channel.mention}")
 
     @pokerset.command(name="managerrole", description="[Admin] Set the Poker Manager role")
     @app_commands.describe(role="Role that gets poker manager access")
     async def set_manager_role(self, interaction: discord.Interaction, role: discord.Role):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, manager_role_id=role.id)
-        await interaction.response.send_message(f"✅ Poker Manager role: **{role.name}**")
+        await interaction.followup.send(f"✅ Poker Manager role: **{role.name}**")
 
     @poker.command(name="resetdb", description="[Admin] Wipe all poker data from the database")
     async def reset_db(self, interaction: discord.Interaction):

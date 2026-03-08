@@ -532,15 +532,21 @@ class PokerGame:
         p.acted = True
         msg = f"🏳️ **{p.display_name}** was force-folded."
 
-        # 2. Use was_turn, and check if this leaves only 1 active player
-        if was_turn or not self.current_player() or len(self.players_in_hand) == 1:
+        # 2. Check if this leaves only 1 active player
+        if len(self.players_in_hand) == 1:
             end = self._advance()
             return True, msg + ("\n" + end if end else "")
 
-        # If not their turn, check if folding them closes betting
+        # 3. Check if folding them closes betting
         if self._betting_closed():
             end = self._next_street()
             return True, msg + ("\n" + end if end else "")
+
+        # 4. If it was their turn, simply checking current_player() naturally glides
+        # the turn index to the next active player without double-skipping them!
+        if was_turn:
+            self.current_player()
+
         return True, msg
 
     def _build_fold_result(self, winner: "PokerPlayer") -> HandResult:

@@ -1456,20 +1456,39 @@ class PokerCog(commands.Cog):
     @app_commands.describe(user="Player to kick")
     async def kick(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
-        key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
-        if not t:
-            await interaction.response.send_message("❌ No table here.", ephemeral=True); return
-        p = t.game.get_player(user.id)
-        if not p:
-            await interaction.response.send_message(f"❌ **{user.display_name}** is not at the table.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
 
+        # 1. DEFER INSTANTLY
+        await interaction.response.defer(ephemeral=False)
+
+        key = (interaction.guild_id, interaction.channel_id)
+        t = get_table(key)
+        if not t:
+            await interaction.followup.send("❌ No table here.", ephemeral=True);
+            return
+
+        p = t.game.get_player(user.id)
+        pj = next((x for x in t.game.pending_joins if x.user_id == user.id), None)
+
+        if not p and not pj:
+            await interaction.followup.send(f"❌ **{user.display_name}** is not at the table.", ephemeral=True);
+            return
+
+        # Kick from waiting list
+        if pj:
+            t.game.pending_joins.remove(pj)
+            total_to_return = pj.chips + pj.pending_rebuy
+            if total_to_return > 0:
+                await db.return_chips(user.id, total_to_return)
+                await db.clear_chips_in_play(user.id)
+            await interaction.followup.send(f"🦵 **{user.display_name}** has been kicked from the waiting list.")
+            return
+
+        # Kick from table
         if t.game.street == Street.WAITING:
             t.game.players.remove(p)
-            # FIX: Add pending_rebuy to the refund
             total_to_return = p.chips + p.pending_rebuy
-            await interaction.response.defer(ephemeral=False)
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
                 await db.clear_chips_in_play(user.id)
@@ -1493,7 +1512,7 @@ class PokerCog(commands.Cog):
                     if part.strip():
                         slog(t, part)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
 
         if t.game._hand_result:
@@ -1516,10 +1535,6 @@ class PokerCog(commands.Cog):
                                     interaction.user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
 
-        # Defer ephemerally — we'll decide whether to go public after checking tables.
-        # Using a public defer when the user isn't seated causes a blank public message
-        # that Discord renders confusingly alongside between-hands views.
-
         kicked_from = []
         for (gid, cid), t in list(tables.items()):
             if gid != interaction.guild_id:
@@ -1527,28 +1542,42 @@ class PokerCog(commands.Cog):
             if table_name is None or t.name.lower() == table_name.lower():
                 if user.id not in t.game.banned_users:
                     t.game.banned_users.append(user.id)
-                p  = t.game.get_player(user.id)
+
+                # Fetch player state
+                p = t.game.get_player(user.id)
                 pj = next((x for x in t.game.pending_joins if x.user_id == user.id), None)
+
+                # Apply exact same logic as Kick command
                 if pj:
                     t.game.pending_joins.remove(pj)
-                    if pj.chips > 0:
-                        await db.return_chips(user.id, pj.chips)
+                    total_to_return = pj.chips + pj.pending_rebuy
+                    if total_to_return > 0:
+                        await db.return_chips(user.id, total_to_return)
                         await db.clear_chips_in_play(user.id)
+
                 if p:
                     if t.game.street == Street.WAITING:
                         t.game.players.remove(p)
-                        total = p.chips + p.pending_rebuy
-                        if total > 0:
-                            await db.return_chips(user.id, total)
+                        total_to_return = p.chips + p.pending_rebuy
+                        if total_to_return > 0:
+                            await db.return_chips(user.id, total_to_return)
                             await db.clear_chips_in_play(user.id)
                     else:
-                        # Hand in progress — force fold then queue removal for after hand.
-                        if not p.folded and t.game.street != Street.SHOWDOWN:
-                            ok, fold_msg = t.game.force_fold(user.id)
-                            if ok:
-                                slog(t, fold_msg.split("\n")[0])
+                        if user.id not in t.game.kicked_users:
+                            t.game.kicked_users.append(user.id)
                         if user.id not in t.game.pending_leaves:
                             t.game.pending_leaves.append(user.id)
+
+                        if not p.folded:
+                            ok, fold_msg = t.game.force_fold(user.id)
+                            if ok:
+                                parts = fold_msg.split("\n")
+                                if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                                    slog_clear(t)
+                                for part in parts:
+                                    if part.strip():
+                                        slog(t, part)
+
                 if p or pj:
                     kicked_from.append(t.name)
                     ch = interaction.guild.get_channel(cid)
@@ -1557,7 +1586,8 @@ class PokerCog(commands.Cog):
                             await ch.send(f"🔨 **{user.display_name}** has been banned and removed from the table.")
                             await refresh(ch, t)
                         else:
-                            await ch.send(f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
+                            await ch.send(
+                                f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
                             if t.game._hand_result:
                                 await _process_result(interaction.guild, ch, t)
                             else:
@@ -1565,10 +1595,11 @@ class PokerCog(commands.Cog):
 
         kick_note = f" Kicked from: {', '.join(kicked_from)}." if kicked_from else ""
         if not added:
-            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kick_note}", ephemeral=True)
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kick_note}",
+                                            ephemeral=True)
         else:
-            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kick_note}", ephemeral=not kicked_from)
-
+            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kick_note}",
+                                            ephemeral=not kicked_from)
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
     async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
@@ -1597,24 +1628,36 @@ class PokerCog(commands.Cog):
     @app_commands.describe(user="Player to force fold")
     async def force_fold_cmd(self, interaction: discord.Interaction, user: discord.Member):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
+
+        # 1. DEFER INSTANTLY
+        await interaction.response.defer(ephemeral=False)
+
         key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
+        t = get_table(key)
         if not t:
-            await interaction.response.send_message("❌ No table here.", ephemeral=True); return
+            await interaction.followup.send("❌ No table here.", ephemeral=True);
+            return
         if t.game.street == Street.WAITING:
-            await interaction.response.send_message("❌ No hand in progress.", ephemeral=True); return
+            await interaction.followup.send("❌ No hand in progress.", ephemeral=True);
+            return
         p = t.game.get_player(user.id)
         if not p:
-            await interaction.response.send_message(f"❌ **{user.display_name}** is not at the table.", ephemeral=True); return
+            await interaction.followup.send(f"❌ **{user.display_name}** is not at the table.", ephemeral=True);
+            return
         if p.folded:
-            await interaction.response.send_message(f"ℹ️ **{user.display_name}** is already folded.", ephemeral=True); return
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** is already folded.", ephemeral=True);
+            return
 
         ok, msg = t.game.force_fold(user.id)
         if not ok:
-            await interaction.response.send_message(f"❌ {msg}", ephemeral=True); return
+            await interaction.followup.send(f"❌ {msg}", ephemeral=True);
+            return
+
         slog(t, msg)
-        await interaction.response.send_message(f"✅ Force folded **{user.display_name}**.")
+        await interaction.followup.send(f"✅ Force folded **{user.display_name}**.")
+
         if t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, t)
         else:

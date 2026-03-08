@@ -961,7 +961,7 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
 
     async def on_submit(self, interaction: discord.Interaction):
         # Defer first — only one response allowed
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         raise_amount = parse_chips(self.amount.value)
         if raise_amount is None:
             await interaction.followup.send("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
@@ -981,8 +981,6 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
             await _process_result(interaction.guild, self.channel, self.t)
         else:
             await refresh(self.channel, self.t)
-            
-        await interaction.followup.send("✅ Custom raise placed.", ephemeral=True)
 
 class RaisePickerView(discord.ui.View):
     """Shown when player clicks Raise — offers preset options."""
@@ -991,7 +989,7 @@ class RaisePickerView(discord.ui.View):
         self.t = t; self.channel = channel; self.guild = guild
 
     async def _do_raise(self, interaction: discord.Interaction, raise_amount: int):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         uid = interaction.user.id
         if not self.t.game.is_turn(uid):
             await interaction.followup.send("❌ It's not your turn.", ephemeral=True); return
@@ -1005,8 +1003,6 @@ class RaisePickerView(discord.ui.View):
             await _process_result(self.guild, self.channel, self.t)
         else:
             await refresh(self.channel, self.t)
-
-        await interaction.followup.send("✅ Raise placed.", ephemeral=True)
 
     @discord.ui.button(label="1/3 Pot", style=discord.ButtonStyle.green, row=0)
     async def third_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1034,7 +1030,7 @@ class RaisePickerView(discord.ui.View):
 
     @discord.ui.button(label="All In 🚀", style=discord.ButtonStyle.red, row=0)
     async def all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         g = self.t.game
         p = g.get_player(interaction.user.id)
         if not p:
@@ -1054,8 +1050,6 @@ class RaisePickerView(discord.ui.View):
             await _process_result(self.guild, self.channel, self.t)
         else:
             await refresh(self.channel, self.t)
-
-        await interaction.followup.send("✅ Went All-In! 🚀", ephemeral=True)
 
     @discord.ui.button(label="Custom…", style=discord.ButtonStyle.grey, row=0)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1131,13 +1125,11 @@ class GameView(discord.ui.View):
         for part in parts[1:]:
             if any(m in part for m in street_markers):
                 slog(self.t, part); break
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if self.t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, self.t)
         else:
             await refresh(interaction.channel, self.t)
-
-        await interaction.followup.send("✅ Action recorded.", ephemeral=True)
 
     @discord.ui.button(label="Join", style=discord.ButtonStyle.green, row=0)
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1180,7 +1172,7 @@ class GameView(discord.ui.View):
         chips_back, msg = self.t.game.remove_player(interaction.user.id)
 
         # 1. DEFER IMMEDIATELY BEFORE DB WRITES
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
 
         # 2. Safely write to DB
         if chips_back > 0:
@@ -1193,8 +1185,6 @@ class GameView(discord.ui.View):
             await interaction.channel.send(
                 f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
         await refresh(interaction.channel, self.t)
-
-        await interaction.followup.send("✅ You left the table.", ephemeral=True)
 
     @discord.ui.button(label="Call",  style=discord.ButtonStyle.green,  row=1)
     async def btn_call(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1781,7 +1771,7 @@ class PokerCog(commands.Cog):
 
         # 2. USE FOLLOWUP.SEND
         await interaction.followup.send(
-            f"✅ **+{amount}** chips → **{user.display_name}** |  Balance: **{new_bal}** 🪙"
+            f"✅ **+{amount}** chips → **{user.mention}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
@@ -1812,7 +1802,7 @@ class PokerCog(commands.Cog):
 
         # 2. USE FOLLOWUP.SEND
         await interaction.followup.send(
-            f"✅ **-{amount}** chips from **{user.display_name}** |  Balance: **{new_bal}** 🪙"
+            f"✅ **-{amount}** chips from **{user.mention}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
     @pokermgr.command(name="bans", description="[Manager] List all currently banned players")

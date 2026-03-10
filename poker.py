@@ -254,11 +254,19 @@ async def _auto_next_hand(t: TableState, channel):
     await refresh(channel, t, new_hand=True)
 
 async def _close_table(channel, t: TableState):
+    t.closing = True
     key = (channel.guild.id, channel.id)
     cancel_timer(t)
     if t.auto_task and not t.auto_task.done():
         t.auto_task.cancel()
     tables.pop(key, None)
+
+    if t.hand_msg:
+        try:
+            await t.hand_msg.edit(view=None)
+        except Exception:
+            pass
+
     # Return chips for seated players not already paid out via pending_leaves
     for p in list(t.game.players):
         if p.user_id not in t.game.pending_leaves:
@@ -911,6 +919,9 @@ class BetweenHandsView(discord.ui.View):
     @discord.ui.button(label="Tip Dealer 💸", style=discord.ButtonStyle.blurple)
     async def tip_dealer(self, interaction: discord.Interaction, button: discord.ui.Button):
         t = self.t
+        if t.closing:  # <-- ADDED GUARD
+            await interaction.response.send_message("❌ This table is closing.", ephemeral=True);
+            return
         if interaction.user.id == t.manager_id:
             await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
         p           = t.game.get_player(interaction.user.id)
@@ -921,6 +932,10 @@ class BetweenHandsView(discord.ui.View):
     @discord.ui.button(label="Add Chips 💰", style=discord.ButtonStyle.green)
     async def add_chips(self, interaction: discord.Interaction, button: discord.ui.Button):
         t = self.t
+        if t.closing:  # <-- ADDED GUARD
+            await interaction.response.send_message("❌ This table is closing.", ephemeral=True);
+            return
+        p = t.game.get_player(interaction.user.id)
         p = t.game.get_player(interaction.user.id)
         pj = next((pj for pj in t.game.pending_joins if pj.user_id == interaction.user.id), None)
 
@@ -1067,6 +1082,9 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
         self.amount.placeholder = f"min {min_w} — max {limit_str}  (wallet: {bal})"
 
     async def on_submit(self, interaction: discord.Interaction):
+        if self.t.closing:
+            await interaction.response.send_message("❌ This table has been closed.", ephemeral=True);
+            return
         chips = parse_chips(self.amount.value)
         if chips is None:
             await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k).", ephemeral=True); return
@@ -1106,10 +1124,13 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 class GameView(discord.ui.View):
     def __init__(self, t: TableState):
         super().__init__(timeout=None)
-        self.t      = t
-        in_hand     = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
-        table_full  = (len(t.game.players) + len(t.game.pending_joins)) >= 8
-        self.btn_join.disabled  = in_hand or table_full or t.closing
+        self.t = t
+        in_hand = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
+        table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 8
+        self.btn_join.disabled = in_hand or table_full or t.closing
+
+        self.btn_leave.disabled = t.closing  # <-- ADD THIS LINE
+
         for b in [self.btn_call, self.btn_check, self.btn_raise, self.btn_fold]:
             b.disabled = not in_hand
 
@@ -1376,26 +1397,33 @@ class PokerCog(commands.Cog):
     @poker.command(name="close", description="[Manager] Close table after current hand")
     async def close_table(self, interaction: discord.Interaction):
         key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
+        t = get_table(key)
         if not t:
-            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
+            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True);
+            return
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
+
+        # DEFER FIRST
+        await interaction.response.defer(ephemeral=False)
+
         if t.game.street == Street.WAITING:
             # No hand running — close immediately
-            await interaction.response.defer(ephemeral=True)
             await _close_table(interaction.channel, t)
-            await interaction.followup.send("✅ Table closed.", ephemeral=True)
+            await interaction.followup.send("✅ Table closed.")
         else:
-            # Hand in progress — flag to close after it ends, cancel any between-hands timer
+            # Hand in progress
             t.closing = True
             if t.auto_task and not t.auto_task.done():
                 t.auto_task.cancel()
             if t.between_msg:
-                try: await t.between_msg.delete()
-                except Exception: pass
+                try:
+                    await t.between_msg.delete()
+                except Exception:
+                    pass
                 t.between_msg = None
-            await interaction.response.send_message("✅ Table will close after this hand.", ephemeral=False)
+            await interaction.followup.send("✅ Table will close after this hand.")
             await refresh(interaction.channel, t)
 
     @poker.command(name="start", description="[Manager] Deal the first hand")
@@ -1434,7 +1462,8 @@ class PokerCog(commands.Cog):
         success, msg = t.game.start_hand()
         slog(t, msg)
         if not success:
-            await interaction.response.send_message(msg, ephemeral=True); return
+            await interaction.followup.send(msg, ephemeral=True);
+            return
         t.msg_count = 0
         await refresh(interaction.channel, t, new_hand=True)
         await interaction.followup.send("✅ Hand started!", ephemeral=True)

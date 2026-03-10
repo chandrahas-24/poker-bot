@@ -254,7 +254,7 @@ class PokerGame:
         return cp is not None and cp.user_id == user_id
 
     def call_amount(self, player: PokerPlayer) -> int:
-        return min(self.current_bet - player.bet, player.chips)
+        return max(0,min(self.current_bet - player.bet, player.chips))
 
     # Actions
 
@@ -319,12 +319,16 @@ class PokerGame:
         if actual_raise >= min_raise:
             self.last_raise_size = actual_raise
 
-        p.chips     -= total_needed
-        p.bet       += total_needed
+        p.chips -= total_needed
+        p.bet += total_needed
         p.total_bet += total_needed
-        self.pot    += total_needed
-        self.current_bet = p.bet
-        self.last_raiser = user_id
+        self.pot += total_needed
+
+        # FIX: Only update the table's bet if they actually raised it!
+        if p.bet > self.current_bet:
+            self.current_bet = p.bet
+            self.last_raiser = user_id
+
         if p.chips == 0:
             p.all_in = True
         for other in self.active_players:

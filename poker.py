@@ -263,7 +263,8 @@ async def _close_table(channel, t: TableState):
 
     if t.hand_msg:
         try:
-            await t.hand_msg.edit(view=None)
+            # Fire-and-forget: Tell Discord to remove the buttons, but DO NOT wait for it to finish
+            asyncio.create_task(t.hand_msg.edit(view=None))
         except Exception:
             pass
 
@@ -322,12 +323,10 @@ async def post_hand_log(channel, t: TableState, result):
 
     # Helper: get "username (user_id)" for a user_id
     async def uid_str(uid):
-        try:
-            m = channel.guild.get_member(uid) or await channel.guild.fetch_member(uid)
-            return f"{m.name} ({uid})"
-        except Exception:
-            p = game.get_player(uid)
-            return f"{p.display_name if p else uid} ({uid})"
+        # ZERO LAG: Read directly from table memory!
+        p = game.get_player(uid)
+        uname = p.display_name if p else "Unknown"
+        return f"{uname} ({uid})"
 
     # Community cards — read from result since game.community is cleared by _end_hand
     from engine import hand_str
@@ -362,12 +361,11 @@ async def post_hand_log(channel, t: TableState, result):
     body = "\n".join(lines)
     await thread.send(f"```\n{body}\n```")
 
-async def post_tip_log(channel, t: TableState, tipper: str, amount: int, recipient: str):
+async def post_tip_log(channel, t: TableState, tipper_id: int, tipper_name: str, amount: int, recipient_id: int, recipient_name: str):
     thread = await ensure_log_thread(channel, t)
     if thread:
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        await thread.send(f"💸 **Tip** [{ts}] — {tipper} tipped **{amount}** 🪙 to **{recipient}** at table `{t.name}`")
-
+        await thread.send(f"💸 **Tip** [{ts}] — {amount} \n **{tipper_name}** ({tipper_id}) to **{recipient_name}** ({recipient_id}) at table `{t.name}`")
 # ── Embed ─────────────────────────────────────────────────────────────────────
 
 STREET_COLOR = {
@@ -628,12 +626,11 @@ async def _process_result(guild, channel, t: TableState):
         for p in t.game.players:
             net = result.chip_deltas.get(p.user_id, 0)
             won = any(w.user_id == p.user_id for w in result.winners)
-            try:
-                member = guild.get_member(p.user_id) or await guild.fetch_member(p.user_id)
-                uname  = member.name
-            except Exception:
-                uname = p.display_name
-            await db.record_hand(p.user_id, uname, won, net)
+
+            # ZERO LAG: Stop fetching from Discord.
+            # p.display_name now securely holds their permanent username!
+            await db.record_hand(p.user_id, p.display_name, won, net)
+
     except Exception as e:
         print(f"[poker] record_hand error: {e}")
 
@@ -854,17 +851,23 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
                     await db.update_chips_in_play(interaction.user.id, p.chips)
                 await interaction.followup.send("❌ Failed to deduct wallet chips.", ephemeral=True); return
 
-        manager_id   = self.t.manager_id
+        manager_id = self.t.manager_id
         manager_name = "Dealer"
         try:
-            member = interaction.guild.get_member(manager_id) or await interaction.guild.fetch_member(manager_id)
-            manager_name = member.display_name
+            # ZERO LAG: Check table memory first, then fast cache. No fetching!
+            p_mgr = self.t.game.get_player(manager_id)
+            if p_mgr:
+                manager_name = p_mgr.display_name
+            else:
+                member = interaction.guild.get_member(manager_id)
+                if member:
+                    manager_name = member.display_name
         except Exception:
             pass
 
         await db.add_chips(interaction.user.id, interaction.user.display_name,
                            manager_id, manager_name, tip, f"Tip from {interaction.user.display_name}")
-        await post_tip_log(interaction.channel, self.t, interaction.user.display_name, tip, manager_name)
+        await post_tip_log(interaction.channel, self.t, interaction.user.id, interaction.user.display_name, tip, manager_id, manager_name)
         await db.record_tip(interaction.user.id, interaction.user.display_name, tip)
         await interaction.followup.send(
             f"💸 **{interaction.user.display_name}** tipped **{tip}** chips to **{manager_name}**!", ephemeral=False)
@@ -1110,16 +1113,20 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 
         ok = await db.deduct_chips(interaction.user.id, chips)
         if not ok:
-            await interaction.followup.send("❌ Failed to deduct chips.", ephemeral=True); return
-        await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
+            await interaction.followup.send("❌ Failed to deduct chips.", ephemeral=True);
+            return
 
-        msg = t.game.add_player(interaction.user.id, interaction.user.display_name, chips)
+        # STRICT USERNAME: We now inject .name instead of .display_name!
+        await db.mark_chips_in_play(interaction.user.id, interaction.user.name, chips)
+
+        msg = t.game.add_player(interaction.user.id, interaction.user.name, chips)
         if msg.startswith("❌"):
             await db.return_chips(interaction.user.id, chips)
             await db.clear_chips_in_play(interaction.user.id)
-            await interaction.followup.send(msg, ephemeral=True); return
+            await interaction.followup.send(msg, ephemeral=True);
+            return
 
-        await interaction.channel.send(f"✅ **{interaction.user.display_name}** joined the table with **{chips}** 🪙!")
+        await interaction.channel.send(f"✅ **{interaction.user.name}** joined the table with **{chips}** 🪙!")
         await refresh(interaction.channel, t)
         await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
 
@@ -1259,12 +1266,9 @@ class GameView(discord.ui.View):
 
     @discord.ui.button(label="My Cards", style=discord.ButtonStyle.grey, row=2)
     async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1. Instantly defer to prevent the 404 Unknown Interaction crash
-        await interaction.response.defer(ephemeral=True)
-
         p = self.t.game.get_player(interaction.user.id)
         if not p or not p.hole_cards:
-            await interaction.followup.send("❌ No cards right now.", ephemeral=True);
+            await interaction.response.send_message("❌ No cards right now.", ephemeral=True);
             return
 
         strength = ""
@@ -1274,15 +1278,18 @@ class GameView(discord.ui.View):
             pct = round((1 - score / 7462) * 100, 1)
             strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
 
-        # FIXED: Always include the emoji text format for slow internet connections
         caption = f"Your hole cards — {p.chips} 🪙 at table{strength}\n**Cards:** {hand_str(p.hole_cards)}"
 
+        # 1. INSTANTLY send the text so players with slow internet see their cards immediately
+        await interaction.response.send_message(caption, ephemeral=True)
+
+        # 2. Generate the heavy image and patch it in a second later
         if USE_IMAGES:
-            # 2. Push the heavy image processing to the background
-            file = await asyncio.to_thread(card_images.make_strip, p.hole_cards)
-            await interaction.followup.send(caption, file=file, ephemeral=True)
-        else:
-            await interaction.followup.send(caption, ephemeral=True)
+            try:
+                file = await asyncio.to_thread(card_images.make_strip, p.hole_cards)
+                await interaction.edit_original_response(attachments=[file])
+            except Exception:
+                pass  # If the image fails to upload, they already have the text!
 
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1644,11 +1651,11 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
             return
 
-        await interaction.response.defer(ephemeral=True)
+        # FIXED: Defer publicly
+        await interaction.response.defer(ephemeral=False)
         removed = await db.unban_player(interaction.guild_id, user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "all tables"
 
-        # Remove in-memory ban too for the single active table
         active = next(((cid, table) for (gid, cid), table in tables.items() if gid == interaction.guild_id), None)
 
         if active:
@@ -1657,11 +1664,11 @@ class PokerCog(commands.Cog):
                 if user.id in t.game.banned_users:
                     t.game.banned_users.remove(user.id)
 
+        # FIXED: Send publicly
         if removed:
-            await interaction.followup.send(f"✅ **{user.display_name}** unbanned from {scope}.")
+            await interaction.followup.send(f"✅ **{user.display_name}** unbanned from {scope}.", ephemeral=False)
         else:
-            await interaction.followup.send(
-                f"ℹ️ **{user.display_name}** had no bans for {scope}.", ephemeral=True)
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** had no bans for {scope}.", ephemeral=False)
 
     @pokermgr.command(name="forcefold", description="[Manager] Force a player to fold their hand")
     @app_commands.describe(user="Player to force fold")
@@ -1719,17 +1726,77 @@ class PokerCog(commands.Cog):
         await interaction.followup.send(f"{label}: {bal} 🪙{table_str}{pending_str}", ephemeral=False)
 
     @poker.command(name="tip", description="Tip the dealer between hands")
-    async def tip_cmd(self, interaction: discord.Interaction):
+    @app_commands.describe(amount="How many chips to tip? (e.g. 50, 1k)")
+    async def tip_cmd(self, interaction: discord.Interaction, amount: str):
+        # 1. Defer instantly since we don't need a modal anymore
+        await interaction.response.defer(ephemeral=False)
+
+        tip = parse_chips(amount)
+        if tip is None or tip <= 0:
+            await interaction.followup.send("❌ Enter a valid amount greater than 0.", ephemeral=True)
+            return
+
         key = (interaction.guild_id, interaction.channel_id)
-        t   = get_table(key)
+        t = get_table(key)
         if not t:
-            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True); return
+            await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
+            return
+
         if interaction.user.id == t.manager_id:
-            await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
-        p           = t.game.get_player(interaction.user.id)
+            await interaction.followup.send("❌ You can't tip yourself.", ephemeral=True)
+            return
+
+        p = t.game.get_player(interaction.user.id)
         table_chips = p.chips if p else 0
-        # Balance check and zero-check happen inside TipModal.on_submit after defer()
-        await interaction.response.send_modal(TipModal(t, 0, table_chips))
+        wallet_bal = await db.get_balance(interaction.user.id)
+
+        # Pull from table first, then wallet
+        from_table = min(tip, table_chips)
+        from_wallet = tip - from_table
+
+        if from_wallet > wallet_bal:
+            await interaction.followup.send(
+                f"❌ Not enough chips. Table: **{table_chips}**, Wallet: **{wallet_bal}**.", ephemeral=True)
+            return
+
+        # Deduct chips
+        if from_table > 0 and p:
+            p.chips -= from_table
+            await db.update_chips_in_play(interaction.user.id, p.chips)
+        if from_wallet > 0:
+            ok = await db.deduct_chips(interaction.user.id, from_wallet)
+            if not ok:
+                # Rollback if wallet deduction fails
+                if from_table > 0 and p:
+                    p.chips += from_table
+                    await db.update_chips_in_play(interaction.user.id, p.chips)
+                await interaction.followup.send("❌ Failed to deduct wallet chips.", ephemeral=True)
+                return
+
+        # ZERO LAG: Get manager name without fetching
+        manager_id = t.manager_id
+        manager_name = "Dealer"
+        try:
+            p_mgr = t.game.get_player(manager_id)
+            if p_mgr:
+                manager_name = p_mgr.display_name
+            else:
+                member = interaction.guild.get_member(manager_id)
+                if member:
+                    manager_name = member.display_name
+        except Exception:
+            pass
+
+        # Log and send
+        await db.add_chips(interaction.user.id, interaction.user.display_name,
+                           manager_id, manager_name, tip, f"Tip from {interaction.user.display_name}")
+
+        await post_tip_log(interaction.channel, t, interaction.user.id, interaction.user.display_name, tip, manager_id,
+                           manager_name)
+        await db.record_tip(interaction.user.id, interaction.user.display_name, tip)
+
+        await interaction.followup.send(
+            f"💸 **{interaction.user.display_name}** tipped **{tip}** chips to **{manager_name}**!", ephemeral=False)
 
     @poker.command(name="leaderboard", description="Top poker players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):
@@ -1743,13 +1810,6 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("No stats yet!", ephemeral=True)
             return
 
-        async def get_uname(uid):
-            try:
-                m = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
-                return m.name
-            except Exception:
-                return None
-
         MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
         top_ids = {r['user_id'] for r in rows}
 
@@ -1761,7 +1821,7 @@ class PokerCog(commands.Cog):
             wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
             net = r['net_chips']
             sign = "+" if net >= 0 else ""
-            uname = (await get_uname(r['user_id']) or r['username'])[:17]
+            uname = r['username'][:17]
             medal = MEDALS.get(rank, f"{rank}. ")
             you_tag = " ◀" if r['user_id'] == caller_id else ""
             table_lines.append(f"{medal:<4}{uname:<18} {wp:>5} {sign + str(net):>9} {r['wallet']:>8}{you_tag}")
@@ -1903,25 +1963,21 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
             return
 
-        # Defer so the database has time to fetch without timing out
-        await interaction.response.defer(ephemeral=True)
+        # FIXED: Defer publicly
+        await interaction.response.defer(ephemeral=False)
 
         bans = await db.get_all_bans(interaction.guild_id)
 
         if not bans:
-            await interaction.followup.send("✅ There are currently no banned players in this server.", ephemeral=True)
+            await interaction.followup.send("✅ There are currently no banned players in this server.", ephemeral=False)
             return
 
         lines = []
         for b in bans:
-            # Check if it's a table ban or server-wide ban
             scope = f"Table: **{b['table_name']}**" if b['table_name'] else "**Server-wide**"
-            date_str = b['ts'].split(" ")[0]  # Just grab the YYYY-MM-DD part for cleanliness
-
+            date_str = b['ts'].split(" ")[0]
             lines.append(f"• **{b['username']}** (`{b['user_id']}`) — {scope} *(on {date_str})*")
 
-        # Discord has a 4096 character limit for embed descriptions.
-        # This safely joins them and truncates if the list is absurdly massive.
         description = "\n".join(lines)[:4096]
 
         embed = discord.Embed(
@@ -1931,7 +1987,8 @@ class PokerCog(commands.Cog):
         )
         embed.set_footer(text=f"Total bans: {len(bans)}")
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        # FIXED: Send publicly
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
     @poker.command(name="settings", description="[Manager] View table settings")
     async def settings_view(self, interaction: discord.Interaction):
@@ -2153,7 +2210,9 @@ class PokerCog(commands.Cog):
     @poker.command(name="request_cashout", description="Lock chips for withdrawal and notify staff")
     @app_commands.describe(amount="Chips to cash out", note="Optional payment info")
     async def request_cashout(self, interaction: discord.Interaction, amount: str, note: str = ""):
-        await interaction.response.defer(ephemeral=False)
+        # FIXED: Defer ephemerally to hide from chat
+        await interaction.response.defer(ephemeral=True)
+
         chips = parse_chips(amount)
         if chips is None or chips <= 0:
             await interaction.followup.send("❌ Enter a valid amount (e.g. 500, 2k).", ephemeral=True);
@@ -2166,7 +2225,6 @@ class PokerCog(commands.Cog):
                 ephemeral=True);
             return
 
-        # 💸 Calculate 5% Round-Up Tax
         tax = math.ceil(chips * 0.05)
         payout_amount = chips - tax
 
@@ -2186,8 +2244,11 @@ class PokerCog(commands.Cog):
             except Exception:
                 pass
 
+        # FIXED: Send the final receipt ephemerally
         await interaction.followup.send(
-            f"✅ Locked **{chips}** 🪙 for cashout (Payout: **{payout_amount}**, Tax: **{tax}**). Staff have been notified in the cashouts channel.")
+            f"✅ Locked **{chips}** 🪙 for cashout (Payout: **{payout_amount}**, Tax: **{tax}**). Staff have been notified in the cashouts channel.",
+            ephemeral=True
+        )
 
     @pokermgr.command(name="pay_cashout", description="[Manager] Deduct paid chips from pending and send receipt")
     @app_commands.describe(user="Player who was paid", amount="Amount of chips paid")
@@ -2195,6 +2256,15 @@ class PokerCog(commands.Cog):
         if not await is_manager(interaction):
             await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
             return
+
+        # NEW: Check if the command is being run in the correct cashout channel
+        cashout_ch_id_str = os.getenv("CASHOUT_CHANNEL_ID")
+        if cashout_ch_id_str:
+            cashout_ch_id = int(cashout_ch_id_str)
+            if interaction.channel_id != cashout_ch_id:
+                await interaction.response.send_message(f"❌ This command can only be used in <#{cashout_ch_id}>.",
+                                                        ephemeral=True)
+                return
 
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
@@ -2209,14 +2279,6 @@ class PokerCog(commands.Cog):
                 f"❌ **{user.display_name}** only has **{pending}** 🪙 pending. You cannot deduct {amount}.",
                 ephemeral=True);
             return
-
-        cashout_ch_id = os.getenv("CASHOUT_CHANNEL_ID")
-        if cashout_ch_id:
-            try:
-                ch = interaction.guild.get_channel(int(cashout_ch_id))
-                if ch: await ch.send(f"{user.mention} Cashed out {amount} chips successfully.")
-            except Exception:
-                pass
 
         await interaction.followup.send(
             f"✅ Successfully deducted **{amount}** 🪙 from **{user.mention}**'s pending cashouts.")
@@ -2289,13 +2351,6 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("No tips recorded yet! Be the first to tip the dealer!", ephemeral=True)
             return
 
-        async def get_uname(uid):
-            try:
-                m = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
-                return m.name
-            except Exception:
-                return None
-
         MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
         top_ids = {r['user_id'] for r in rows}
 
@@ -2305,7 +2360,7 @@ class PokerCog(commands.Cog):
 
         for i, r in enumerate(rows):
             rank = i + 1
-            uname = (await get_uname(r['user_id']) or r['username'])[:17]
+            uname = r['username'][:17]
             medal = MEDALS.get(rank, f"{rank}. ")
             you_tag = " ◀" if r['user_id'] == caller_id else ""
             table_lines.append(f"{medal:<4}{uname:<18} {r['total_tipped']:>12,}{you_tag}")

@@ -1568,19 +1568,21 @@ class PokerCog(commands.Cog):
                                     interaction.user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
 
-        kicked_from = []
-        for (gid, cid), t in list(tables.items()):
-            if gid != interaction.guild_id:
-                continue
+        kicked_from = ""
+
+        # Grab the single active table for this server
+        active = next(((cid, table) for (gid, cid), table in tables.items() if gid == interaction.guild_id), None)
+
+        if active:
+            cid, t = active
             if table_name is None or t.name.lower() == table_name.lower():
                 if user.id not in t.game.banned_users:
                     t.game.banned_users.append(user.id)
 
-                # Fetch player state
                 p = t.game.get_player(user.id)
                 pj = next((x for x in t.game.pending_joins if x.user_id == user.id), None)
 
-                # Apply exact same logic as Kick command
+                # Kick from waiting list
                 if pj:
                     t.game.pending_joins.remove(pj)
                     total_to_return = pj.chips + pj.pending_rebuy
@@ -1588,6 +1590,7 @@ class PokerCog(commands.Cog):
                         await db.return_chips(user.id, total_to_return)
                         await db.clear_chips_in_play(user.id)
 
+                # Kick from active table
                 if p:
                     if t.game.street == Street.WAITING:
                         t.game.players.remove(p)
@@ -1612,41 +1615,44 @@ class PokerCog(commands.Cog):
                                         slog(t, part)
 
                 if p or pj:
-                    kicked_from.append(t.name)
+                    kicked_from = f" Kicked from: {t.name}."
                     ch = interaction.guild.get_channel(cid)
                     if ch:
-                        if t.game.street == Street.WAITING:
+                        if t.game._hand_result:
+                            await ch.send(
+                                f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
+                            await _process_result(interaction.guild, ch, t)
+                        elif t.game.street == Street.WAITING:
                             await ch.send(f"🔨 **{user.display_name}** has been banned and removed from the table.")
                             await refresh(ch, t)
                         else:
                             await ch.send(
                                 f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
-                            if t.game._hand_result:
-                                await _process_result(interaction.guild, ch, t)
-                            else:
-                                await refresh(ch, t)
+                            await refresh(ch, t)
 
-        kick_note = f" Kicked from: {', '.join(kicked_from)}." if kicked_from else ""
         if not added:
-            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kick_note}",
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kicked_from}",
                                             ephemeral=True)
         else:
-            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kick_note}",
+            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kicked_from}",
                                             ephemeral=not kicked_from)
+
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
     async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            return
 
         await interaction.response.defer(ephemeral=True)
         removed = await db.unban_player(interaction.guild_id, user.id, table_name)
-        scope   = f"table **{table_name}**" if table_name else "all tables"
+        scope = f"table **{table_name}**" if table_name else "all tables"
 
-        # Remove in-memory ban too
-        for (gid, _), t in tables.items():
-            if gid != interaction.guild_id:
-                continue
+        # Remove in-memory ban too for the single active table
+        active = next(((cid, table) for (gid, cid), table in tables.items() if gid == interaction.guild_id), None)
+
+        if active:
+            cid, t = active
             if table_name is None or t.name.lower() == (table_name or "").lower():
                 if user.id in t.game.banned_users:
                     t.game.banned_users.remove(user.id)

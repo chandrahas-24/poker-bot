@@ -457,6 +457,24 @@ async def update_board(t: TableState):
 # ── Turn ping ─────────────────────────────────────────────────────────────────
 
 async def send_turn_ping(channel, t: TableState):
+    cp = t.game.current_player()
+
+    # 1. If hand is over or waiting, clean up and bail
+    if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
+        if t.ping_msg:
+            try:
+                await t.ping_msg.delete()
+            except discord.NotFound:
+                pass
+            t.ping_msg = None
+        t.ping_user_id = None
+        return
+
+    # 2. If it is still this exact player's turn, DO NOT delete their ping!
+    if t.ping_user_id == cp.user_id:
+        return
+
+    # 3. Turn has advanced! Delete the old ping.
     if t.ping_msg:
         try:
             await t.ping_msg.delete()
@@ -464,18 +482,8 @@ async def send_turn_ping(channel, t: TableState):
             pass
         t.ping_msg = None
 
-    cp = t.game.current_player()
-    if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
-        t.ping_user_id = None
-        return
-
-    # If we already sent a ping for this player, don't send another.
-    # This guards against concurrent refresh calls (e.g. a button click and
-    # an on_channel_message resend racing each other).
-    if t.ping_user_id == cp.user_id:
-        return
-
-    t.ping_user_id = cp.user_id  # claim BEFORE the await so concurrent calls see it
+    # 4. Claim the lock and send the new ping
+    t.ping_user_id = cp.user_id
     call_amt = t.game.call_amount(cp)
     hint     = f"call **{call_amt}**, raise, or fold" if call_amt else "check or raise"
     t.ping_msg = await channel.send(f"<@{cp.user_id}> your turn — {hint}")
@@ -1266,14 +1274,16 @@ class GameView(discord.ui.View):
             pct = round((1 - score / 7462) * 100, 1)
             strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
 
-        caption = f"Your hole cards — {p.chips} 🪙 at table{strength}"
+        # FIXED: Always include the emoji text format for slow internet connections
+        caption = f"Your hole cards — {p.chips} 🪙 at table{strength}\n**Cards:** {hand_str(p.hole_cards)}"
 
         if USE_IMAGES:
             # 2. Push the heavy image processing to the background
             file = await asyncio.to_thread(card_images.make_strip, p.hole_cards)
             await interaction.followup.send(caption, file=file, ephemeral=True)
         else:
-            await interaction.followup.send(f"{caption}\n{hand_str(p.hole_cards)}", ephemeral=True)
+            await interaction.followup.send(caption, ephemeral=True)
+
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
@@ -2358,7 +2368,7 @@ class PokerCog(commands.Cog):
             # Post the 0% tax legacy receipt to the cashouts channel
             await cashout_ch.send(
                 f"**⚠️ LEGACY MIGRATION PAYOUT**\n"
-                f"{uid} ({uname}) \n"
+                f"<@{uid}> ({uname}) ({uid})\n"
                 f"**Amount Owed:** {amount} 🪙\n"
                 f"-# (0% Tax applied — Admin must pay player in dank. Player can then rebuy under new system)"
             )

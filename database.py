@@ -122,6 +122,26 @@ async def init_db():
                 detail    TEXT
             )
         """)
+
+        await db.execute("""
+                    CREATE TABLE IF NOT EXISTS house_revenue (
+                        ts TEXT,
+                        amount INTEGER
+                    )
+                """)
+
+        # Safely upgrade existing stats table
+        try:
+            await db.execute("ALTER TABLE stats ADD COLUMN total_tipped INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+        # Safely upgrade existing wallets table without wiping data
+        try:
+            await db.execute("ALTER TABLE wallets ADD COLUMN pending_cashout INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         await db.commit()
 
 
@@ -281,11 +301,11 @@ async def get_player_rank(user_id: int) -> int | None:
         row = await c.fetchone()
         return row[0] if row else None
 
-
 async def get_player_stats(user_id: int) -> dict | None:
     db = await _get_db()
     async with db.execute("""
         SELECT s.username, s.hands_played, s.hands_won, s.chips_won, s.chips_lost,
+               COALESCE(s.total_tipped, 0) AS total_tipped,
                (s.chips_won - s.chips_lost) AS net_chips,
                COALESCE(w.balance, 0) AS wallet
         FROM stats s LEFT JOIN wallets w ON s.user_id = w.user_id
@@ -452,7 +472,6 @@ async def delete_player_stats(user_id: int) -> bool:
         await db.commit()
     return True
 
-
 async def reset_database(admin_id: int, admin_name: str):
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     db = await _get_db()
@@ -463,8 +482,145 @@ async def reset_database(admin_id: int, admin_name: str):
         await db.execute("DELETE FROM chip_log")
         await db.execute("DELETE FROM chips_in_play")
         await db.execute("DELETE FROM poker_bans")
+        await db.execute("DELETE FROM house_revenue")  # <-- FIXED: Clears the revenue tracker
         await db.execute("""
             INSERT INTO audit_log (ts, action, user_id, user_name, detail)
             VALUES (?, 'DATABASE_RESET', ?, ?, 'Full database reset performed')
         """, (ts, admin_id, admin_name))
         await db.commit()
+
+
+# --- VAULT & CASHOUT FUNCTIONS ---
+
+async def get_wallet(user_id: int) -> tuple[int, int]:
+    """Returns (available_balance, pending_cashout)"""
+    db = await _get_db()
+    async with db.execute("SELECT balance, pending_cashout FROM wallets WHERE user_id=?", (user_id,)) as c:
+        row = await c.fetchone()
+        return (row[0], row[1]) if row else (0, 0)
+
+
+async def request_cashout(user_id: int, amount: int, tax: int) -> bool:
+    """Moves chips to pending vault AND destroys the taxed amount permanently."""
+    db = await _get_db()
+    payout_amount = amount - tax
+    async with _write_lock:
+        await db.execute(
+            "UPDATE wallets SET balance = balance - ?, pending_cashout = pending_cashout + ? WHERE user_id = ? AND balance >= ?",
+            (amount, payout_amount, user_id, amount)
+        )
+        await db.commit()
+        async with db.execute("SELECT changes()") as c:
+            row = await c.fetchone()
+            return bool(row and row[0] > 0)
+
+
+async def pay_cashout(user_id: int, amount: int) -> bool:
+    """Staff pays out chips: deducts the specific amount from pending vault."""
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT pending_cashout FROM wallets WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+            pending = row[0] if row else 0
+
+        if pending < amount:
+            return False
+
+        await db.execute(
+            "UPDATE wallets SET pending_cashout = pending_cashout - ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        await db.commit()
+        return True
+
+
+# --- REVENUE & ECONOMY FUNCTIONS ---
+
+async def log_revenue(amount: int):
+    """Silently log projected house profit."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
+                         (datetime.utcnow().isoformat(), amount))
+        await db.commit()
+
+
+async def get_revenue_stats() -> dict:
+    """Calculate daily, weekly, monthly, and all-time revenue."""
+    db = await _get_db()
+    now = datetime.utcnow()
+    stats = {"daily": 0, "weekly": 0, "monthly": 0, "all_time": 0}
+
+    async with db.execute("SELECT ts, amount FROM house_revenue") as c:
+        rows = await c.fetchall()
+        for row in rows:
+            try:
+                ts = datetime.fromisoformat(row[0])
+                amt = row[1]
+
+                # FIXED: Use total_seconds to prevent off-by-one day rounding errors
+                hours_old = (now - ts).total_seconds() / 3600.0
+
+                stats["all_time"] += amt
+                if hours_old <= 24:   stats["daily"] += amt
+                if hours_old <= 168:  stats["weekly"] += amt  # 7 days * 24 hrs
+                if hours_old <= 720:  stats["monthly"] += amt  # 30 days * 24 hrs
+            except Exception:
+                pass
+    return stats
+
+
+async def get_economy_totals() -> tuple[int, int]:
+    """Returns (total_available_wallets, total_pending_cashouts)"""
+    db = await _get_db()
+    async with db.execute("SELECT SUM(balance), SUM(pending_cashout) FROM wallets") as c:
+        row = await c.fetchone()
+        return (row[0] or 0, row[1] or 0)
+
+# --- TIP TRACKING ---
+
+async def record_tip(user_id: int, username: str, amount: int):
+    """Adds to a player's all-time tipped amount."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO stats (user_id, username, hands_played, hands_won, chips_won, chips_lost, total_tipped)
+            VALUES (?, ?, 0, 0, 0, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username     = excluded.username,
+                total_tipped = COALESCE(total_tipped, 0) + ?
+        """, (user_id, username, amount, amount))
+        await db.commit()
+
+async def get_tip_leaderboard(limit: int = 10) -> list[dict]:
+    """Fetch the top tippers."""
+    db = await _get_db()
+    async with db.execute("""
+        SELECT user_id, username, COALESCE(total_tipped, 0) AS total_tipped
+        FROM stats
+        WHERE total_tipped > 0
+        ORDER BY total_tipped DESC LIMIT ?
+    """, (limit,)) as c:
+        return [dict(r) for r in await c.fetchall()]
+
+
+async def sweep_all_wallets() -> list[tuple[int, str, int]]:
+    """One-time migration: Zeroes all wallets and returns amounts owed."""
+    db = await _get_db()
+    async with _write_lock:
+        # Get everyone who has usable balance OR pending cashouts
+        async with db.execute(
+                "SELECT user_id, username, balance, pending_cashout FROM wallets WHERE balance > 0 OR pending_cashout > 0") as c:
+            rows = await c.fetchall()
+
+        payouts = []
+        for r in rows:
+            total = r[2] + r[3]  # Combine usable balance + already pending cashouts
+            payouts.append((r[0], r[1], total))
+
+        # Zero out the economy
+        await db.execute("UPDATE wallets SET balance = 0, pending_cashout = 0")
+        await db.execute("DELETE FROM chips_in_play")  # Safety wipe
+        await db.commit()
+
+        return payouts

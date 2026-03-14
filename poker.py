@@ -1946,6 +1946,15 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
             return
 
+        # FIXED: Check the player's balance before allowing the removal!
+        bal = await db.get_balance(user.id)
+        if amount > bal:
+            await interaction.response.send_message(
+                f"❌ **{user.display_name}** only has **{bal}** 🪙 in their wallet. You cannot remove **{amount}**.",
+                ephemeral=True
+            )
+            return
+
         # 1. DEFER PUBLICLY BEFORE DB WRITE
         await interaction.response.defer(ephemeral=False)
 
@@ -2285,7 +2294,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="economy", description="[Admin] View total chips in circulation")
     async def economy(self, interaction: discord.Interaction):
-        if not await is_manager(interaction):
+        if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
         await interaction.response.defer(ephemeral=False)
@@ -2310,7 +2319,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="revenue", description="[Admin] View projected house profits")
     async def revenue(self, interaction: discord.Interaction):
-        if not await is_manager(interaction):
+        if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
         await interaction.response.defer(ephemeral=False)
@@ -2328,7 +2337,7 @@ class PokerCog(commands.Cog):
     @pokeradmin.command(name="adjustrevenue", description="[Admin] Manually adjust all-time revenue tracker")
     @app_commands.describe(amount="Amount to add (or negative to subtract)")
     async def adjustrevenue(self, interaction: discord.Interaction, amount: int):
-        if not await is_manager(interaction):
+        if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
         await interaction.response.defer(ephemeral=False)
@@ -2386,60 +2395,6 @@ class PokerCog(commands.Cog):
             embed.add_field(name="📊 Your Generosity", value="No tips yet.", inline=False)
 
         await interaction.followup.send(embed=embed)
-
-    @pokeradmin.command(name="migrate_payouts",
-                        description="[Admin] ONE-TIME WIPE: Cash out all legacy players at 0% tax")
-    async def migrate_payouts(self, interaction: discord.Interaction):
-        if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=False)
-
-        # Safety Check: Prevent wiping while chips are on a table
-        if tables:
-            await interaction.followup.send(
-                "❌ **Safety Block:** You must close all active poker tables (using `/poker close`) before running the migration.")
-            return
-
-        payouts = await db.sweep_all_wallets()
-
-        if not payouts:
-            await interaction.followup.send("✅ No players have chips. The economy is already empty!")
-            return
-
-        cashout_ch_id = os.getenv("CASHOUT_CHANNEL_ID")
-        cashout_ch = None
-        if cashout_ch_id:
-            try:
-                cashout_ch = interaction.guild.get_channel(int(cashout_ch_id))
-            except Exception:
-                pass
-
-        if not cashout_ch:
-            await interaction.followup.send(
-                "❌ **Error:** Could not find the cashout channel. Please ensure `CASHOUT_CHANNEL_ID` is correct in your .env file so receipts can be posted.")
-            return
-
-        count = 0
-        total_chips = 0
-        for uid, uname, amount in payouts:
-            count += 1
-            total_chips += amount
-            # Post the 0% tax legacy receipt to the cashouts channel
-            await cashout_ch.send(
-                f"**⚠️ LEGACY MIGRATION PAYOUT**\n"
-                f"<@{uid}> ({uname}) ({uid})\n"
-                f"**Amount Owed:** {amount} 🪙\n"
-                f"-# (0% Tax applied — Admin must pay player in dank. Player can then rebuy under new system)"
-            )
-
-        await interaction.followup.send(
-            f"✅ **Migration Complete!**\n"
-            f"Wiped and processed payouts for **{count}** legacy players.\n"
-            f"Total legacy chips cashed out: **{total_chips}** 🪙.\n\n"
-            f"All wallets are now at 0. Check the cashouts channel for the individual receipts!"
-        )
 
 async def setup(bot):
     await bot.add_cog(PokerCog(bot))

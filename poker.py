@@ -283,12 +283,14 @@ async def _close_table(channel, t: TableState):
             await db.clear_chips_in_play(p.user_id)
     await channel.send(f"🚪 **Table '{t.name}'** closed. All chips returned.")
 
+
 # ── Log thread ────────────────────────────────────────────────────────────────
 
 _log_threads: dict[int, discord.Thread] = {}
 
+
 async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
-    settings  = await db.get_settings(channel.guild.id)
+    settings = await db.get_settings(channel.guild.id)
     log_ch_id = settings.get("log_channel_id")
     if not log_ch_id:
         return None
@@ -297,11 +299,9 @@ async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
         return None
     existing = _log_threads.get(channel.guild.id)
     if existing:
-        try:
-            await channel.guild.fetch_channel(existing.id)
-            return existing
-        except Exception:
-            _log_threads.pop(channel.guild.id, None)
+        # ZERO LAG: Trust the memory cache, do not ask Discord!
+        return existing
+
     if hasattr(log_ch, 'threads'):
         for thread in log_ch.threads:
             if thread.name == "Poker Hand Log":
@@ -314,58 +314,65 @@ async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
     except Exception:
         return None
 
+
 async def post_hand_log(channel, t: TableState, result):
     thread = await ensure_log_thread(channel, t)
     if not thread:
         return
-    game  = t.game
+    game = t.game
     lines = [f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"]
 
     # Helper: get "username (user_id)" for a user_id
     async def uid_str(uid):
-        # ZERO LAG: Read directly from table memory!
         p = game.get_player(uid)
         uname = p.display_name if p else "Unknown"
         return f"{uname} ({uid})"
 
-    # Community cards — read from result since game.community is cleared by _end_hand
     from engine import hand_str
     if hasattr(result, 'community') and result.community:
         lines.append(f"Board: {hand_str(result.community)}")
 
-    # Each player's hole cards + result
     pot_results = result.pot_results or []
-    ranks       = result.winner_ranks or {}
+    ranks = result.winner_ranks or {}
     for p in t.game.players:
         delta = result.chip_deltas.get(p.user_id, 0)
-        sign  = "+" if delta >= 0 else ""
-        ustr  = await uid_str(p.user_id)
-        rank  = ranks.get(p.user_id)
+        sign = "+" if delta >= 0 else ""
+        ustr = await uid_str(p.user_id)
+        rank = ranks.get(p.user_id)
         from engine import hand_str as hs
         cards = hs(p.hole_cards) if p.hole_cards else "folded"
         rank_part = f" [{rank}]" if rank else ""
         lines.append(f"  {ustr}: {cards}{rank_part}  {sign}{delta}")
 
-    # Pot outcomes
     if pot_results:
         for i, (amt, winners) in enumerate(pot_results):
-            label  = "Main pot" if i == 0 else f"Side pot {i}"
-            wstrs  = [await uid_str(w.user_id) for w in winners]
-            each   = amt // len(winners)
+            label = "Main pot" if i == 0 else f"Side pot {i}"
+            wstrs = [await uid_str(w.user_id) for w in winners]
+            each = amt // len(winners)
             lines.append(f"  {label} ({amt}): {', '.join(wstrs)}" + (f" ({each} each)" if len(winners) > 1 else ""))
     else:
-        # Fold win
         for w in result.winners:
             lines.append(f"  Winner (fold): {await uid_str(w.user_id)}")
 
     body = "\n".join(lines)
-    await thread.send(f"```\n{body}\n```")
+    try:
+        # FIRE AND FORGET
+        await thread.send(f"```\n{body}\n```")
+    except Exception:
+        # If thread was deleted, quietly clear the cache so it rebuilds next hand
+        _log_threads.pop(channel.guild.id, None)
 
-async def post_tip_log(channel, t: TableState, tipper_id: int, tipper_name: str, amount: int, recipient_id: int, recipient_name: str):
+
+async def post_tip_log(channel, t: TableState, tipper_id: int, tipper_name: str, amount: int, recipient_id: int,
+                       recipient_name: str):
     thread = await ensure_log_thread(channel, t)
     if thread:
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        await thread.send(f"💸 **Tip** [{ts}] — {amount} \n **{tipper_name}** ({tipper_id}) to **{recipient_name}** ({recipient_id}) at table `{t.name}`")
+        try:
+            await thread.send(
+                f"💸 **Tip** [{ts}] — {amount} \n **{tipper_name}** ({tipper_id}) to **{recipient_name}** ({recipient_id}) at table `{t.name}`")
+        except Exception:
+            _log_threads.pop(channel.guild.id, None)
 # ── Embed ─────────────────────────────────────────────────────────────────────
 
 STREET_COLOR = {

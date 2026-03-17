@@ -9,6 +9,7 @@ from treys import Evaluator
 import card_images
 import os, asyncio, uuid, zipfile
 from datetime import datetime
+import datetime as dt
 import time
 import math
 
@@ -322,10 +323,20 @@ async def post_hand_log(channel, t: TableState, result):
     game = t.game
     lines = [f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"]
 
-    # Helper: get "username (user_id)" for a user_id
+    # Build name lookup from result snapshots — safe for players who already left
+    _name_map = {}
+    for _p in (result.showdown_players or []):
+        _name_map[_p.user_id] = _p.display_name
+    for _p in (result.winners or []):
+        _name_map[_p.user_id] = _p.display_name
+    for _uid in result.chip_deltas:
+        if _uid not in _name_map:
+            _live = game.get_player(_uid)
+            if _live:
+                _name_map[_uid] = _live.display_name
+
     async def uid_str(uid):
-        p = game.get_player(uid)
-        uname = p.display_name if p else "Unknown"
+        uname = _name_map.get(uid, "Unknown")
         return f"{uname} ({uid})"
 
     from engine import hand_str
@@ -334,13 +345,15 @@ async def post_hand_log(channel, t: TableState, result):
 
     pot_results = result.pot_results or []
     ranks = result.winner_ranks or {}
-    for p in t.game.players:
-        delta = result.chip_deltas.get(p.user_id, 0)
+
+    _player_map = {_p.user_id: _p for _p in (result.showdown_players or [])}
+    for uid, delta in result.chip_deltas.items():
         sign = "+" if delta >= 0 else ""
-        ustr = await uid_str(p.user_id)
-        rank = ranks.get(p.user_id)
+        ustr = await uid_str(uid)
+        rank = ranks.get(uid)
         from engine import hand_str as hs
-        cards = hs(p.hole_cards) if p.hole_cards else "folded"
+        sp = _player_map.get(uid)
+        cards = hs(sp.hole_cards) if sp and sp.hole_cards else "folded"
         rank_part = f" [{rank}]" if rank else ""
         lines.append(f"  {ustr}: {cards}{rank_part}  {sign}{delta}")
 
@@ -652,6 +665,16 @@ async def _process_result(guild, channel, t: TableState):
         print(f"[poker] chips_in_play error: {e}")
 
     try:
+        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
+    except Exception as e:
+        print(f"[poker] log_hand error: {e}")
+
+    try:
+        await post_hand_log(channel, t, result)
+    except Exception as e:
+        print(f"[poker] post_hand_log error: {e}")
+
+    try:
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
             if p:
@@ -669,16 +692,6 @@ async def _process_result(guild, channel, t: TableState):
         t.game.kicked_users.clear()
     except Exception as e:
         print(f"[poker] pending_leaves return error: {e}")
-
-    try:
-        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
-    except Exception as e:
-        print(f"[poker] log_hand error: {e}")
-
-    try:
-        await post_hand_log(channel, t, result)
-    except Exception as e:
-        print(f"[poker] post_hand_log error: {e}")
 
     # These must always run — winner announcement + embed update
     try:
@@ -1390,8 +1403,9 @@ class PokerCog(commands.Cog):
 
         try:
             # Force SQLite to flush the WAL to the main DB safely
-            conn = await db._get_db()
-            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            async with db._write_lock:
+                conn = await db._get_db()
+                await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
             # 2. Write the zip file safely using absolute paths and arcname
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -1412,18 +1426,20 @@ class PokerCog(commands.Cog):
                 os.remove(zip_path)
 
     # ── THE AUTO TIMER (Every 24 Hours) ────────────────────────────────────
-    import datetime as dt
     time_to_run = dt.time(hour=4, minute=0, tzinfo=dt.timezone.utc)
 
     @tasks.loop(time=time_to_run)
     async def daily_backup(self):
-        await self.bot.wait_until_ready()
         try:
             user = await self.bot.fetch_user(self.DEV_USER_ID)
             if user:
                 await self._send_backup(user)
         except Exception as e:
             print(f"[Backup Task Error] {e}")
+
+    @daily_backup.before_loop
+    async def before_daily_backup(self):
+        await self.bot.wait_until_ready()
 
     # ── THE BOUNCER ────────────────────────────────────────────────────────
     # This automatically runs before EVERY slash command in this file.
@@ -2008,20 +2024,29 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
             return
 
-        # FIXED: Check the player's balance before allowing the removal!
-        bal = await db.get_balance(user.id)
-        if amount > bal:
-            await interaction.response.send_message(
-                f"❌ **{user.display_name}** only has **{bal}** 🪙 in their wallet. You cannot remove **{amount}**.",
+        # 1. DEFER PUBLICLY BEFORE DB WRITE
+        await interaction.response.defer(ephemeral=False)
+
+        # Check balance and deduct atomically — no race condition possible
+        bal_before = await db.get_balance(user.id)
+        if amount > bal_before:
+            await interaction.followup.send(
+                f"❌ **{user.display_name}** only has **{bal_before}** 🪙 in their wallet. You cannot remove **{amount}**.",
                 ephemeral=True
             )
             return
 
-        # 1. DEFER PUBLICLY BEFORE DB WRITE
-        await interaction.response.defer(ephemeral=False)
-
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, -amount, note)
+
+        # Verify the full amount was actually removed (guards against concurrent deductions)
+        expected = bal_before - amount
+        if new_bal > expected:
+            await interaction.followup.send(
+                f"⚠️ Only **{bal_before - new_bal}** chips could be removed — **{user.display_name}**'s balance changed concurrently. New balance: **{new_bal}** 🪙",
+                ephemeral=True
+            )
+            return
 
         # 2. USE FOLLOWUP.SEND
         await interaction.followup.send(

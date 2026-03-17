@@ -2,12 +2,12 @@
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from engine import PokerGame, Street, hand_str
 import database as db
 from treys import Evaluator
 import card_images
-import os, asyncio, uuid
+import os, asyncio, uuid, zipfile
 from datetime import datetime
 import time
 import math
@@ -1367,8 +1367,62 @@ class ConfirmResetView2(discord.ui.View):
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class PokerCog(commands.Cog):
+
+    DEV_USER_ID = 1339935869598961728 # baymax for backups
+
     def __init__(self, bot):
         self.bot = bot
+        self.daily_backup.start()
+
+    def cog_unload(self):
+        self.daily_backup.cancel()
+
+    # ── THE BACKUP ENGINE (Hidden Helper) ──────────────────────────────────
+    async def _send_backup(self, user: discord.User):
+        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+        # 1. Get the absolute path to the directory this script lives in
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        clean_zip_name = f"poker_backup_{date_str}.zip"
+        zip_path = os.path.join(base_dir, clean_zip_name)
+
+        files_to_zip = ["poker.db", "poker.db-wal", "poker.db-shm"]
+
+        try:
+            # Force SQLite to flush the WAL to the main DB safely
+            conn = await db._get_db()
+            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+            # 2. Write the zip file safely using absolute paths and arcname
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for filename in files_to_zip:
+                    full_path = os.path.join(base_dir, filename)
+                    if os.path.exists(full_path):
+                        # arcname prevents ugly folder structures inside the zip
+                        zipf.write(full_path, arcname=filename)
+
+                        # 3. Send the file to Discord
+            with open(zip_path, 'rb') as f:
+                discord_file = discord.File(f, filename=clean_zip_name)
+                await user.send(f"📦 **Database Backup** ({date_str})", file=discord_file)
+
+        finally:
+            # 4. ALWAYS clean up the zip file, even if the Discord send fails
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+    # ── THE AUTO TIMER (Every 24 Hours) ────────────────────────────────────
+    time_to_run = datetime.time(hour=4, minute=0, tzinfo=datetime.timezone.utc)
+
+    @tasks.loop(time=time_to_run)
+    async def daily_backup(self):
+        await self.bot.wait_until_ready()
+        try:
+            user = await self.bot.fetch_user(self.DEV_USER_ID)
+            if user:
+                await self._send_backup(user)
+        except Exception as e:
+            print(f"[Backup Task Error] {e}")
 
     # ── THE BOUNCER ────────────────────────────────────────────────────────
     # This automatically runs before EVERY slash command in this file.
@@ -2423,6 +2477,27 @@ class PokerCog(commands.Cog):
             embed.add_field(name="📊 Your Generosity", value="No tips yet.", inline=False)
 
         await interaction.followup.send(embed=embed)
+
+
+    @pokeradmin.command(name="backup", description="[Dev] Force a database backup to your DMs")
+    async def force_backup(self, interaction: discord.Interaction):
+        # Ironclad Security: Only YOU can run this
+        if interaction.user.id != self.DEV_USER_ID:
+            await interaction.response.send_message("❌ This command is restricted to the bot developer.",
+                                                    ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await self._send_backup(interaction.user)
+            await interaction.followup.send("✅ Backup sent directly to your DMs!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Failed to send DM. Please check your Discord privacy settings to allow messages from server members.",
+                ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(PokerCog(bot))

@@ -1412,7 +1412,8 @@ class PokerCog(commands.Cog):
                 os.remove(zip_path)
 
     # ── THE AUTO TIMER (Every 24 Hours) ────────────────────────────────────
-    time_to_run = datetime.time(hour=4, minute=0, tzinfo=datetime.timezone.utc)
+    import datetime as dt
+    time_to_run = dt.time(hour=4, minute=0, tzinfo=dt.timezone.utc)
 
     @tasks.loop(time=time_to_run)
     async def daily_backup(self):

@@ -1973,6 +1973,27 @@ class PokerCog(commands.Cog):
             f"✅ **-{amount}** chips from **{user.mention}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""))
 
+    @pokermgr.command(name="setdealer", description="[Manager] Change the dealer (who receives tips) for this table")
+    @app_commands.describe(user="The new dealer")
+    async def set_dealer(self, interaction: discord.Interaction, user: discord.Member):
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True)
+            return
+
+        key = (interaction.guild_id, interaction.channel_id)
+        t = get_table(key)
+        if not t:
+            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=False)
+
+        # Switch the tip recipient
+        t.manager_id = user.id
+
+        await interaction.followup.send(
+            f"🔄 **{user.mention}** has taken over as the dealer! All new tips will go to them.")
+
     @pokermgr.command(name="bans", description="[Manager] List all currently banned players")
     async def list_bans(self, interaction: discord.Interaction):
         if not await is_manager(interaction):

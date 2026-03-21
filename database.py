@@ -21,6 +21,9 @@ async def _get_db() -> aiosqlite.Connection:
         _db = await aiosqlite.connect(DB_PATH, timeout=30)
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA busy_timeout=10000")
+
+        await _db.execute("PRAGMA temp_store=MEMORY")
+
         _db.row_factory = aiosqlite.Row
     return _db
 

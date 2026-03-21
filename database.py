@@ -1,15 +1,19 @@
 import aiosqlite
 import asyncio
 import os
+import shutil  # <-- 1. Add this import
 from datetime import datetime
 
+# 2. Set the path to use Railway's environment variable
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "poker.db"))
 
-# ── Singleton connection + serialised-write lock ──────────────────────────────
-# SQLite only allows one writer at a time.  Opening a new connection per call
-# means concurrent button clicks race for the write lock and raise
-# "database is locked".  We keep ONE shared connection and route all writes
-# through a single asyncio.Lock so they are naturally serialised.
+# 3. THE AUTO-COPY TRICK
+# If the bot is on Railway and the volume is empty, copy the GitHub file into the volume!
+if DB_PATH.startswith("/app/data"):
+    local_db = os.path.join(os.path.dirname(__file__), "poker.db")
+    if not os.path.exists(DB_PATH) and os.path.exists(local_db):
+        print("📦 Injecting rescued database into permanent Railway Volume...")
+        shutil.copy2(local_db, DB_PATH)
 
 _db: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()

@@ -3,7 +3,7 @@ import asyncio
 import os
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "poker.db")
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "poker.db"))
 
 # ── Singleton connection + serialised-write lock ──────────────────────────────
 # SQLite only allows one writer at a time.  Opening a new connection per call

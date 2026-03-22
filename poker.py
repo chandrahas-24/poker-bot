@@ -1993,7 +1993,7 @@ class PokerCog(commands.Cog):
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
     async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int,
                               note: str = ""):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
 
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)

@@ -1,23 +1,11 @@
 import aiosqlite
 import asyncio
 import os
-import shutil  # <-- 1. Add this import
 from datetime import datetime
 
 # 1. FORCE the bot to look inside the Railway Volume
 # Replace '/app/data/poker.db' with whatever your Mount Path + filename is
 DB_PATH = "/app/data/poker.db"
-
-# 2. THE EMERGENCY INJECTION (Only runs if the Volume is empty)
-# This takes the rescued chips from your GitHub and pushes them into the Volume
-def inject_database():
-    github_version = os.path.join(os.path.dirname(__file__), "poker.db")
-    if not os.path.exists(DB_PATH) and os.path.exists(github_version):
-        print("📦 Volume empty! Injecting chips from GitHub into Volume...")
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        shutil.copy2(github_version, DB_PATH)
-
-inject_database()
 
 _db: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()

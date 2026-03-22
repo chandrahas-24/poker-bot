@@ -70,7 +70,7 @@ class PokerGame:
     SMALL_BLIND = 25
     BIG_BLIND   = 50
     MIN_BUYIN   = 50
-    MAX_PLAYERS = 8
+    MAX_PLAYERS = 12
 
     def __init__(self):
         self.players:        list[PokerPlayer] = []

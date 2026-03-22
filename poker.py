@@ -444,7 +444,7 @@ def build_embed(t: TableState) -> discord.Embed:
     for p in game.pending_joins:
         lines.append(f"<@{p.user_id}> **{p.chips} 🪙** — ⏳ next hand")
     if lines:
-        embed.add_field(name=f"Players ({len(game.players)}/8)", value="\n".join(lines), inline=False)
+        embed.add_field(name=f"Players ({len(game.players)}/12)", value="\n".join(lines), inline=False)
 
     if t.street_log:
         embed.add_field(name="This round", value="\n".join(t.street_log[-8:]), inline=False)
@@ -1157,7 +1157,7 @@ class GameView(discord.ui.View):
         super().__init__(timeout=None)
         self.t = t
         in_hand = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
-        table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 8
+        table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 12
         self.btn_join.disabled = in_hand or table_full or t.closing
 
         self.btn_leave.disabled = t.closing  # <-- ADD THIS LINE
@@ -1397,9 +1397,9 @@ class PokerCog(commands.Cog):
         # 1. Get the absolute path to the directory this script lives in
         base_dir = os.path.dirname(os.path.abspath(__file__))
         clean_zip_name = f"poker_backup_{date_str}.zip"
-        zip_path = os.path.join(base_dir, clean_zip_name)
-
-        files_to_zip = ["poker.db", "poker.db-wal", "poker.db-shm"]
+        zip_path = os.path.join("/app/data", clean_zip_name)
+        
+        files_to_zip = ["/app/data/poker.db", "/app/data/poker.db-wal", "/app/data/poker.db-shm"]
 
         try:
             # Force SQLite to flush the WAL to the main DB safely
@@ -1409,11 +1409,9 @@ class PokerCog(commands.Cog):
 
             # 2. Write the zip file safely using absolute paths and arcname
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for filename in files_to_zip:
-                    full_path = os.path.join(base_dir, filename)
+                for full_path in files_to_zip:
                     if os.path.exists(full_path):
-                        # arcname prevents ugly folder structures inside the zip
-                        zipf.write(full_path, arcname=filename)
+                        zipf.write(full_path, arcname=os.path.basename(full_path))
 
                         # 3. Send the file to Discord
             with open(zip_path, 'rb') as f:
@@ -1467,19 +1465,21 @@ class PokerCog(commands.Cog):
     @poker.command(name="open", description="[Manager] Open a poker table in this channel")
     @app_commands.describe(name="Table name")
     async def open_table(self, interaction: discord.Interaction, name: str = "Poker Table"):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True);
+            return
         for (gid, cid), t in tables.items():
             if gid == interaction.guild_id:
-                await interaction.response.send_message(
-                    f"❌ A table is already running in <#{cid}>. Close it first.", ephemeral=True); return
+                await interaction.followup.send(
+                    f"❌ A table is already running in <#{cid}>. Close it first.", ephemeral=True);
+                return
         t = TableState(name, interaction.user.id)
         tables[(interaction.guild_id, interaction.channel_id)] = t
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
         t.game.MIN_BUYIN = settings.get("min_wallet", 50)
-        await interaction.response.defer(ephemeral=True)
         await refresh(interaction.channel, t, new_hand=True)
         await interaction.followup.send("✅ Table opened!", ephemeral=True)  # <-- ADD THIS
 
@@ -1487,15 +1487,13 @@ class PokerCog(commands.Cog):
     async def close_table(self, interaction: discord.Interaction):
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
+        await interaction.response.defer(ephemeral=True)
         if not t:
-            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True);
+            await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
             return
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-
-        # DEFER FIRST
-        await interaction.response.defer(ephemeral=False)
 
         if t.game.street == Street.WAITING:
             # No hand running — close immediately
@@ -1519,17 +1517,16 @@ class PokerCog(commands.Cog):
     async def start(self, interaction: discord.Interaction):
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
+        await interaction.response.defer(ephemeral=True)
         if not t:
-            await interaction.response.send_message("❌ No table here. Use `/poker open` first.", ephemeral=True);
+            await interaction.followup.send("❌ No table here. Use `/poker open` first.", ephemeral=True)
             return
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
         if t.game.street != Street.WAITING:
-            await interaction.response.send_message("❌ A hand is already in progress.", ephemeral=True);
+            await interaction.followup.send("❌ A hand is already in progress.", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=True)
 
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
@@ -1573,12 +1570,10 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
     @app_commands.describe(user="Player to kick")
     async def kick(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-
-        # 1. DEFER INSTANTLY
-        await interaction.response.defer(ephemeral=False)
 
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
@@ -1641,12 +1636,10 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
     async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
-        if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
-            return
-
-        # 1. DEFER FIRST
         await interaction.response.defer(ephemeral=True)
+        if not await is_manager(interaction):
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
+            return
 
         # 2. Persist ban to DB
         added = await db.ban_player(interaction.guild_id, user.id, user.display_name,
@@ -1725,12 +1718,10 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
     async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-
-        # FIXED: Defer publicly
-        await interaction.response.defer(ephemeral=False)
         removed = await db.unban_player(interaction.guild_id, user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "all tables"
 
@@ -1751,12 +1742,10 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="forcefold", description="[Manager] Force a player to fold their hand")
     @app_commands.describe(user="Player to force fold")
     async def force_fold_cmd(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-
-        # 1. DEFER INSTANTLY
-        await interaction.response.defer(ephemeral=False)
 
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
@@ -1938,9 +1927,10 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")
     async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
-        if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
+        if not await is_manager(interaction):
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True);
+            return
         removed = await db.delete_player_stats(user.id)
         if removed:
             await interaction.followup.send(f"✅ Removed **{user.name}** ({user.id}) from the leaderboard.")
@@ -1969,12 +1959,13 @@ class PokerCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── Manager settings commands ─────────────────────────────────────────
-
     @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
     async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+        await interaction.response.defer(ephemeral=True)
+
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
         allowed_str = os.getenv("ADD_CHIPS_CHANNELS", "")
@@ -1982,34 +1973,30 @@ class PokerCog(commands.Cog):
             allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
             if allowed_channels and interaction.channel_id not in allowed_channels:
                 mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
-                await interaction.response.send_message(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+                await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
                 return
 
         if amount <= 0:
-            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
+            await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
             return
-
-        # 1. DEFER PUBLICLY BEFORE DB WRITE
-        await interaction.response.defer(ephemeral=False)
 
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, amount, note)
-
-        # 💸 Log 5% Round-Up Revenue immediately!
         tax = math.ceil(amount * 0.05)
         await db.log_revenue(tax)
 
-        # 2. USE FOLLOWUP.SEND
         await interaction.followup.send(
             f"✅ **+{amount}** chips → **{user.mention}** |  Balance: **{new_bal}** 🪙"
-            + (f"\n> {note}" if note else ""))
+            + (f"\n> {note}" if note else ""), ephemeral=False)
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
     async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int,
                               note: str = ""):
+        await interaction.response.defer(ephemeral=True)
+
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
         allowed_str = os.getenv("REMOVE_CHIPS_CHANNELS", "")
@@ -2017,56 +2004,47 @@ class PokerCog(commands.Cog):
             allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
             if allowed_channels and interaction.channel_id not in allowed_channels:
                 mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
-                await interaction.response.send_message(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+                await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
                 return
 
         if amount <= 0:
-            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
+            await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
             return
 
-        # 1. DEFER PUBLICLY BEFORE DB WRITE
-        await interaction.response.defer(ephemeral=False)
-
-        # Check balance and deduct atomically — no race condition possible
         bal_before = await db.get_balance(user.id)
         if amount > bal_before:
             await interaction.followup.send(
                 f"❌ **{user.display_name}** only has **{bal_before}** 🪙 in their wallet. You cannot remove **{amount}**.",
-                ephemeral=True
-            )
+                ephemeral=True)
             return
 
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, -amount, note)
 
-        # Verify the full amount was actually removed (guards against concurrent deductions)
         expected = bal_before - amount
         if new_bal > expected:
             await interaction.followup.send(
                 f"⚠️ Only **{bal_before - new_bal}** chips could be removed — **{user.display_name}**'s balance changed concurrently. New balance: **{new_bal}** 🪙",
-                ephemeral=True
-            )
+                ephemeral=True)
             return
 
-        # 2. USE FOLLOWUP.SEND
         await interaction.followup.send(
             f"✅ **-{amount}** chips from **{user.mention}** |  Balance: **{new_bal}** 🪙"
-            + (f"\n> {note}" if note else ""))
+            + (f"\n> {note}" if note else ""), ephemeral=False)
 
     @pokermgr.command(name="setdealer", description="[Manager] Change the dealer (who receives tips) for this table")
     @app_commands.describe(user="The new dealer")
     async def set_dealer(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True)
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
         if not t:
-            await interaction.response.send_message("❌ No table in this channel.", ephemeral=True)
+            await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=False)
 
         # Switch the tip recipient
         t.manager_id = user.id
@@ -2076,12 +2054,10 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="bans", description="[Manager] List all currently banned players")
     async def list_bans(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-
-        # FIXED: Defer publicly
-        await interaction.response.defer(ephemeral=False)
 
         bans = await db.get_all_bans(interaction.guild_id)
 
@@ -2109,11 +2085,10 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="settings", description="[Manager] View table settings")
     async def settings_view(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=False)
         s = await db.get_settings(interaction.guild_id)
         role_str = f"<@&{s['manager_role_id']}>" if s.get("manager_role_id") else "*(not set)*"
         log_str = f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "*(not set)*"
@@ -2370,24 +2345,22 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="pay_cashout", description="[Manager] Deduct paid chips from pending and send receipt")
     @app_commands.describe(user="Player who was paid", amount="Amount of chips paid")
     async def pay_cashout(self, interaction: discord.Interaction, user: discord.Member, amount: int):
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True);
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
-        # NEW: Check if the command is being run in the correct cashout channel
         cashout_ch_id_str = os.getenv("CASHOUT_CHANNEL_ID")
         if cashout_ch_id_str:
             cashout_ch_id = int(cashout_ch_id_str)
             if interaction.channel_id != cashout_ch_id:
-                await interaction.response.send_message(f"❌ This command can only be used in <#{cashout_ch_id}>.",
-                                                        ephemeral=True)
+                await interaction.followup.send(f"❌ This command can only be used in <#{cashout_ch_id}>.",
+                                                ephemeral=True)
                 return
 
         if amount <= 0:
-            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True);
+            await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=False)
 
         ok = await db.pay_cashout(user.id, amount)
         if not ok:

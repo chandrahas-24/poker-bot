@@ -1398,7 +1398,7 @@ class PokerCog(commands.Cog):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         clean_zip_name = f"poker_backup_{date_str}.zip"
         zip_path = os.path.join("/app/data", clean_zip_name)
-        
+
         files_to_zip = ["/app/data/poker.db", "/app/data/poker.db-wal", "/app/data/poker.db-shm"]
 
         try:
@@ -1570,7 +1570,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
     @app_commands.describe(user="Player to kick")
     async def kick(self, interaction: discord.Interaction, user: discord.Member):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -1636,7 +1636,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
     async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -1718,7 +1718,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
     async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -1742,7 +1742,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="forcefold", description="[Manager] Force a player to fold their hand")
     @app_commands.describe(user="Player to force fold")
     async def force_fold_cmd(self, interaction: discord.Interaction, user: discord.Member):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -1927,7 +1927,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")
     async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True);
             return
@@ -1962,7 +1962,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
     async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
 
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
@@ -2035,7 +2035,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="setdealer", description="[Manager] Change the dealer (who receives tips) for this table")
     @app_commands.describe(user="The new dealer")
     async def set_dealer(self, interaction: discord.Interaction, user: discord.Member):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -2054,7 +2054,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="bans", description="[Manager] List all currently banned players")
     async def list_bans(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -2345,7 +2345,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="pay_cashout", description="[Manager] Deduct paid chips from pending and send receipt")
     @app_commands.describe(user="Player who was paid", amount="Amount of chips paid")
     async def pay_cashout(self, interaction: discord.Interaction, user: discord.Member, amount: int):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return

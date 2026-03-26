@@ -9,7 +9,12 @@ load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+# Tell Discord to only remember the last 10 messages instead of 1000 per channel
+bot = commands.Bot(
+    command_prefix=commands.when_mentioned,
+    intents=intents,
+    max_messages=20
+)
 
 @bot.event
 async def on_ready():

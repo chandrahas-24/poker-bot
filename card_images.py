@@ -36,9 +36,10 @@ def cards_available() -> bool:
     return len([f for f in os.listdir(CARDS_DIR) if f.endswith(".png") and f != "back.png"]) >= 52
 
 def _resize(path: str) -> Image.Image:
-    img = Image.open(path).convert("RGBA")
-    w = int(img.width * CARD_HEIGHT / img.height)
-    return img.resize((w, CARD_HEIGHT), Image.LANCZOS)
+    with Image.open(path) as img:
+        img = img.convert("RGBA")
+        w = int(img.width * CARD_HEIGHT / img.height)
+        return img.resize((w, CARD_HEIGHT), Image.LANCZOS)
 
 def make_strip(card_ints: list[int], backs: int = 0) -> discord.File:
     """

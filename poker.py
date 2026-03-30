@@ -2363,9 +2363,9 @@ class PokerCog(commands.Cog):
         embed.add_field(name="Rank", value=str(rank_str), inline=True)
         embed.add_field(name="Hands", value=str(row['hands_played']), inline=True)
         embed.add_field(name="Win %", value=wp, inline=True)
-        embed.add_field(name="Net", value=f"{'+' if net >= 0 else ''}{net} 🪙", inline=True)
-        embed.add_field(name="Wallet", value=f"{row['wallet']} 🪙", inline=True)
-        embed.add_field(name="Tipped", value=f"{row.get('total_tipped', 0):,} 🪙", inline=True)
+        embed.add_field(name="Net", value=f"{'+' if net >= 0 else ''}{net} <:poker_chip:1488128491881758760>", inline=True)
+        embed.add_field(name="Wallet", value=f"{row['wallet']} <:poker_chip:1488128491881758760>", inline=True)
+        embed.add_field(name="Tipped", value=f"{row.get('total_tipped', 0):,} <:poker_chip:1488128491881758760>", inline=True)
 
         # 2. Send the final embed using the user's choice
         await interaction.followup.send(embed=embed, ephemeral=hidden)
@@ -2737,7 +2737,7 @@ class PokerCog(commands.Cog):
             try:
                 ch = interaction.guild.get_channel(int(cashout_ch_id))
                 if ch:
-                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Chips Amount:** {chips}<:poker_chip:1488128491881758760>"
+                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1488128491881758760>"
                     if note: ticket_msg += f"\n**Notes:** {note}"
                     await ch.send(ticket_msg)
             except Exception:
@@ -2880,13 +2880,13 @@ class PokerCog(commands.Cog):
         )
 
         embed = discord.Embed(
-            title="<:denchip:1486843539290853416> Jackpot",
+            title="<a:md_den:996127219019690034> Jackpot",
             description=desc,
             color=0xFFD700  # Decimal 16766720
         )
         embed.set_thumbnail(
             url="https://media.discordapp.net/attachments/1478125269285081211/1488098208986038282/3d-casino-poker-cards-and-playing-chips-on-black-background-illustration-free-vector.png?ex=69cb8af4&is=69ca3974&hm=58f")
-        embed.set_footer(text="• 60% RF, 20% SF, 5% Q")
+        embed.set_footer(text="• 5% Q, 20% SF, 60% RF")
 
         await interaction.followup.send(embed=embed)
 

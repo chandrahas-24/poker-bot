@@ -1,7 +1,7 @@
 import sqlite3
 import math
 
-DB_PATH = "poker.db"
+DB_PATH = "/app/data/poker.db"
 
 
 def migrate_db():

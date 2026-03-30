@@ -4,7 +4,6 @@ import os
 from datetime import datetime, timedelta
 
 # 1. FORCE the bot to look inside the Railway Volume
-# Replace '/app/data/poker.db' with whatever your Mount Path + filename is
 DB_PATH = "/app/data/poker.db"
 
 _db: aiosqlite.Connection | None = None

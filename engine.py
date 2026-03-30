@@ -2,6 +2,7 @@ from treys import Card, Deck, Evaluator
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum, auto
+from math import ceil
 
 evaluator = Evaluator()
 
@@ -65,6 +66,7 @@ class HandResult:
     pot_results: list = None  # [(amount, [winner,...]), ...] one entry per side pot
     showdown_players: list = None  # snapshot of all non-folded players at showdown
     is_over: bool = False
+    tax: int = 0
 
 class PokerGame:
     SMALL_BLIND = 25
@@ -345,8 +347,25 @@ class PokerGame:
         alive = self.players_in_hand
         if len(alive) == 1:
             winner = alive[0]
+
+            # REFUND UNCALLED OVERBET FOR FOLDS
+            max_other = max((p.total_bet for p in self.players if p != winner), default=0)
+            if winner.total_bet > max_other:
+                uncalled = winner.total_bet - max_other
+                winner.chips += uncalled
+                winner.total_bet -= uncalled
+                winner.bet -= uncalled
+                self.pot -= uncalled
+
+            # 🚨 6% TAX ON NET WINNINGS ONLY
+            profit = self.pot - winner.total_bet
+            tax = 0
+            if profit > 0:
+                tax = ceil(profit * 0.06)
+
+            self.pot -= tax
             winner.chips += self.pot
-            self._hand_result = self._build_fold_result(winner)
+            self._hand_result = self._build_fold_result(winner, tax)
 
             # Capture the pot value BEFORE the hand is cleared
             pot_won = self.pot
@@ -452,23 +471,48 @@ class PokerGame:
     def _showdown(self) -> str:
         self.street = Street.SHOWDOWN
         alive       = self.players_in_hand
-        scores      = {p.user_id: evaluator.evaluate(p.hole_cards, self.community)
-                       for p in alive}
 
-        pots        = self._compute_side_pots()
+        # 1. REFUND UNCALLED OVERBETS BEFORE BUILDING POTS
+        max_bet = max((p.total_bet for p in self.players), default=0)
+        max_betters = [p for p in self.players if p.total_bet == max_bet]
+        if len(max_betters) == 1:
+            p = max_betters[0]
+            second_max = max((other.total_bet for other in self.players if other != p), default=0)
+            uncalled = max_bet - second_max
+            if uncalled > 0:
+                p.chips += uncalled
+                p.total_bet -= uncalled
+                p.bet -= uncalled
+                self.pot -= uncalled
+
+        scores = {p.user_id: evaluator.evaluate(p.hole_cards, self.community)
+                  for p in alive}
+
+        pots = self._compute_side_pots()
         chip_deltas = {p.user_id: -p.total_bet for p in self.players}
         pot_results = []
 
+        # 1. Distribute the raw pots normally
         for sp in pots:
-            best      = min(scores[p.user_id] for p in sp.eligible)
-            winners   = [p for p in sp.eligible if scores[p.user_id] == best]
-            each      = sp.amount // len(winners)
+            best = min(scores[p.user_id] for p in sp.eligible)
+            winners = [p for p in sp.eligible if scores[p.user_id] == best]
+            each = sp.amount // len(winners)
             remainder = sp.amount - each * len(winners)
             for i, w in enumerate(winners):
                 award = each + (remainder if i == 0 else 0)
-                w.chips               += award
+                w.chips += award
                 chip_deltas[w.user_id] += award
             pot_results.append((sp.amount, winners))
+
+        # 🚨 2. APPLY 6% TAX ONLY TO PLAYERS WITH NET PROFIT
+        total_tax = 0
+        for p in self.players:
+            if chip_deltas[p.user_id] > 0:  # Only tax them if they actually made a profit!
+                profit_tax = ceil(chip_deltas[p.user_id] * 0.06)
+                if profit_tax > 0:
+                    p.chips -= profit_tax
+                    chip_deltas[p.user_id] -= profit_tax
+                    total_tax += profit_tax
 
         lines = ["🃏 **Showdown!**", f"Board: {hand_str(self.community)}"]
         for p in alive:
@@ -489,10 +533,10 @@ class PokerGame:
                 label = "Main pot" if i == 0 else f"Side pot {i}"
                 each  = amt // len(winners)
                 if len(winners) == 1:
-                    lines.append(f"🏆 **{label}** ({amt}🪙): **{winners[0].display_name}**")
+                    lines.append(f"🏆 **{label}** ({amt}<:poker_chip:1488128491881758760>): **{winners[0].display_name}**")
                 else:
                     names = ", ".join(w.display_name for w in winners)
-                    lines.append(f"🤝 **{label}** ({amt}🪙): **{names}** ({each}🪙 each)")
+                    lines.append(f"🤝 **{label}** ({amt}<:poker_chip:1488128491881758760>): **{names}** ({each}<:poker_chip:1488128491881758760> each)")
 
         seen        = set()
         all_winners = []
@@ -510,13 +554,14 @@ class PokerGame:
         self.side_pots    = pots
         self._hand_result = HandResult(
             winners=all_winners,
-            pot=self.pot,
+            pot=self.pot - total_tax,
             summary="\n".join(lines),
             chip_deltas=chip_deltas,
             community=list(self.community),
             winner_ranks=winner_ranks,
             pot_results=pot_results,
-            showdown_players=list(alive),  # snapshot before _end_hand clears state
+            showdown_players=list(alive),
+            tax=total_tax# snapshot before _end_hand clears state
         )
         self._end_hand()
         return "\n".join(lines)
@@ -553,7 +598,7 @@ class PokerGame:
 
         return True, msg
 
-    def _build_fold_result(self, winner: "PokerPlayer") -> HandResult:
+    def _build_fold_result(self, winner: "PokerPlayer", tax: int = 0) -> HandResult:
         deltas = {p.user_id: -p.total_bet for p in self.players}
         deltas[winner.user_id] += self.pot
         lines = [f"Hand #{self.hand_num} | Pot: {self.pot}",
@@ -564,7 +609,7 @@ class PokerGame:
         return HandResult(winners=[winner], pot=self.pot,
                           summary="\n".join(lines), chip_deltas=deltas,
                           community=list(self.community),
-                          showdown_players=[winner])
+                          showdown_players=[winner], tax = tax)
 
     def _end_hand(self):
         self.street = Street.WAITING

@@ -888,7 +888,7 @@ TITLES: dict[str, dict] = {
         "hidden": False,
     },
     "rf_win": {
-        "display": "👑 Royalty",
+        "display": "👑 God's Chosen Emperor",
         "description": "Win a hand with a Royal Flush",
         "rarity": "legendary",
         "hidden": False,

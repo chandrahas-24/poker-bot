@@ -1327,7 +1327,7 @@ class GameView(discord.ui.View):
         self.t = t
         in_hand = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
         table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 12
-        self.btn_join.disabled = in_hand or table_full or t.closing
+        self.btn_join.disabled =  table_full or t.closing
 
         self.btn_leave.disabled = t.closing  # <-- ADD THIS LINE
 

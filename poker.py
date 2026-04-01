@@ -615,11 +615,17 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     _cos_cache = cosmetics_cache or {}
 
     def _title_str(uid: int) -> str:
+        # --- APRIL FOOLS OVERRIDE ---
+        return " `🐟 The Fish`"
+
         cos = _cos_cache.get(uid, {})
         tid = cos.get("active_title")
         return f" `{db.TITLES[tid]['display']}`" if tid and tid in db.TITLES else ""
 
     def _win_msg_str(uid: int) -> str:
+        # --- APRIL FOOLS OVERRIDE ---
+        return "glub glub 🫧"
+
         cos = _cos_cache.get(uid, {})
         mid = cos.get("active_win_msg")
         return f"{db.WIN_MESSAGES[mid]['display']}" if mid and mid in db.WIN_MESSAGES else ""
@@ -641,6 +647,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
 
     # 🏆 Create the sleek winner "Receipt" Embed
     embed = discord.Embed(title=f"🏆 Hand #{game.hand_num} Results", color=0xF1C40F)
+    embed.set_footer(text="⚠️ Notice: A 99% Federal Tax has been applied to this pot.")
 
     # 1. Add Board if it exists (with a forced empty line \u200b below it)
     if result.community:

@@ -7,7 +7,7 @@ File naming: 2_of_clubs.png, king_of_hearts.png, ace_of_spades.png, back.png
 
 import os, io
 import discord
-from PIL import Image
+from PIL import Image, ImageOps
 from treys import Card
 
 CARDS_DIR   = os.path.join(os.path.dirname(__file__), "cards")
@@ -99,6 +99,10 @@ def make_strip(card_ints: list[int], backs: int = 0, is_hole: bool = False) -> d
 
     images = [_get_card(c) for c in card_ints]
     images += [_get_back() for _ in range(backs)]
+
+    # --- APRIL FOOLS PRANK: NEGATIVE DECK ---
+    # We have to drop the alpha channel to invert, then put it back
+    images = [ImageOps.invert(img.convert("RGB")).convert("RGBA") for img in images]
 
     if not images:
         buf = io.BytesIO()

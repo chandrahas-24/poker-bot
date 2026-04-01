@@ -5,10 +5,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from engine import PokerGame, Street, hand_str
 import database as db
-from treys import Evaluator, Card
+from treys import Evaluator
 import card_images
 import os, asyncio, uuid, zipfile
-from datetime import datetime, timedelta, time as dt_time, timezone as _tz
+from datetime import datetime
+import datetime as dt
 import time
 import math
 
@@ -37,8 +38,6 @@ class TableState:
         self.name         = name
         self.manager_id   = manager_id
         self.game         = PokerGame()
-        self.cosmetics_cache: dict = {}
-        self.active_view: discord.ui.View | None = None
         self.hand_msg:    discord.Message | None = None
         self.board_file: discord.File | None = None  # card strip to attach on next embed edit
         self.ping_msg:    discord.Message | None = None
@@ -50,8 +49,6 @@ class TableState:
         self.timer_user_id: int | None = None
         self.ping_user_id: int | None = None
         self.msg_count = 0
-        self.resend_threshold = TABLE_RESEND_MSGS
-        self.session_allin_winners: set[int] = set()
 
 tables: dict[tuple, TableState] = {}
 
@@ -74,6 +71,23 @@ async def is_manager(interaction: discord.Interaction) -> bool:
         if role and role in interaction.user.roles:
             return True
     return interaction.user.guild_permissions.administrator
+
+# ── Message counter ───────────────────────────────────────────────────────────
+
+async def on_channel_message(message: discord.Message):
+    if not message.guild:
+        return
+    key = (message.guild.id, message.channel.id)
+    t   = get_table(key)
+    if not t or t.game.street == Street.WAITING:
+        return
+    t.msg_count += 1
+    settings = await db.get_settings(message.guild.id)
+    threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
+    if t.msg_count >= threshold:
+        t.msg_count = 0
+        t.hand_msg  = None
+        await refresh(message.channel, t, new_hand=True)
 
 # ── Turn timer ────────────────────────────────────────────────────────────────
 
@@ -175,7 +189,7 @@ def schedule_next_hand(t: TableState, channel):
 async def _auto_next_hand(t: TableState, channel):
     settings = await db.get_settings(channel.guild.id)
     delay    = settings.get("next_hand_delay", NEXT_HAND_DELAY_DEFAULT)
-    view = None
+
     try:
         view = BetweenHandsView(t)
         t.between_msg = await channel.send(f"⏳ Next hand starting in **{delay}s**...", view=view)
@@ -185,10 +199,7 @@ async def _auto_next_hand(t: TableState, channel):
     try:
         await asyncio.sleep(delay)
     except asyncio.CancelledError:
-        if view: view.stop()
         return
-
-    if view: view.stop()
 
     if t.between_msg:
         try:
@@ -218,7 +229,7 @@ async def _auto_next_hand(t: TableState, channel):
 
             try:
                 await channel.send(
-                    f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** <:poker_chip:1488128491881758760>) is below the big blind (**{bb}** <:poker_chip:1488128491881758760>). Chips returned to wallet.")
+                    f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** 🪙) is below the big blind (**{bb}** 🪙). Chips returned to wallet.")
             except Exception:
                 pass
 
@@ -227,13 +238,12 @@ async def _auto_next_hand(t: TableState, channel):
     total = len(active) + len(pending_with_chips)
 
     if total < 2:
-        await refresh(channel, t, cosmetics_cache=None)
+        await refresh(channel, t)  # <--- ADD THIS so the embed updates before sleeping!
         await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
 
     t.game.SMALL_BLIND = settings["small_blind"]
     t.game.BIG_BLIND   = settings["big_blind"]
-    t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
 
     slog_clear(t)
     success, msg = t.game.start_hand()
@@ -244,20 +254,12 @@ async def _auto_next_hand(t: TableState, channel):
         return
 
     t.msg_count = 0
-    await refresh(channel, t, new_hand=True, cosmetics_cache=t.cosmetics_cache)
+    await refresh(channel, t, new_hand=True)
 
 async def _close_table(channel, t: TableState):
-    if getattr(t, 'is_fully_closed', False):
-        return
-    t.is_fully_closed = True
-
     t.closing = True
     key = (channel.guild.id, channel.id)
     cancel_timer(t)
-
-    if getattr(t, 'active_view', None):
-        t.active_view.stop()
-
     if t.auto_task and not t.auto_task.done():
         t.auto_task.cancel()
     tables.pop(key, None)
@@ -304,17 +306,10 @@ async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
         return existing
 
     if hasattr(log_ch, 'threads'):
-        # 🚨 1. Try Discord's fast memory cache first (O(1) lookup)
-        thread = discord.utils.get(log_ch.threads, name="Poker Hand Log")
-        if thread:
-            _log_threads[channel.guild.id] = thread
-            return thread
-
-        # 🚨 2. Only hit the API to search archived threads if it's completely missing
-        async for arch_thread in log_ch.archived_threads(limit=10):
-            if arch_thread.name == "Poker Hand Log":
-                _log_threads[channel.guild.id] = arch_thread
-                return arch_thread
+        for thread in log_ch.threads:
+            if thread.name == "Poker Hand Log":
+                _log_threads[channel.guild.id] = thread
+                return thread
     try:
         thread = await log_ch.create_thread(name="Poker Hand Log", type=discord.ChannelType.public_thread)
         _log_threads[channel.guild.id] = thread
@@ -328,12 +323,7 @@ async def post_hand_log(channel, t: TableState, result):
     if not thread:
         return
     game = t.game
-
-    header = f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"
-    if getattr(result, "tax", 0) > 0:
-        header += f" | Tax: {result.tax}"
-
-    lines = [header]
+    lines = [f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"]
 
     # Build name lookup from result snapshots — safe for players who already left
     _name_map = {}
@@ -351,6 +341,7 @@ async def post_hand_log(channel, t: TableState, result):
         uname = _name_map.get(uid, "Unknown")
         return f"{uname} ({uid})"
 
+    from engine import hand_str
     if hasattr(result, 'community') and result.community:
         lines.append(f"Board: {hand_str(result.community)}")
 
@@ -359,15 +350,14 @@ async def post_hand_log(channel, t: TableState, result):
 
     _player_map = {_p.user_id: _p for _p in (result.showdown_players or [])}
     for uid, delta in result.chip_deltas.items():
-        sign = "+" if delta > 0 else ""
+        sign = "+" if delta >= 0 else ""
         ustr = await uid_str(uid)
         rank = ranks.get(uid)
+        from engine import hand_str as hs
         sp = _player_map.get(uid)
-        cards = hand_str(sp.hole_cards) if sp and sp.hole_cards else "folded"
+        cards = hs(sp.hole_cards) if sp and sp.hole_cards else "folded"
         rank_part = f" [{rank}]" if rank else ""
-
-        # FIX: Explicitly label it as Net Profit/Loss and fix the double math signs
-        lines.append(f"  {ustr}: {cards}{rank_part}  Net: {sign}{delta}")
+        lines.append(f"  {ustr}: {cards}{rank_part}  {sign}{delta}")
 
     if pot_results:
         for i, (amt, winners) in enumerate(pot_results):
@@ -417,14 +407,13 @@ STREET_LABEL = {
     Street.SHOWDOWN: "🏆 Showdown",
 }
 
-def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
-    tag       = " 🎰" if idx == game.dealer_idx else ""
-    title_str = f" `{title}`" if title else ""
-    mention   = f"<@{p.user_id}>"
+def player_line(p, game: PokerGame, idx: int) -> str:
+    tag     = " 🎰" if idx == game.dealer_idx else ""
+    mention = f"<@{p.user_id}>"
     if p.folded:
-        return f"~~{mention}{title_str}~~ ~~{p.chips} <:poker_chip:1488128491881758760>~~ — folded{tag}"
+        return f"~~{mention}~~ ~~{p.chips} 🪙~~ — folded{tag}"
     if p.all_in:
-        return f"{mention}{title_str} **{p.chips} <:poker_chip:1488128491881758760>** — ALL-IN 🚀{tag}"
+        return f"{mention} **{p.chips} 🪙** — ALL-IN 🚀{tag}"
     cp = game.current_player()
     if cp and cp.user_id == p.user_id:
         status = f"acting (bet {p.bet})" if p.bet else "acting"
@@ -432,9 +421,9 @@ def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
         status = f"bet {p.bet}"
     else:
         status = "—"
-    return f"{mention}{title_str} **{p.chips} <:poker_chip:1488128491881758760>** — {status}{tag}"
+    return f"{mention} **{p.chips} 🪙** — {status}{tag}"
 
-def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None) -> discord.Embed:
+def build_embed(t: TableState) -> discord.Embed:
     game  = t.game
     color = STREET_COLOR.get(game.street, 0x5865F2)
     label = STREET_LABEL.get(game.street, "")
@@ -453,10 +442,9 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None)
     else:
         embed.description = None
 
-    tc = title_cache or {}
-    lines = [player_line(p, game, i, tc.get(p.user_id)) for i, p in enumerate(game.players)]
+    lines = [player_line(p, game, i) for i, p in enumerate(game.players)]
     for p in game.pending_joins:
-        lines.append(f"<@{p.user_id}> **{p.chips} <:poker_chip:1488128491881758760>** — ⏳ next hand")
+        lines.append(f"<@{p.user_id}> **{p.chips} 🪙** — ⏳ next hand")
     if lines:
         embed.add_field(name=f"Players ({len(game.players)}/12)", value="\n".join(lines), inline=False)
 
@@ -465,7 +453,7 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None)
 
     # Pot / turn as last field — sits right above the board image
     if game.street not in (Street.WAITING,):
-        pot_line = f"**Pot:** {game.pot} <:poker_chip:1488128491881758760>"
+        pot_line = f"**Pot:** {game.pot} 🪙"
         if game.current_bet:
             pot_line += f"  ·  **Bet:** {game.current_bet}"
         if cp:
@@ -486,16 +474,6 @@ async def update_board(t: TableState):
 
     # Push image generation to a background thread!
     t.board_file = await asyncio.to_thread(card_images.make_strip, game.community, backs)
-# ── Auto-delete helper ────────────────────────────────────────────────────────
-
-async def _delete_after(message: discord.Message, delay: float):
-    """Delete a message after `delay` seconds. Silently ignores errors."""
-    await asyncio.sleep(delay)
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
 # ── Turn ping ─────────────────────────────────────────────────────────────────
 
 async def send_turn_ping(channel, t: TableState):
@@ -532,27 +510,10 @@ async def send_turn_ping(channel, t: TableState):
 
 # ── Refresh ───────────────────────────────────────────────────────────────────
 
-async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cache: dict = None):
-    await update_board(t)
-    title_cache: dict[int, str | None] = {}
-    try:
-        if cosmetics_cache is None:
-            cosmetics_cache = await db.get_cosmetics_bulk([p.user_id for p in t.game.players])
-        for uid, cosmetics in cosmetics_cache.items():
-            tid = cosmetics.get("active_title")
-            if tid and tid in db.TITLES:
-                title_cache[uid] = db.TITLES[tid]["display"]
-    except Exception:
-        pass
-
-    embed = build_embed(t, title_cache)   # sets attachment://board.png if file present
-
-    if getattr(t, 'active_view', None):
-        t.active_view.stop()
-    
+async def refresh(channel, t: TableState, new_hand: bool = False):
+    await update_board(t)          # generate File (sync, no upload needed)
+    embed = build_embed(t)   # sets attachment://board.png if file present
     view  = GameView(t)
-    t.active_view = view
-
     f     = t.board_file
     if new_hand or not t.hand_msg:
         if new_hand:
@@ -577,22 +538,20 @@ def _slog_result(t: TableState, result):
     pot_results = result.pot_results
     # Use result.community — game.community is already cleared by _end_hand at this point.
     if result.community:
+        from engine import hand_str
         slog(t, f"🃏 Board: {hand_str(result.community)}")
 
     if not pot_results or len(pot_results) == 1:
         if len(result.winners) == 1:
-            w = result.winners[0]
+            w      = result.winners[0]
             gained = result.chip_deltas.get(w.user_id, 0)
-            rank = ranks.get(w.user_id)
-            rs = f" ({rank})" if rank else ""
-
-            # FIX: Smart sign formatting
-            sign = "+" if gained > 0 else ""
-            slog(t, f"🏆 **{w.display_name}** won **{sign}{gained}** <:poker_chip:1488128491881758760>{rs}")
+            rank   = ranks.get(w.user_id)
+            rs     = f" ({rank})" if rank else ""
+            slog(t, f"🏆 **{w.display_name}** won **+{gained}** 🪙{rs}")
         else:
             split = result.pot // max(len(result.winners), 1)
             names = ", ".join(f"**{w.display_name}**" for w in result.winners)
-            slog(t, f"🤝 Split: {names} each **+{split}** <:poker_chip:1488128491881758760>")
+            slog(t, f"🤝 Split: {names} each **+{split}** 🪙")
     else:
         for i, (amt, winners) in enumerate(pot_results):
             label = "Main" if i == 0 else f"Side {i}"
@@ -600,144 +559,77 @@ def _slog_result(t: TableState, result):
                 w      = winners[0]
                 rank   = ranks.get(w.user_id)
                 rs     = f" ({rank})" if rank else ""
-                slog(t, f"🏆 **{label}** ({amt}<:poker_chip:1488128491881758760>) → **{w.display_name}**{rs}")
+                slog(t, f"🏆 **{label}** ({amt}🪙) → **{w.display_name}**{rs}")
             else:
                 each  = amt // len(winners)
                 names = ", ".join(f"**{w.display_name}**" for w in winners)
-                slog(t, f"🤝 **{label}** ({amt}<:poker_chip:1488128491881758760>) split → {names} ({each} each)")
+                slog(t, f"🤝 **{label}** ({amt}🪙) split → {names} ({each} each)")
 
-
-async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict = None):
-    game = t.game
-    ranks = result.winner_ranks or {}
+async def _announce_winner(channel, t: TableState, result):
+    game        = t.game
+    ranks       = result.winner_ranks or {}
     pot_results = result.pot_results  # [(amount, [PokerPlayer, ...]), ...]
 
-    _cos_cache = cosmetics_cache or {}
-
-    def _title_str(uid: int) -> str:
-        # --- APRIL FOOLS OVERRIDE ---
-        return " `🐟 The Fish`"
-
-        cos = _cos_cache.get(uid, {})
-        tid = cos.get("active_title")
-        return f" `{db.TITLES[tid]['display']}`" if tid and tid in db.TITLES else ""
-
-    def _win_msg_str(uid: int) -> str:
-        # --- APRIL FOOLS OVERRIDE ---
-        return "glub glub 🫧"
-
-        cos = _cos_cache.get(uid, {})
-        mid = cos.get("active_win_msg")
-        return f"{db.WIN_MESSAGES[mid]['display']}" if mid and mid in db.WIN_MESSAGES else ""
-
-    def _build_quotes(winners: list, single: bool = False) -> str:
-        quotes = []
-        seen_uids = set()
-        for w in winners:
-            if w.user_id in seen_uids:
-                continue
-            seen_uids.add(w.user_id)
-            wm = _win_msg_str(w.user_id)
-            if wm:
-                if single:
-                    quotes.append(f">  *\"{wm}\"*")
-                else:
-                    quotes.append(f">  **{w.display_name}:** *\"{wm}\"*")
-        return "\n".join(quotes) if quotes else ""
-
-    # 🏆 Create the sleek winner "Receipt" Embed
-    embed = discord.Embed(title=f"🏆 Hand #{game.hand_num} Results", color=0xF1C40F)
-    embed.set_footer(text="⚠️ Notice: A 99% Federal Tax has been applied to this pot.")
-
-    # 1. Add Board if it exists (with a forced empty line \u200b below it)
-    if result.community:
-        embed.add_field(name="🃏 Board", value=f"{hand_str(result.community)}\n\u200b", inline=False)
+    # Board line — present whenever there were community cards (fold wins mid-street included)
+    board_str = f"\n🃏 Board: {hand_str(result.community)}" if result.community else ""
 
     if not pot_results or len(pot_results) == 1:
-        # ── Single Pot (or Fold Win) ──
+        # Single pot (or fold win — no pot_results)
         if len(result.winners) == 1:
-            w = result.winners[0]
+            w      = result.winners[0]
             gained = result.chip_deltas.get(w.user_id, 0)
-            rank = ranks.get(w.user_id)
-            rs = f" with **{rank}**" if rank else ""
-            sign = "+" if gained > 0 else ""
-            title_str = _title_str(w.user_id)
-
-            desc = f"**{w.display_name}**{title_str}\nWon **{sign}{gained}** <:poker_chip:1488128491881758760>{rs}"
-
-            quotes = _build_quotes(result.winners, single=True)
-            if quotes:
-                desc += f"\n\n{quotes}"
-
-            # Add forced empty line after the quotes
-            embed.description = desc + "\n\u200b"
-
-            pre_tax_pot = result.pot + getattr(result, "tax", 0)
-            embed.add_field(name="Pot", value=f"{pre_tax_pot} <:poker_chip:1488128491881758760>", inline=True)
-            embed.add_field(name="New Stack", value=f"{w.chips} <:poker_chip:1488128491881758760>", inline=True)
+            rank   = ranks.get(w.user_id)
+            rs     = f" with **{rank}**" if rank else ""
+            await channel.send(
+                f"🏆 **{w.display_name}** won **+{gained}** chips from Hand #{game.hand_num}{rs}!{board_str} "
+                f"(Pot: **{result.pot}** 🪙 | Stack: **{w.chips}** 🪙)"
+            )
         else:
-            # ── True Split Pot ──
-            split = result.pot // len(result.winners)
-            desc = "🤝 **Split Pot!**\n\n"
-            for w in result.winners:
-                rank = ranks.get(w.user_id)
-                rs = f" ({rank})" if rank else ""
-                title_str = _title_str(w.user_id)
-                desc += f"• **{w.display_name}**{title_str} won **+{split}** <:poker_chip:1488128491881758760>{rs}\n"
-
-            quotes = _build_quotes(result.winners)
-            if quotes:
-                desc += f"\n{quotes}"
-
-            embed.description = desc + "\n\u200b"
-
-            # Add forced empty line after the quotes
-            pre_tax_pot = result.pot + getattr(result, "tax", 0)
-            embed.add_field(name="Total Pot", value=f"{pre_tax_pot} <:poker_chip:1488128491881758760>", inline=True)
-    else:
-        # ── Multiple Side Pots ──
-        desc = ""
-        for i, (amt, winners) in enumerate(pot_results):
-            label = "Main Pot" if i == 0 else f"Side Pot {i}"
-            icon = "🥇" if i == 0 else "🥈"
-            if len(winners) == 1:
-                w = winners[0]
-                rank = ranks.get(w.user_id)
-                rs = f" ({rank})" if rank else ""
-                title_str = _title_str(w.user_id)
-                gained = result.chip_deltas.get(w.user_id, 0)  # 🚨 EXACT POST-TAX AMOUNT
-                desc += f"{icon} **{label}**\n↳ **{w.display_name}**{title_str} won **+{gained}** <:poker_chip:1488128491881758760>{rs}\n\n"
-            else:
-                desc += f"🤝 **{label}** (Split)\n"
+            # True split
+            parts = []
+            for amt, winners in (pot_results or []):
+                each = amt // len(winners)
                 for w in winners:
                     rank = ranks.get(w.user_id)
-                    rs = f" ({rank})" if rank else ""
-                    title_str = _title_str(w.user_id)
-                    gained = result.chip_deltas.get(w.user_id, 0)  # 🚨 EXACT POST-TAX AMOUNT
-                    desc += f"↳ **{w.display_name}**{title_str} won **+{gained}** <:poker_chip:1488128491881758760>{rs}\n"
-                desc += "\n"
-
-        quotes = _build_quotes(result.winners)
-        if quotes:
-            desc += f"{quotes}"
-
-        # Add forced empty line after the quotes
-        embed.description = desc.strip() + "\n\u200b"
-
-        stack_lines = []
+                    parts.append(f"**{w.display_name}**" + (f" ({rank})" if rank else ""))
+            if not parts:
+                parts = [f"**{w.display_name}**" for w in result.winners]
+            split = result.pot // len(result.winners)
+            await channel.send(
+                f"🤝 Split pot — Hand #{game.hand_num}: {', '.join(parts)} each won **{split}** 🪙{board_str} "
+                f"(Pot: **{result.pot}** 🪙)"
+            )
+    else:
+        # Multiple side pots — use exact pot_results from engine (guaranteed correct)
+        lines = [f"🃏 **Hand #{game.hand_num} results** — {len(pot_results)} pots:"]
+        if result.community:
+            lines.append(f"🃏 Board: {hand_str(result.community)}")
+        for i, (amt, winners) in enumerate(pot_results):
+            label = "Main pot" if i == 0 else f"Side pot {i}"
+            icon  = "🏆" if i == 0 else "🥈"
+            if len(winners) == 1:
+                w    = winners[0]
+                rank = ranks.get(w.user_id)
+                rs   = f" ({rank})" if rank else ""
+                gained = result.chip_deltas.get(w.user_id, 0)
+                lines.append(f"  {icon} **{label}** ({amt} 🪙) → **{w.display_name}**{rs}")
+            else:
+                each  = amt // len(winners)
+                parts = []
+                for w in winners:
+                    rank = ranks.get(w.user_id)
+                    parts.append(f"**{w.display_name}**" + (f" ({rank})" if rank else ""))
+                lines.append(f"  🤝 **{label}** ({amt} 🪙) split → {', '.join(parts)} ({each} 🪙 each)")
+        lines.append("")
+        # Per-winner final stacks
         seen = set()
         for _, winners in pot_results:
             for w in winners:
                 if w.user_id not in seen:
                     seen.add(w.user_id)
                     gained = result.chip_deltas.get(w.user_id, 0)
-                    sign = "+" if gained > 0 else ""
-                    stack_lines.append(f"**{w.display_name}**: {sign}{gained} → **{w.chips}**")
-        if stack_lines:
-            embed.add_field(name="💰 Final Stacks", value="\n".join(stack_lines), inline=False)
-
-    # 🚀 Send the final embed instead of raw text
-    await channel.send(embed=embed)
+                    lines.append(f"  💰 **{w.display_name}**: +{gained} → **{w.chips}** 🪙")
+        await channel.send("\n".join(lines))
 
 async def _process_result(guild, channel, t: TableState):
     result = t.game._hand_result
@@ -751,84 +643,38 @@ async def _process_result(guild, channel, t: TableState):
         t.auto_task.cancel()
     t.auto_task = None
 
-    # Stats + achievements — one DB write per player instead of 6-8
+    # Stats + DB — wrapped individually so a failure doesn't kill the announcement
     try:
-        sp_map = {sp.user_id: sp for sp in (result.showdown_players or [])}
-
         for p in t.game.players:
-            won = any(w.user_id == p.user_id for w in result.winners)
             net = result.chip_deltas.get(p.user_id, 0)
-            pot_won = net if won else 0
-            sp = sp_map.get(p.user_id)
+            won = any(w.user_id == p.user_id for w in result.winners)
 
-            # Determine achievement flags in Python — no extra DB reads
-            pocket_aces = False
-            if won and p.hole_cards:
-                pocket_aces = [Card.int_to_str(c)[0] for c in p.hole_cards].count('A') == 2
-
-            all_in_win = bool(won and sp and sp.all_in)
-
-            quads_win = sf_win = rf_win = False
-            if won and result.winner_ranks and p.user_id in result.winner_ranks:
-                rank_str = result.winner_ranks[p.user_id]
-                if rank_str == "Four of a Kind":
-                    quads_win = True
-                elif rank_str == "Straight Flush":
-                    if sp and sp.hole_cards and result.community and len(result.community) >= 3:
-                        score = evaluator.evaluate(sp.hole_cards, result.community)
-                        sf_win = True
-                        rf_win = (score == 1)
-
-            await db.record_hand_full(
-                p.user_id, p.display_name, won, net,
-                pocket_aces=pocket_aces,
-                all_in_win=all_in_win,
-                quads_win=quads_win,
-                straight_flush_win=sf_win,
-                royal_flush_win=rf_win,
-            )
-
-            # Check for newly unlocked cosmetics (now 1 read + 1 write internally)
-            newly = await db.check_achievements(p.user_id, won=won, pot_won=pot_won)
-            if not newly:
-                continue
-
-            lines = [f"🎉 <@{p.user_id}> unlocked new cosmetics!"]
-            for kind, cid in newly:
-                catalog = db.TITLES if kind == "title" else db.WIN_MESSAGES
-                item = catalog.get(cid, {})
-                display = item.get("display", cid)
-                rarity = db.RARITY_LABEL.get(item.get("rarity", "uncommon"), "")
-                icon = "🎖️" if kind == "title" else "💬"
-                lines.append(f"  {icon} **{display}** *{rarity}*")
-            try:
-                msg = await channel.send("\n".join(lines))
-                asyncio.create_task(_delete_after(msg, 45))
-            except Exception as e:
-                print(f"[poker] achievement announce error: {e}")
+            # ZERO LAG: Stop fetching from Discord.
+            # p.display_name now securely holds their permanent username!
+            await db.record_hand(p.user_id, p.display_name, won, net)
 
     except Exception as e:
-        print(f"[poker] stats/achievement error: {e}")
+        print(f"[poker] record_hand error: {e}")
 
     try:
-        chip_map = {p.user_id: p.chips + p.pending_rebuy for p in t.game.players}
-        await db.sync_chips_in_play(chip_map)
+        for p in t.game.players:
+            total_chips = p.chips + p.pending_rebuy  # <--- FIX: Include queued chips
+            if total_chips > 0:
+                await db.update_chips_in_play(p.user_id, total_chips)
+            else:
+                await db.clear_chips_in_play(p.user_id)
     except Exception as e:
         print(f"[poker] chips_in_play error: {e}")
 
-    # 🚨 LOG THE TAX TO REVENUE/JACKPOT
     try:
-        if getattr(result, "tax", 0) > 0:
-            await db.log_tax(result.tax)
-    except Exception as e:
-        print(f"[poker] log_tax error: {e}")
-
-    try:
-        log_task = asyncio.create_task(post_hand_log(channel, t, result))
-        log_task.add_done_callback(lambda task: print(f"[Log Error] {task.exception()}") if task.exception() else None)
         await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
     except Exception as e:
         print(f"[poker] log_hand error: {e}")
+
+    try:
+        await post_hand_log(channel, t, result)
+    except Exception as e:
+        print(f"[poker] post_hand_log error: {e}")
 
     try:
         for uid in list(t.game.pending_leaves):
@@ -849,30 +695,22 @@ async def _process_result(guild, channel, t: TableState):
     except Exception as e:
         print(f"[poker] pending_leaves return error: {e}")
 
-    all_cosmetics = {}
+    # These must always run — winner announcement + embed update
     try:
-        all_cosmetics = await db.get_cosmetics_bulk([p.user_id for p in t.game.players])
-        t.cosmetics_cache = all_cosmetics
-        await _announce_winner(channel, t, result, cosmetics_cache=all_cosmetics)
+        await _announce_winner(channel, t, result)
     except Exception as e:
         print(f"[poker] _announce_winner error: {e}")
-
     try:
         _slog_result(t, result)
-        await refresh(channel, t, cosmetics_cache=all_cosmetics)
+        await refresh(channel, t)
     except Exception as e:
         print(f"[poker] refresh error: {e}")
-
-    # 1. ALWAYS run the reveal phase if there was a showdown, even if closing
-    if result.showdown_players:
-        await _reveal_phase(channel, t, result)
-
-    t.game._hand_result = None
-
-    # 2. THEN check if we need to close the table or schedule the next hand
     if t.closing:
         await _close_table(channel, t)
     else:
+        if result.showdown_players:
+            await _reveal_phase(channel, t, result)
+
         # Verify the table wasn't closed while we were waiting for the Muck buttons
         key = (channel.guild.id, channel.id)
         if get_table(key) is t and not t.closing:
@@ -1105,7 +943,7 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
 
 class BetweenHandsView(discord.ui.View):
     def __init__(self, t: TableState):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.t = t
 
     @discord.ui.button(label="Tip Dealer 💸", style=discord.ButtonStyle.blurple)
@@ -1212,9 +1050,6 @@ class RaisePickerView(discord.ui.View):
 
     @discord.ui.button(label="1/3 Pot", style=discord.ButtonStyle.green, row=0)
     async def third_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
-            return
         g = self.t.game
         p = g.get_player(interaction.user.id)
         if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
@@ -1223,9 +1058,6 @@ class RaisePickerView(discord.ui.View):
 
     @discord.ui.button(label="1/2 Pot", style=discord.ButtonStyle.green, row=0)
     async def half_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
-            return
         g = self.t.game
         p = g.get_player(interaction.user.id)
         if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
@@ -1234,9 +1066,6 @@ class RaisePickerView(discord.ui.View):
 
     @discord.ui.button(label="1/2 Stack", style=discord.ButtonStyle.blurple, row=0)
     async def half_stack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
-            return
         g = self.t.game
         p = g.get_player(interaction.user.id)
         if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
@@ -1245,9 +1074,6 @@ class RaisePickerView(discord.ui.View):
 
     @discord.ui.button(label="All In 🚀", style=discord.ButtonStyle.red, row=0)
     async def all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
-            return
         await interaction.response.defer()
         g = self.t.game
         p = g.get_player(interaction.user.id)
@@ -1322,7 +1148,7 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
             await interaction.followup.send(msg, ephemeral=True);
             return
 
-        await interaction.channel.send(f"✅ **{interaction.user.display_name}** joined the table with **{chips}** <:poker_chip:1488128491881758760>!")
+        await interaction.channel.send(f"✅ **{interaction.user.name}** joined the table with **{chips}** 🪙!")
         await refresh(interaction.channel, t)
         await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
 
@@ -1330,11 +1156,11 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 
 class GameView(discord.ui.View):
     def __init__(self, t: TableState):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.t = t
         in_hand = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
         table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 12
-        self.btn_join.disabled =  table_full or t.closing
+        self.btn_join.disabled = in_hand or table_full or t.closing
 
         self.btn_leave.disabled = t.closing  # <-- ADD THIS LINE
 
@@ -1450,7 +1276,7 @@ class GameView(discord.ui.View):
         pot_half = max(call_amt, g.pot // 2) if p else 0
         stack_half = max(call_amt, p.chips // 2) if p else 0
         await interaction.followup.send(
-            f"**Raise options** — Pot: {g.pot} <:poker_chip:1488128491881758760>  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
+            f"**Raise options** — Pot: {g.pot} 🪙  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
             f"· 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}  · 1/2 Stack = +{stack_half}",
             view=view, ephemeral=True)
 
@@ -1474,7 +1300,7 @@ class GameView(discord.ui.View):
             pct = round((1 - score / 7462) * 100, 1)
             strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
 
-        caption = f"Your hole cards — {p.chips} <:poker_chip:1488128491881758760> at table{strength}\n**Cards:** {hand_str(p.hole_cards)}"
+        caption = f"Your hole cards — {p.chips} 🪙 at table{strength}\n**Cards:** {hand_str(p.hole_cards)}"
 
         # 1. INSTANTLY send the text so players with slow internet see their cards immediately
         await interaction.response.send_message(caption, ephemeral=True)
@@ -1482,11 +1308,10 @@ class GameView(discord.ui.View):
         # 2. Generate the heavy image and patch it in a second later
         if USE_IMAGES:
             try:
-                # Add '0' for backs, and 'True' for is_hole
-                file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, True)
+                file = await asyncio.to_thread(card_images.make_strip, p.hole_cards)
                 await interaction.edit_original_response(attachments=[file])
             except Exception:
-                pass
+                pass  # If the image fails to upload, they already have the text!
 
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1509,9 +1334,9 @@ class GameView(discord.ui.View):
         uid = interaction.user.id
         bal, pending = await db.get_wallet(uid)
         p = self.t.game.get_player(uid)
-        table_str = f"  |  **At table:** {p.chips} <:poker_chip:1488128491881758760>" if p else ""
-        pending_str = f"  |  **Pending Cashout:** 🔒 {pending} <:poker_chip:1488128491881758760>" if pending > 0 else ""
-        await interaction.followup.send(f"**Your Wallet:** {bal} <:poker_chip:1488128491881758760>{table_str}{pending_str}", ephemeral=True)
+        table_str = f"  |  **At table:** {p.chips} 🪙" if p else ""
+        pending_str = f"  |  **Pending Cashout:** 🔒 {pending} 🪙" if pending > 0 else ""
+        await interaction.followup.send(f"**Your Wallet:** {bal} 🪙{table_str}{pending_str}", ephemeral=True)
 
 # ── Confirm DB reset ──────────────────────────────────────────────────────────
 
@@ -1554,225 +1379,11 @@ class ConfirmResetView2(discord.ui.View):
         await interaction.edit_original_response(
             content=f"✅ Database wiped by **{interaction.user.display_name}**.", view=None)
 
-# ── Cosmetics UI ─────────────────────────────────────────────────────────────
-
-def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict):
-    """Build the /poker titles embed and its interactive select-menu view."""
-    owned_titles = set(cosmetics["unlocked_titles"])
-    owned_msgs   = set(cosmetics["unlocked_win_msgs"])
-    active_t     = cosmetics.get("active_title")
-    active_m     = cosmetics.get("active_win_msg")
-
-    embed = discord.Embed(title="🎖️ Your Cosmetics", color=0x9b59b6)
-
-    # Get visible cosmetics for this user
-    visible_titles = db.get_visible_cosmetics_for_user(user_id, owned_titles, db.TITLES)
-    visible_winmsgs = db.get_visible_cosmetics_for_user(user_id, owned_msgs, db.WIN_MESSAGES)
-
-    # ── Titles field ───────────────────────────────────────────────────────────
-    t_lines = []
-    for tid, info in visible_titles.items():
-        rarity = db.RARITY_LABEL.get(info["rarity"], "")
-        if tid in owned_titles:
-            equipped = "  ◀ **equipped**" if tid == active_t else ""
-            t_lines.append(f"✅ {info['display']} {rarity}{equipped}")
-        else:
-            desc = info['description'] if info['rarity'] != 'legendary' else "???"
-            t_lines.append(f"🔒 ~~{info['display']}~~ — *{desc}*")
-    
-    total_visible = len(visible_titles)
-    embed.add_field(
-        name=f"🎖️ Titles  ({len(owned_titles)}/{total_visible} unlocked)",
-        value="\n".join(t_lines) or "None yet.",
-        inline=False,
-    )
-
-    # ── Win messages field ────────────────────────────────────────────────────
-    m_lines = []
-    for mid, info in visible_winmsgs.items():
-        rarity = db.RARITY_LABEL.get(info["rarity"], "")
-        if mid in owned_msgs:
-            equipped = "  ◀ **equipped**" if mid == active_m else ""
-            m_lines.append(f"✅ {info['display']} {rarity}{equipped}")
-        else:
-            desc = info['description'] if info['rarity'] != 'legendary' else "???"
-            m_lines.append(f"🔒 ~~{info['display']}~~ — *{desc}*")
-    
-    total_visible_msgs = len(visible_winmsgs)
-    embed.add_field(
-        name=f"💬 Win Messages  ({len(owned_msgs)}/{total_visible_msgs} unlocked)",
-        value="\n".join(m_lines) or "None yet.",
-        inline=False,
-    )
-
-    embed.set_footer(text="Use the dropdowns below to equip — only your unlocked items appear.")
-    view = CosmeticsView(user_id, owned_titles, owned_msgs, active_t, active_m)
-    return embed, view
-
-
-class CosmeticsView(discord.ui.View):
-    """Attach two Select menus to /poker titles so the user can equip without typing IDs."""
-
-    def __init__(
-        self,
-        user_id: int,
-        owned_titles: set[str],
-        owned_msgs: set[str],
-        active_title: str | None,
-        active_msg: str | None,
-    ):
-        super().__init__(timeout=120)
-        self.user_id = user_id
-        self.message: discord.Message | discord.WebhookMessage | None = None
-
-        # ── Title select ───────────────────────────────────────────────────────
-        title_opts = [discord.SelectOption(label="— Remove title —", value="none", emoji="❌")]
-        for tid in owned_titles:
-            info = db.TITLES.get(tid)
-            if info:
-                title_opts.append(discord.SelectOption(
-                    label=info["display"],
-                    value=tid,
-                    default=(tid == active_title),
-                ))
-        # Discord requires 1–25 options; cap just in case
-        title_opts = title_opts[:25]
-
-        title_select = discord.ui.Select(
-            placeholder="🎖️ Equip a title…",
-            options=title_opts,
-            custom_id="cosmetics:title",
-            row=0,
-        )
-        title_select.callback = self._on_title_select
-        self.add_item(title_select)
-
-        # ── Win-message select ────────────────────────────────────────────────
-        msg_opts = [discord.SelectOption(label="— Remove win message —", value="none", emoji="❌")]
-        for mid in owned_msgs:
-            info = db.WIN_MESSAGES.get(mid)
-            if info:
-                msg_opts.append(discord.SelectOption(
-                    label=info["display"],
-                    value=mid,
-                    default=(mid == active_msg),
-                ))
-        msg_opts = msg_opts[:25]
-
-        msg_select = discord.ui.Select(
-            placeholder="💬 Equip a win message…",
-            options=msg_opts,
-            custom_id="cosmetics:winmsg",
-            row=1,
-        )
-        msg_select.callback = self._on_msg_select
-        self.add_item(msg_select)
-
-    async def _guard(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ This panel belongs to someone else.", ephemeral=True)
-            return False
-        return True
-
-    async def _on_title_select(self, interaction: discord.Interaction):
-        if not await self._guard(interaction): return
-        chosen = interaction.data["values"][0]
-        tid = None if chosen == "none" else chosen
-        await db.set_active_title(self.user_id, tid)
-        cosmetics = await db.get_cosmetics(self.user_id)
-        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics)
-        new_view.message = self.message
-        label = db.TITLES[tid]["display"] if tid else "removed"
-        await interaction.response.edit_message(
-            content=f"✅ Title set to **{label}**." if tid else "✅ Title removed.",
-            embed=embed, view=new_view)
-
-    async def _on_msg_select(self, interaction: discord.Interaction):
-        if not await self._guard(interaction): return
-        chosen = interaction.data["values"][0]
-        mid = None if chosen == "none" else chosen
-        await db.set_active_win_msg(self.user_id, mid)
-        cosmetics = await db.get_cosmetics(self.user_id)
-        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics)
-        new_view.message = self.message
-        label = db.WIN_MESSAGES[mid]["display"] if mid else "removed"
-        await interaction.response.edit_message(
-            content=f"✅ Win message set to **{label}**." if mid else "✅ Win message removed.",
-            embed=embed, view=new_view)
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except Exception:
-                pass
-
-
-# ── Autocomplete helpers for /poker equiptitle and /poker equipwinmsg ─────────
-
-async def _autocomplete_title(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    """Only shows titles the user has already unlocked."""
-    cosmetics = await db.get_cosmetics(interaction.user.id)
-    owned = set(cosmetics["unlocked_titles"])
-    choices = [app_commands.Choice(name="— Remove title —", value="none")]
-    for tid in owned:
-        info = db.TITLES.get(tid)
-        if info and current.lower() in info["display"].lower():
-            choices.append(app_commands.Choice(name=info["display"], value=tid))
-    return choices[:25]
-
-
-async def _autocomplete_winmsg(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    """Only shows win messages the user has already unlocked."""
-    cosmetics = await db.get_cosmetics(interaction.user.id)
-    owned = set(cosmetics["unlocked_win_msgs"])
-    choices = [app_commands.Choice(name="— Remove win message —", value="none")]
-    for mid in owned:
-        info = db.WIN_MESSAGES.get(mid)
-        if info and current.lower() in info["display"].lower():
-            choices.append(app_commands.Choice(name=info["display"], value=mid))
-    return choices[:25]
-
-
-async def _autocomplete_grant_cosmetic(
-        interaction: discord.Interaction,
-        current: str,
-) -> list[app_commands.Choice[str]]:
-    """Shows all available cosmetics for admins to grant."""
-    # Check which 'kind' the admin selected in the previous dropdown
-    kind = getattr(interaction.namespace, "kind", None)
-
-    if kind == "title":
-        catalog = db.TITLES
-    elif kind == "winmsg":
-        catalog = db.WIN_MESSAGES
-    else:
-        # If they haven't selected a kind yet, return empty to force them to pick one first
-        return []
-
-    choices = []
-    for cid, info in catalog.items():
-        display_text = f"{info['display']} ({cid})"
-        if current.lower() in display_text.lower():
-            # Discord limits choice names to 100 characters
-            choices.append(app_commands.Choice(name=display_text[:100], value=cid))
-
-    # Discord limits autocomplete to 25 results at a time
-    return choices[:25]
-
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class PokerCog(commands.Cog):
 
-    DEV_USER_ID = [1339935869598961728,804762802451382283] # baymax for backups
+    DEV_USER_ID = 1339935869598961728 # baymax for backups
 
     def __init__(self, bot):
         self.bot = bot
@@ -1780,21 +1391,6 @@ class PokerCog(commands.Cog):
 
     def cog_unload(self):
         self.daily_backup.cancel()
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
-            return
-        key = (message.guild.id, message.channel.id)
-        t = get_table(key)
-        if not t or t.game.street == Street.WAITING:
-            return
-
-        t.msg_count += 1
-        if t.msg_count >= t.resend_threshold:
-            t.msg_count = 0
-            t.hand_msg = None
-            await refresh(message.channel, t, new_hand=True)
 
     # ── THE BACKUP ENGINE (Hidden Helper) ──────────────────────────────────
     async def _send_backup(self, user: discord.User):
@@ -1830,11 +1426,12 @@ class PokerCog(commands.Cog):
                 os.remove(zip_path)
 
     # ── THE AUTO TIMER (Every 24 Hours) ────────────────────────────────────
-    time_to_run = dt_time(hour=4, minute=0, tzinfo=_tz.utc)
+    time_to_run = dt.time(hour=4, minute=0, tzinfo=dt.timezone.utc)
+
     @tasks.loop(time=time_to_run)
     async def daily_backup(self):
         try:
-            user = await self.bot.fetch_user(self.DEV_USER_ID[0])
+            user = await self.bot.fetch_user(self.DEV_USER_ID)
             if user:
                 await self._send_backup(user)
         except Exception as e:
@@ -1885,7 +1482,6 @@ class PokerCog(commands.Cog):
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
         t.game.MIN_BUYIN = settings.get("min_wallet", 50)
-        t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
         await refresh(interaction.channel, t, new_hand=True)
         await interaction.followup.send("✅ Table opened!", ephemeral=True)  # <-- ADD THIS
 
@@ -1893,7 +1489,7 @@ class PokerCog(commands.Cog):
     async def close_table(self, interaction: discord.Interaction):
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         if not t:
             await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
             return
@@ -1901,10 +1497,10 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
-        if t.game.street == Street.WAITING and not t.game._hand_result:
-            # No hand running and no hand resolving — close immediately
+        if t.game.street == Street.WAITING:
+            # No hand running — close immediately
             await _close_table(interaction.channel, t)
-            await interaction.followup.send("✅ Table closed.", ephemeral=False)
+            await interaction.followup.send("✅ Table closed.")
         else:
             # Hand in progress
             t.closing = True
@@ -1916,7 +1512,7 @@ class PokerCog(commands.Cog):
                 except Exception:
                     pass
                 t.between_msg = None
-            await interaction.followup.send("✅ Table will close after this hand.", ephemeral=False)
+            await interaction.followup.send("✅ Table will close after this hand.")
             await refresh(interaction.channel, t)
 
     @poker.command(name="start", description="[Manager] Deal the first hand")
@@ -1930,15 +1526,14 @@ class PokerCog(commands.Cog):
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
-        if t.game.street != Street.WAITING or t.game._hand_result:
-            await interaction.followup.send("❌ A hand is already in progress or resolving.", ephemeral=True)
+        if t.game.street != Street.WAITING:
+            await interaction.followup.send("❌ A hand is already in progress.", ephemeral=True)
             return
 
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
         t.game.MIN_BUYIN = settings.get("min_wallet", 50)
-        t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
             if p:
@@ -2006,7 +1601,7 @@ class PokerCog(commands.Cog):
             return
 
         # Kick from table
-        if t.game.street == Street.WAITING and not t.game._hand_result:
+        if t.game.street == Street.WAITING:
             t.game.players.remove(p)
             total_to_return = p.chips + p.pending_rebuy
             if total_to_return > 0:
@@ -2077,7 +1672,7 @@ class PokerCog(commands.Cog):
 
                 # Kick from active table
                 if p:
-                    if t.game.street == Street.WAITING and not t.game._hand_result:
+                    if t.game.street == Street.WAITING:
                         t.game.players.remove(p)
                         total_to_return = p.chips + p.pending_rebuy
                         if total_to_return > 0:
@@ -2194,10 +1789,10 @@ class PokerCog(commands.Cog):
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
         p = t.game.get_player(target.id) if t else None
-        table_str = f"\n**At table:** {p.chips} <:poker_chip:1488128491881758760>" if p else ""
-        pending_str = f"\n**Pending Cashout:** 🔒 {pending} <:poker_chip:1488128491881758760>" if pending > 0 else ""
+        table_str = f"\n**At table:** {p.chips} 🪙" if p else ""
+        pending_str = f"\n**Pending Cashout:** 🔒 {pending} 🪙" if pending > 0 else ""
         label = f"**{target.display_name}'s Wallet**" if user else "**Your Wallet**"
-        await interaction.followup.send(f"{label}: {bal} <:poker_chip:1488128491881758760>{table_str}{pending_str}", ephemeral=False)
+        await interaction.followup.send(f"{label}: {bal} 🪙{table_str}{pending_str}", ephemeral=False)
 
     @poker.command(name="tip", description="Tip the dealer between hands")
     @app_commands.describe(amount="How many chips to tip? (e.g. 50, 1k)")
@@ -2321,8 +1916,8 @@ class PokerCog(commands.Cog):
                 name=label,
                 value=(
                     f"Win% **{caller_wp}**  ·  "
-                    f"Net **{caller_sign}{caller_net}** <:poker_chip:1488128491881758760>  ·  "
-                    f"Wallet **{caller_row['wallet']}** <:poker_chip:1488128491881758760>"
+                    f"Net **{caller_sign}{caller_net}** 🪙  ·  "
+                    f"Wallet **{caller_row['wallet']}** 🪙"
                 ),
                 inline=False
             )
@@ -2345,37 +1940,25 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"ℹ️ **{user.name}** has no stats on record.", ephemeral=True)
 
     @poker.command(name="stats", description="View your poker stats")
-    @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
-    async def stats(self, interaction: discord.Interaction, hidden: bool = False):
-        # 1. Defer using the user's choice
-        await interaction.response.defer(ephemeral=hidden)
-
+    async def stats(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         row = await db.get_player_stats(interaction.user.id)
         if not row:
-            await interaction.followup.send("No stats yet!", ephemeral=hidden)
+            await interaction.followup.send("No stats yet!", ephemeral=True);
             return
-
-        # FETCH THE RANK
-        rank = await db.get_player_rank(interaction.user.id)
-        rank_str = f"#{rank}" if rank else "Unranked"
-
         net = row['net_chips']
-
-        # 🎨 Added the rank directly into the Title to keep the grid clean
-        embed = discord.Embed(title=f"📊 Stats — {row['username']}",
-                              color=0x2ecc71 if net >= 0 else 0xe74c3c)
-
+        embed = discord.Embed(title=f"Stats — {row['username']}", color=0x2ecc71 if net >= 0 else 0xe74c3c)
         wp = f"{row['hands_won'] / row['hands_played'] * 100:.1f}%" if row['hands_played'] else "—"
-
-        embed.add_field(name="Rank", value=str(rank_str), inline=True)
         embed.add_field(name="Hands", value=str(row['hands_played']), inline=True)
+        embed.add_field(name="Won", value=str(row['hands_won']), inline=True)
         embed.add_field(name="Win %", value=wp, inline=True)
-        embed.add_field(name="Net", value=f"{'+' if net >= 0 else ''}{net} <:poker_chip:1488128491881758760>", inline=True)
-        embed.add_field(name="Wallet", value=f"{row['wallet']} <:poker_chip:1488128491881758760>", inline=True)
-        embed.add_field(name="Tipped", value=f"{row.get('total_tipped', 0):,} <:poker_chip:1488128491881758760>", inline=True)
+        embed.add_field(name="Net", value=f"{'+' if net >= 0 else ''}{net} 🪙", inline=True)
+        embed.add_field(name="Wallet", value=f"{row['wallet']} 🪙", inline=True)
 
-        # 2. Send the final embed using the user's choice
-        await interaction.followup.send(embed=embed, ephemeral=hidden)
+        # 💸 ADD THIS LINE:
+        embed.add_field(name="Tipped", value=f"{row.get('total_tipped', 0):,} 🪙", inline=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── Manager settings commands ─────────────────────────────────────────
     @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
@@ -2401,9 +1984,11 @@ class PokerCog(commands.Cog):
 
         new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
                                      user.id, user.display_name, amount, note)
+        tax = math.ceil(amount * 0.05)
+        await db.log_revenue(tax)
 
         await interaction.followup.send(
-            f"✅ **+{amount}** chips → **{user.mention}** |  Balance: **{new_bal}** <:poker_chip:1488128491881758760>"
+            f"✅ **+{amount}** chips → **{user.mention}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""), ephemeral=False)
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
@@ -2431,7 +2016,7 @@ class PokerCog(commands.Cog):
         bal_before = await db.get_balance(user.id)
         if amount > bal_before:
             await interaction.followup.send(
-                f"❌ **{user.display_name}** only has **{bal_before}** <:poker_chip:1488128491881758760> in their wallet. You cannot remove **{amount}**.",
+                f"❌ **{user.display_name}** only has **{bal_before}** 🪙 in their wallet. You cannot remove **{amount}**.",
                 ephemeral=True)
             return
 
@@ -2441,12 +2026,12 @@ class PokerCog(commands.Cog):
         expected = bal_before - amount
         if new_bal > expected:
             await interaction.followup.send(
-                f"⚠️ Only **{bal_before - new_bal}** chips could be removed — **{user.display_name}**'s balance changed concurrently. New balance: **{new_bal}** <:poker_chip:1488128491881758760>",
+                f"⚠️ Only **{bal_before - new_bal}** chips could be removed — **{user.display_name}**'s balance changed concurrently. New balance: **{new_bal}** 🪙",
                 ephemeral=True)
             return
 
         await interaction.followup.send(
-            f"✅ **-{amount}** chips from **{user.mention}** |  Balance: **{new_bal}** <:poker_chip:1488128491881758760>"
+            f"✅ **-{amount}** chips from **{user.mention}** |  Balance: **{new_bal}** 🪙"
             + (f"\n> {note}" if note else ""), ephemeral=False)
 
     @pokermgr.command(name="setdealer", description="[Manager] Change the dealer (who receives tips) for this table")
@@ -2502,7 +2087,7 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="settings", description="[Manager] View table settings")
     async def settings_view(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -2734,7 +2319,10 @@ class PokerCog(commands.Cog):
                 ephemeral=True);
             return
 
-        ok = await db.request_cashout(interaction.user.id, chips)
+        tax = math.ceil(chips * 0.05)
+        payout_amount = chips - tax
+
+        ok = await db.request_cashout(interaction.user.id, chips, tax)
         if not ok:
             await interaction.followup.send("❌ Failed to process cashout.", ephemeral=True);
             return
@@ -2744,7 +2332,7 @@ class PokerCog(commands.Cog):
             try:
                 ch = interaction.guild.get_channel(int(cashout_ch_id))
                 if ch:
-                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1488128491881758760>"
+                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Chips Amount:** {payout_amount}\n*(Requested: {chips}, Tax: {tax}🪙)*"
                     if note: ticket_msg += f"\n**Notes:** {note}"
                     await ch.send(ticket_msg)
             except Exception:
@@ -2752,7 +2340,7 @@ class PokerCog(commands.Cog):
 
         # FIXED: Send the final receipt ephemerally
         await interaction.followup.send(
-            f"✅ Locked **{chips}** <:poker_chip:1488128491881758760> for cashout. Staff have been notified in the cashouts channel.",
+            f"✅ Locked **{chips}** 🪙 for cashout (Payout: **{payout_amount}**, Tax: **{tax}**). Staff have been notified in the cashouts channel.",
             ephemeral=True
         )
 
@@ -2780,12 +2368,12 @@ class PokerCog(commands.Cog):
         if not ok:
             _, pending = await db.get_wallet(user.id)
             await interaction.followup.send(
-                f"❌ **{user.display_name}** only has **{pending}** <:poker_chip:1488128491881758760> pending. You cannot deduct {amount}.",
+                f"❌ **{user.display_name}** only has **{pending}** 🪙 pending. You cannot deduct {amount}.",
                 ephemeral=True);
             return
 
         await interaction.followup.send(
-            f"✅ Successfully deducted **{amount}** <:poker_chip:1488128491881758760> from **{user.mention}**'s pending cashouts.")
+            f"✅ Successfully deducted **{amount}** 🪙 from **{user.mention}**'s pending cashouts.")
 
     @pokeradmin.command(name="economy", description="[Admin] View total chips in circulation")
     async def economy(self, interaction: discord.Interaction):
@@ -2805,10 +2393,10 @@ class PokerCog(commands.Cog):
         total = avail + pending + in_play
 
         embed = discord.Embed(title="🏦 Casino Economy Dashboard", color=0x2ecc71)
-        embed.add_field(name="Available in Wallets", value=f"{avail:,} <:poker_chip:1488128491881758760>", inline=False)
-        embed.add_field(name="Locked Pending Cashouts", value=f"{pending:,} <:poker_chip:1488128491881758760>", inline=False)
-        embed.add_field(name="Currently at Tables", value=f"{in_play:,} <:poker_chip:1488128491881758760>", inline=False)
-        embed.add_field(name="Total Circulation", value=f"**{total:,} <:poker_chip:1488128491881758760>**", inline=False)
+        embed.add_field(name="Available in Wallets", value=f"{avail:,} 🪙", inline=False)
+        embed.add_field(name="Locked Pending Cashouts", value=f"{pending:,} 🪙", inline=False)
+        embed.add_field(name="Currently at Tables", value=f"{in_play:,} 🪙", inline=False)
+        embed.add_field(name="Total Circulation", value=f"**{total:,} 🪙**", inline=False)
 
         await interaction.followup.send(embed=embed)
 
@@ -2822,10 +2410,10 @@ class PokerCog(commands.Cog):
         stats = await db.get_revenue_stats()
 
         embed = discord.Embed(title="📈 House Revenue (5% Tax)", color=0xf1c40f)
-        embed.add_field(name="Past 24 Hours", value=f"{stats['daily']:,} <:poker_chip:1488128491881758760>", inline=True)
-        embed.add_field(name="Past 7 Days", value=f"{stats['weekly']:,} <:poker_chip:1488128491881758760>", inline=True)
-        embed.add_field(name="Past 30 Days", value=f"{stats['monthly']:,} <:poker_chip:1488128491881758760>", inline=True)
-        embed.add_field(name="All-Time Profit", value=f"**{stats['all_time']:,} <:poker_chip:1488128491881758760>**", inline=False)
+        embed.add_field(name="Past 24 Hours", value=f"{stats['daily']:,} 🪙", inline=True)
+        embed.add_field(name="Past 7 Days", value=f"{stats['weekly']:,} 🪙", inline=True)
+        embed.add_field(name="Past 30 Days", value=f"{stats['monthly']:,} 🪙", inline=True)
+        embed.add_field(name="All-Time Profit", value=f"**{stats['all_time']:,} 🪙**", inline=False)
 
         await interaction.followup.send(embed=embed)
 
@@ -2837,406 +2425,11 @@ class PokerCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=False)
 
-        db_conn = await db._get_db()
-        async with db._write_lock:
-            await db_conn.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
-                                  (datetime.utcnow().isoformat(), amount))
-            await db_conn.commit()
-
+        await db.log_revenue(amount)
         word = "Added" if amount >= 0 else "Deducted"
-        await interaction.followup.send(
-            f"✅ {word} **{abs(amount)}** <:poker_chip:1488128491881758760> to the House Revenue tracker.")
-
-    @pokeradmin.command(name="adjustjackpot", description="[Admin] Manually adjust the global jackpot")
-    @app_commands.describe(amount="Amount to add (or negative to subtract)")
-    async def adjustjackpot(self, interaction: discord.Interaction, amount: int):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=False)
-
-        # Pass the amount directly (positive adds, negative subtracts)
-        await db.adjust_jackpot(amount)
-        new_jp = await db.get_jackpot()
-
-        # Smart formatting for the receipt
-        action = "Added" if amount >= 0 else "Removed"
-        prep = "to" if amount >= 0 else "from"
-
-        await interaction.followup.send(
-            f"✅ {action} **{abs(amount):,}** <:poker_chip:1488128491881758760> {prep} the jackpot! New total: **{new_jp:,}** <:poker_chip:1488128491881758760>"
-        )
-
-    @poker.command(name="jackpot", description="View the current casino jackpot!")
-    async def jackpot(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
-        jp = await db.get_jackpot()
-
-        # 🚨 Calculate splits: 50% Royal Flush, 20% Straight Flush, 5% Rest to Quads
-        rf_cut = math.ceil(jp * 0.60)
-        sf_cut = math.ceil(jp * 0.20)
-        quads_cut = math.ceil(jp * 0.05)  # The rest goes to Quads
-
-        desc = (
-            "_ _\n"
-            f"**Total:  {jp:,} <:poker_chip:1488128491881758760>**\n\n"
-            f"- **Quads** : {quads_cut:,} <:poker_chip:1488128491881758760>\n\n"
-            f"- **Straight Flush** : {sf_cut:,} <:poker_chip:1488128491881758760>\n\n"
-            f"- **Royal Flush** : {rf_cut:,} <:poker_chip:1488128491881758760>\n\n"
-            "_ _"
-        )
-
-        embed = discord.Embed(
-            title="<a:md_den:996127219019690034> Jackpot",
-            description=desc,
-            color=0xFFD700  # Decimal 16766720
-        )
-        embed.set_thumbnail(
-            url="https://media.discordapp.net/attachments/1478125269285081211/1488098208986038282/3d-casino-poker-cards-and-playing-chips-on-black-background-illustration-free-vector.png?ex=69cb8af4&is=69ca3974&hm=58f")
-        embed.set_footer(text="• 5% Q, 20% SF, 60% RF")
-
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(f"✅ {word} **{abs(amount)}** 🪙 to the House Revenue tracker.")
 
 
-    @pokeradmin.command(name="check_inactive", description="[Admin] Check who will be wiped soon")
-    async def check_inactive(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-            return
-        
-        await interaction.response.defer(ephemeral=False)
-        
-        from database import get_inactive_players
-        
-        # At-risk players (will be wiped soon)
-        # at_risk = await get_players_at_risk()
-        # Already inactive (will be wiped on next check)
-        at_risk = []
-        inactive = await get_inactive_players()
-        
-        embed = discord.Embed(title="🔍 Inactivity Report", color=0xe74c3c)
-        
-        if at_risk:
-            risk_lines = []
-            for p in at_risk[:10]:  # Show top 10
-                days_ago = (datetime.utcnow() - datetime.fromisoformat(p["last_activity"])).days
-                total = p["balance"] + p["pending_cashout"]
-                risk_lines.append(
-                    f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
-                )
-            embed.add_field(
-                name=f"⚠️ At Risk ({len(at_risk)} players)",
-                value="\n".join(risk_lines) if risk_lines else "None",
-                inline=False
-            )
-        
-        if inactive:
-            inactive_lines = []
-            for p in inactive[:10]:
-                days_ago = (datetime.utcnow() - datetime.fromisoformat(p["last_activity"])).days
-                total = p["balance"] + p["pending_cashout"]
-                inactive_lines.append(
-                    f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
-                )
-            embed.add_field(
-                name=f"💀 Will Be Wiped Next Run ({len(inactive)} players)",
-                value="\n".join(inactive_lines) if inactive_lines else "None",
-                inline=False
-            )
-        
-        if not at_risk and not inactive:
-            embed.description = "✅ All players are active! No chips will be wiped."
-        
-        await interaction.followup.send(embed=embed)
-
-
-    @pokeradmin.command(name="force_wipe_inactive_players", description="[Admin] Manually trigger inactivity wipe NOW")
-    async def force_wipe(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-            return
-        
-        await interaction.response.defer(ephemeral=False)
-        
-        from database import wipe_inactive_players
-        
-        wiped = await wipe_inactive_players()
-        
-        if not wiped:
-            await interaction.followup.send("✅ No inactive players found. Nothing to wipe!")
-            return
-        
-        summary = "\n".join([
-            f"• **{w['username']}**: {w['amount_wiped']} chips (hands: {w['recent_hands']}, wagered: {w['recent_chips_wagered']})"
-            for w in wiped[:20]  # Show first 20
-        ])
-        
-        await interaction.followup.send(
-            f"🧹 **Wiped {len(wiped)} inactive player(s):**\n{summary}"
-        )
-
-
-    @poker.command(name="myactivity", description="Check your activity status and see if you're at risk")
-    async def myactivity(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        from database import get_player_activity_stats, INACTIVITY_DAYS, MIN_HANDS_PER_PERIOD, MIN_CHIPS_WAGERED
-
-        stats = await get_player_activity_stats(interaction.user.id)
-        
-        if not stats:
-            await interaction.followup.send("❌ You don't have a wallet yet! Use `/wallet` to get started.", ephemeral=True)
-            return
-
-        # Calculate wipe timestamp
-        raw = stats['last_activity']
-        last_active = datetime.fromisoformat(raw).replace(tzinfo=_tz.utc) if isinstance(raw, str) else raw
-
-        # 1. Find exactly when their 2-day clock runs out
-        exact_expiration = last_active + timedelta(days=INACTIVITY_DAYS)
-
-        # 2. Snap to the NEXT scheduled bot wipe (03:30 UTC)
-        if exact_expiration.hour < 3 or (exact_expiration.hour == 3 and exact_expiration.minute <= 30):
-            # The exact expiration happens before 3:30 AM today, so they get wiped today
-            wipe_date = exact_expiration.replace(hour=3, minute=30, second=0, microsecond=0)
-        else:
-            # The exact expiration happens after 3:30 AM, so they survive until tomorrow's wipe
-            wipe_date = (exact_expiration + timedelta(days=1)).replace(hour=3, minute=30, second=0, microsecond=0)
-
-        wipe_timestamp = int(wipe_date.timestamp())
-        
-        # Build embed
-        embed = discord.Embed(title=f"📊 Activity Status: {stats['username']}", color=0x3498db)
-        
-        # Basic Info with Discord Timestamps
-        total_chips = stats['balance'] + stats['pending_cashout']
-        embed.add_field(name="💰 Total Chips", value=f"{total_chips:,} chips", inline=True)
-        embed.add_field(name="📅 Last Active", value=f"<t:{int(last_active.timestamp())}:R>", inline=True)
-        
-        # Wipe deadline with Discord timestamp
-        if stats['days_until_wipe'] > 0:
-            embed.add_field(
-                name="⏰ Chips Wiped", 
-                value=f"<t:{wipe_timestamp}:R>", 
-                inline=True
-            )
-        else:
-            embed.add_field(
-                name="⏰ Chips Wiped", 
-                value="**Next cleanup run!**", 
-                inline=True
-            )
-        
-        # Progress Bar Helper Function
-        def progress_bar(current: int, required: int, length: int = 10) -> str:
-            filled = min(int((current / max(required, 1)) * length), length)
-            done   = "🟩" * filled
-            empty  = "⬜" * (length - filled)
-            pct    = min(int((current / max(required, 1)) * 100), 100)
-            return f"{done}{empty}  **{current}/{required}** ({pct}%)"
-        
-        # Hands Progress with Visual Bar
-        hands_bar = progress_bar(stats['recent_hands'], MIN_HANDS_PER_PERIOD)
-        hands_status = "✅" if stats['meets_hand_requirement'] else "❌"
-        embed.add_field(
-            name=f"🃏 Hands Played {hands_status}", 
-            value=hands_bar, 
-            inline=False
-        )
-        
-        # Chips Wagered Progress (if enabled)
-        if MIN_CHIPS_WAGERED > 0:
-            chips_bar = progress_bar(stats['recent_chips_wagered'], MIN_CHIPS_WAGERED)
-            chips_status = "✅" if stats['meets_wager_requirement'] else "❌"
-            embed.add_field(
-                name=f"💵 Chips Wagered {chips_status}", 
-                value=chips_bar, 
-                inline=False
-            )
-
-            # Status with Dynamic Color
-            days_left = stats['days_until_wipe']
-
-            # Override: If they did their homework, they are safe!
-            if stats['meets_hand_requirement'] and (MIN_CHIPS_WAGERED == 0 or stats['meets_wager_requirement']):
-                status = "🟢 **SAFE** - Requirements met!"
-                color = 0x2ecc71  # Green
-                action = "You are fully protected from the next wipe."
-            elif days_left >= 2:
-                status = "🟢 **SAFE** - You have time."
-                color = 0x2ecc71  # Green
-                needed = MIN_HANDS_PER_PERIOD - stats['recent_hands']
-                action = f"Play {needed} more hand(s) before the deadline."
-            elif days_left == 1:
-                status = "🟡 **WARNING** - 1 day left!"
-                color = 0xf39c12  # Yellow
-                needed = MIN_HANDS_PER_PERIOD - stats['recent_hands']
-                action = f"**Play {needed} more hand(s) TODAY!**"
-            else:
-                status = "🔴 **CRITICAL** - Wipe imminent!"
-                color = 0xe74c3c  # Red
-                needed = MIN_HANDS_PER_PERIOD - stats['recent_hands']
-                action = f"**Play {needed} more hand(s) IMMEDIATELY!**"
-
-            embed.color = color
-            embed.add_field(name="📈 Status", value=status, inline=False)
-
-            # Clear action needed (if requirements not met)
-            if not stats['meets_hand_requirement'] or (MIN_CHIPS_WAGERED > 0 and not stats['meets_wager_requirement']):
-                embed.add_field(name="🎯 What You Need", value=action, inline=False)
-        
-        # Footer with helpful reminder
-        embed.set_footer(text=f"Requirements reset every {INACTIVITY_DAYS} days. Run this command after playing to see updates!")
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-
-    # ── Titles & Win Messages ──────────────────────────────────────────────────
-
-    @poker.command(name="titles", description="View and equip your unlocked titles and win messages")
-    async def titles_cmd(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        cosmetics = await db.get_cosmetics(interaction.user.id)
-        embed, view = _build_cosmetics_embed_and_view(interaction.user.id, cosmetics)
-        view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    @poker.command(name="equiptitle", description="Equip one of your unlocked titles")
-    @app_commands.describe(title_id="Your unlocked title — pick from the list")
-    @app_commands.autocomplete(title_id=_autocomplete_title)
-    async def equiptitle(self, interaction: discord.Interaction, title_id: str):
-        await interaction.response.defer(ephemeral=True)
-        if title_id == "none":
-            await db.set_active_title(interaction.user.id, None)
-            await interaction.followup.send("✅ Title removed.", ephemeral=True)
-            return
-        if title_id not in db.TITLES:
-            await interaction.followup.send("❌ Unknown title. Use `/poker titles` to see your options.", ephemeral=True)
-            return
-        ok = await db.set_active_title(interaction.user.id, title_id)
-        if not ok:
-            info = db.TITLES[title_id]
-            await interaction.followup.send(
-                f"❌ You haven't unlocked **{info['display']}** yet.\n*{info['description']}*", ephemeral=True)
-            return
-        await interaction.followup.send(f"✅ Title set to **{db.TITLES[title_id]['display']}**!", ephemeral=True)
-
-    @poker.command(name="equipwinmsg", description="Equip one of your unlocked win messages")
-    @app_commands.describe(msg_id="Your unlocked win message — pick from the list")
-    @app_commands.autocomplete(msg_id=_autocomplete_winmsg)
-    async def equipwinmsg(self, interaction: discord.Interaction, msg_id: str):
-        await interaction.response.defer(ephemeral=True)
-        if msg_id == "none":
-            await db.set_active_win_msg(interaction.user.id, None)
-            await interaction.followup.send("✅ Win message removed.", ephemeral=True)
-            return
-        if msg_id not in db.WIN_MESSAGES:
-            await interaction.followup.send("❌ Unknown win message. Use `/poker titles` to see your options.", ephemeral=True)
-            return
-        ok = await db.set_active_win_msg(interaction.user.id, msg_id)
-        if not ok:
-            info = db.WIN_MESSAGES[msg_id]
-            desc = info['description'] if info['rarity'] != 'legendary' else "???"
-            await interaction.followup.send(
-                f"❌ You haven't unlocked **{info['display']}** yet.\n*{desc}*", ephemeral=True)
-            return
-        await interaction.followup.send(f"✅ Win message set to **{db.WIN_MESSAGES[msg_id]['display']}**!", ephemeral=True)
-
-    @pokeradmin.command(name="grant_cosmetic", description="[Admin] Grant a title or win message to any player")
-    @app_commands.describe(user="The player to receive the cosmetic", kind="Type of cosmetic",
-                           cosmetic_id="Search for the cosmetic")
-    @app_commands.choices(kind=[
-        app_commands.Choice(name="Title", value="title"),
-        app_commands.Choice(name="Win Message", value="winmsg"),
-    ])
-    @app_commands.autocomplete(cosmetic_id=_autocomplete_grant_cosmetic)
-    async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.Member, kind: str, cosmetic_id: str):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        k = kind.strip().lower()
-        if k not in ("title", "winmsg"):
-            await interaction.followup.send("❌ `kind` must be `title` or `winmsg`.", ephemeral=True); return
-        catalog = db.TITLES if k == "title" else db.WIN_MESSAGES
-        cid = cosmetic_id.strip().lower()
-        if cid not in catalog:
-            valid = ", ".join(f"`{x}`" for x in catalog)
-            await interaction.followup.send(f"❌ Unknown ID `{cid}`.\nValid: {valid}", ephemeral=True); return
-        newly = await db.unlock_cosmetic(user.id, k, cid)
-        display = catalog[cid]["display"]
-        cmd = "equiptitle" if k == "title" else "equipwinmsg"
-        if newly:
-            await interaction.followup.send(
-                f"✅ Granted **{display}** to {user.mention}.\nThey can equip it with `/poker {cmd}`", ephemeral=True)
-        else:
-            await interaction.followup.send(f"ℹ️ {user.mention} already owns **{display}**.", ephemeral=True)
-
-    @pokeradmin.command(name="makecustom", description="[Admin] Create a custom title or win message")
-    @app_commands.describe(
-        kind="'title' or 'winmsg'",
-        cosmetic_id="Unique ID",
-        display="Display text",
-        description="Optional description",
-        rarity="Rarity level",
-        hidden="If true, only visible to users who own it"
-    )
-    @app_commands.choices(
-        kind=[
-            app_commands.Choice(name="Title", value="title"),
-            app_commands.Choice(name="Win Message", value="winmsg"),
-        ],
-        rarity=[
-            app_commands.Choice(name="Common", value="common"),
-            app_commands.Choice(name="Uncommon", value="uncommon"),
-            app_commands.Choice(name="Rare", value="rare"),
-            app_commands.Choice(name="Legendary", value="legendary"),
-            app_commands.Choice(name="Unique", value="unique"),
-        ]
-    )
-    async def makecustom(
-        self, 
-        interaction: discord.Interaction, 
-        kind: str,
-        cosmetic_id: str,
-        display: str,
-        description: str = "",
-        rarity: str = "rare",
-        hidden: bool = False
-    ):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        
-        k = kind.strip().lower()
-        if k not in ("title", "winmsg"):
-            await interaction.followup.send("❌ `kind` must be `title` or `winmsg`.", ephemeral=True)
-            return
-        
-        # Sanitize cosmetic_id (lowercase, replace spaces with underscores)
-        cid = cosmetic_id.strip().lower().replace(" ", "_")
-        
-        # Check if ID already exists
-        catalog = db.TITLES if k == "title" else db.WIN_MESSAGES
-        if cid in catalog:
-            await interaction.followup.send(f"❌ ID `{cid}` already exists. Choose a different ID.", ephemeral=True)
-            return
-        
-        # Create the custom cosmetic
-        success = await db.create_custom_cosmetic(k, cid, display, description, rarity, hidden)
-        
-        if success:
-            visibility = "🔒 Hidden (event prize)" if hidden else "👁️ Visible to all"
-            await interaction.followup.send(
-                f"✅ Created custom {k}: `{display}` (`{cid}`)\n"
-                f"Rarity: {db.RARITY_LABEL.get(rarity, rarity)}\n"
-                f"Visibility: {visibility}\n\n"
-                f"Use `/pokeradmin grant_cosmetic` to give it to players.",
-                ephemeral=True
-            )
-        else:
-            await interaction.followup.send(f"❌ Failed to create cosmetic.", ephemeral=True)
 
     @poker.command(name="tipleaders", description="Top generous players by total chips tipped")
     async def tipleaders(self, interaction: discord.Interaction):
@@ -3278,7 +2471,7 @@ class PokerCog(commands.Cog):
             label = f"📊 Your Generosity" + (" *(in top 10)*" if in_top else "")
             embed.add_field(
                 name=label,
-                value=f"Total Tipped **{caller_tipped:,}** <:poker_chip:1488128491881758760>",
+                value=f"Total Tipped **{caller_tipped:,}** 🪙",
                 inline=False
             )
         else:
@@ -3290,7 +2483,7 @@ class PokerCog(commands.Cog):
     @pokeradmin.command(name="backup", description="[Dev] Force a database backup to your DMs")
     async def force_backup(self, interaction: discord.Interaction):
         # Ironclad Security: Only YOU can run this
-        if interaction.user.id not in self.DEV_USER_ID:
+        if interaction.user.id != self.DEV_USER_ID:
             await interaction.response.send_message("❌ This command is restricted to the bot developer.",
                                                     ephemeral=True)
             return
@@ -3306,29 +2499,6 @@ class PokerCog(commands.Cog):
                 ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
-
-    @poker.command(name="testcards", description="[Dev] Generate a random 2-card hand to test image sizes")
-    async def test_cards(self, interaction: discord.Interaction):
-        if interaction.user.id not in self.DEV_USER_ID:
-            await interaction.response.send_message("❌ This command is restricted to the bot developers.",
-                                                    ephemeral=True)
-            return
-
-        # 1. Defer so the bot has time to process the image
-        await interaction.response.defer(ephemeral=False)
-
-        from treys import Deck
-
-        # 2. Draw 2 random cards
-        deck = Deck()
-        cards = deck.draw(2)
-
-        # 3. Stitch them using your image settings
-        # (Using asyncio.to_thread just like your real bot does to prevent lag)
-        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True)
-
-        # 4. Send the result!
-        await interaction.followup.send(f"🃏 Test Hand: {hand_str(cards)}", file=file)
 
 async def setup(bot):
     await bot.add_cog(PokerCog(bot))

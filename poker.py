@@ -1772,7 +1772,7 @@ async def _autocomplete_grant_cosmetic(
 
 class PokerCog(commands.Cog):
 
-    DEV_USER_ID = 1339935869598961728 # baymax for backups
+    DEV_USER_ID = [1339935869598961728,804762802451382283] # baymax for backups
 
     def __init__(self, bot):
         self.bot = bot
@@ -1834,7 +1834,7 @@ class PokerCog(commands.Cog):
     @tasks.loop(time=time_to_run)
     async def daily_backup(self):
         try:
-            user = await self.bot.fetch_user(self.DEV_USER_ID)
+            user = await self.bot.fetch_user(self.DEV_USER_ID[0])
             if user:
                 await self._send_backup(user)
         except Exception as e:
@@ -3290,7 +3290,7 @@ class PokerCog(commands.Cog):
     @pokeradmin.command(name="backup", description="[Dev] Force a database backup to your DMs")
     async def force_backup(self, interaction: discord.Interaction):
         # Ironclad Security: Only YOU can run this
-        if interaction.user.id != self.DEV_USER_ID:
+        if interaction.user.id not in self.DEV_USER_ID:
             await interaction.response.send_message("❌ This command is restricted to the bot developer.",
                                                     ephemeral=True)
             return
@@ -3309,6 +3309,11 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="testcards", description="[Dev] Generate a random 2-card hand to test image sizes")
     async def test_cards(self, interaction: discord.Interaction):
+        if interaction.user.id not in self.DEV_USER_ID:
+            await interaction.response.send_message("❌ This command is restricted to the bot developers.",
+                                                    ephemeral=True)
+            return
+
         # 1. Defer so the bot has time to process the image
         await interaction.response.defer(ephemeral=False)
 

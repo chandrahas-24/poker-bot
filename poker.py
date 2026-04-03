@@ -2786,7 +2786,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="economy", description="[Admin] View total chips in circulation")
     async def economy(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_ID):
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
         await interaction.response.defer(ephemeral=False)
@@ -2811,7 +2811,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="revenue", description="[Admin] View projected house profits")
     async def revenue(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_ID):
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
         await interaction.response.defer(ephemeral=False)
@@ -2897,7 +2897,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="check_inactive", description="[Admin] Check who will be wiped soon")
     async def check_inactive(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_ID):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
         
@@ -3148,7 +3148,7 @@ class PokerCog(commands.Cog):
     ])
     @app_commands.autocomplete(cosmetic_id=_autocomplete_grant_cosmetic)
     async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.Member, kind: str, cosmetic_id: str):
-        if not interaction.user.guild_permissions.administrator:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_ID):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
@@ -3201,7 +3201,7 @@ class PokerCog(commands.Cog):
         rarity: str = "rare",
         hidden: bool = False
     ):
-        if not interaction.user.guild_permissions.administrator:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_ID):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)

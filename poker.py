@@ -764,15 +764,17 @@ async def _process_result(guild, channel, t: TableState):
             all_in_win = bool(won and sp and sp.all_in)
 
             quads_win = sf_win = rf_win = False
-            if won and result.winner_ranks and p.user_id in result.winner_ranks:
-                rank_str = result.winner_ranks[p.user_id]
+
+            # FIX: Evaluate the winner's hand even if everyone folded (no showdown)
+            if won and sp and sp.hole_cards and result.community and len(result.community) >= 3:
+                score = evaluator.evaluate(sp.hole_cards, result.community)
+                rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
+
                 if rank_str == "Four of a Kind":
                     quads_win = True
                 elif rank_str == "Straight Flush":
-                    if sp and sp.hole_cards and result.community and len(result.community) >= 3:
-                        score = evaluator.evaluate(sp.hole_cards, result.community)
-                        sf_win = True
-                        rf_win = (score == 1)
+                    sf_win = True
+                    rf_win = (score == 1)
 
             await db.record_hand_full(
                 p.user_id, p.display_name, won, net,
@@ -1100,7 +1102,7 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
 
 class BetweenHandsView(discord.ui.View):
     def __init__(self, t: TableState):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.t = t
 
     @discord.ui.button(label="Tip Dealer 💸", style=discord.ButtonStyle.blurple)
@@ -1325,7 +1327,7 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 
 class GameView(discord.ui.View):
     def __init__(self, t: TableState):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.t = t
         in_hand = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
         table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 12

@@ -2902,12 +2902,9 @@ class PokerCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=False)
 
-        # 🚨 FIXED: Import both functions
-        from database import get_inactive_players, get_players_at_risk
-
         # 🚨 FIXED: Actually fetch the at-risk list instead of forcing it to []
-        at_risk = await get_players_at_risk()
-        inactive = await get_inactive_players()
+        at_risk = await db.get_players_at_risk()
+        inactive = await db.get_inactive_players()
 
         embed = discord.Embed(title="🔍 Inactivity Report", color=0xe74c3c)
 
@@ -2954,10 +2951,8 @@ class PokerCog(commands.Cog):
             return
         
         await interaction.response.defer(ephemeral=False)
-        
-        from database import wipe_inactive_players
-        
-        wiped = await wipe_inactive_players()
+
+        wiped = await db.wipe_inactive_players()
         
         if not wiped:
             await interaction.followup.send("✅ No inactive players found. Nothing to wipe!")
@@ -2977,9 +2972,8 @@ class PokerCog(commands.Cog):
     async def myactivity(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        from database import get_player_activity_stats, INACTIVITY_DAYS, MIN_HANDS_PER_PERIOD, MIN_CHIPS_WAGERED
 
-        stats = await get_player_activity_stats(interaction.user.id)
+        stats = await db.get_player_activity_stats(interaction.user.id)
         
         if not stats:
             await interaction.followup.send("❌ You don't have a wallet yet! Use `/wallet` to get started.", ephemeral=True)
@@ -2990,7 +2984,7 @@ class PokerCog(commands.Cog):
         last_active = datetime.fromisoformat(raw).replace(tzinfo=_tz.utc) if isinstance(raw, str) else raw
 
         # 1. Find exactly when their 2-day clock runs out
-        exact_expiration = last_active + timedelta(days=INACTIVITY_DAYS)
+        exact_expiration = last_active + timedelta(days=db.INACTIVITY_DAYS)
 
         # 2. Snap to the NEXT scheduled bot wipe (03:30 UTC)
         if exact_expiration.hour < 3 or (exact_expiration.hour == 3 and exact_expiration.minute <= 30):
@@ -3033,7 +3027,7 @@ class PokerCog(commands.Cog):
             return f"{done}{empty}  **{current}/{required}** ({pct}%)"
         
         # Hands Progress with Visual Bar
-        hands_bar = progress_bar(stats['recent_hands'], MIN_HANDS_PER_PERIOD)
+        hands_bar = progress_bar(stats['recent_hands'], db.MIN_HANDS_PER_PERIOD)
         hands_status = "✅" if stats['meets_hand_requirement'] else "❌"
         embed.add_field(
             name=f"🃏 Hands Played {hands_status}", 
@@ -3042,8 +3036,8 @@ class PokerCog(commands.Cog):
         )
         
         # Chips Wagered Progress (if enabled)
-        if MIN_CHIPS_WAGERED > 0:
-            chips_bar = progress_bar(stats['recent_chips_wagered'], MIN_CHIPS_WAGERED)
+        if db.MIN_CHIPS_WAGERED > 0:
+            chips_bar = progress_bar(stats['recent_chips_wagered'], db.MIN_CHIPS_WAGERED)
             chips_status = "✅" if stats['meets_wager_requirement'] else "❌"
             embed.add_field(
                 name=f"💵 Chips Wagered {chips_status}", 
@@ -3055,35 +3049,35 @@ class PokerCog(commands.Cog):
             days_left = stats['days_until_wipe']
 
             # Override: If they did their homework, they are safe!
-            if stats['meets_hand_requirement'] and (MIN_CHIPS_WAGERED == 0 or stats['meets_wager_requirement']):
+            if stats['meets_hand_requirement'] and (db.MIN_CHIPS_WAGERED == 0 or stats['meets_wager_requirement']):
                 status = "🟢 **SAFE** - Requirements met!"
                 color = 0x2ecc71  # Green
                 action = "You are fully protected from the next wipe."
             elif days_left >= 2:
                 status = "🟢 **SAFE** - You have time."
                 color = 0x2ecc71  # Green
-                needed = MIN_HANDS_PER_PERIOD - stats['recent_hands']
+                needed = db.MIN_HANDS_PER_PERIOD - stats['recent_hands']
                 action = f"Play {needed} more hand(s) before the deadline."
             elif days_left == 1:
                 status = "🟡 **WARNING** - 1 day left!"
                 color = 0xf39c12  # Yellow
-                needed = MIN_HANDS_PER_PERIOD - stats['recent_hands']
+                needed = db.MIN_HANDS_PER_PERIOD - stats['recent_hands']
                 action = f"**Play {needed} more hand(s) TODAY!**"
             else:
                 status = "🔴 **CRITICAL** - Wipe imminent!"
                 color = 0xe74c3c  # Red
-                needed = MIN_HANDS_PER_PERIOD - stats['recent_hands']
+                needed = db.MIN_HANDS_PER_PERIOD - stats['recent_hands']
                 action = f"**Play {needed} more hand(s) IMMEDIATELY!**"
 
             embed.color = color
             embed.add_field(name="📈 Status", value=status, inline=False)
 
             # Clear action needed (if requirements not met)
-            if not stats['meets_hand_requirement'] or (MIN_CHIPS_WAGERED > 0 and not stats['meets_wager_requirement']):
+            if not stats['meets_hand_requirement'] or (db.MIN_CHIPS_WAGERED > 0 and not stats['meets_wager_requirement']):
                 embed.add_field(name="🎯 What You Need", value=action, inline=False)
         
         # Footer with helpful reminder
-        embed.set_footer(text=f"Requirements reset every {INACTIVITY_DAYS} days. Run this command after playing to see updates!")
+        embed.set_footer(text=f"Requirements reset every {db.INACTIVITY_DAYS} days. Run this command after playing to see updates!")
         
         await interaction.followup.send(embed=embed, ephemeral=True)
 

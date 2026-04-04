@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 # 1. FORCE the bot to look inside the Railway Volume
 # Replace '/app/data/poker.db' with whatever your Mount Path + filename is
-DB_PATH = "/app/data/poker.db"
+DB_PATH = "poker.db"
 
 _db: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()
@@ -284,24 +284,25 @@ async def get_balance(user_id: int) -> int:
         row = await c.fetchone()
         return row[0] if row else 0
 
-
 async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str,
                     amount: int, note: str = "") -> int:
     db = await _get_db()
     now = datetime.utcnow().isoformat()
 
     async with _write_lock:
-        # 1. Add the chips AND start the clock if it's currently NULL
+        # 🚨 DUST REVIVE: Only reset the clock if their playable balance was below 50!
         await db.execute("""
-            INSERT INTO wallets (user_id, username, balance, last_activity) 
-            VALUES (?, ?, MAX(0, ?), ?)
+            INSERT INTO wallets (user_id, username, balance, last_activity, recent_hands, recent_chips_wagered) 
+            VALUES (?, ?, MAX(0, ?), ?, 0, 0)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username,
-                balance  = MAX(0, balance + ?),
-                last_activity = COALESCE(wallets.last_activity, ?)
-        """, (user_id, user_name, amount, now, amount, now))
+                last_activity = CASE WHEN balance < 50 THEN ? ELSE COALESCE(wallets.last_activity, ?) END,
+                recent_hands = CASE WHEN balance < 50 THEN 0 ELSE COALESCE(wallets.recent_hands, 0) END,
+                recent_chips_wagered = CASE WHEN balance < 50 THEN 0 ELSE COALESCE(wallets.recent_chips_wagered, 0) END,
+                balance  = MAX(0, balance + ?)
+        """, (user_id, user_name, amount, now, now, now, amount))
 
-        # 2. Use your existing chip_log table!
+        # Log the transaction
         await db.execute("""
             INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -309,7 +310,7 @@ async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str
 
         await db.commit()
 
-        # 3. Fetch the new balance
+        # Fetch the new balance
         async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
             row = await c.fetchone()
             return row[0] if row else 0
@@ -1567,7 +1568,7 @@ async def get_inactive_players() -> list[dict]:
             recent_hands,
             recent_chips_wagered
         FROM wallets
-        WHERE (balance > 0 OR pending_cashout > 0)
+        WHERE (balance > 0)
           AND (
               last_activity < ? 
               OR (
@@ -1648,24 +1649,27 @@ async def wipe_inactive_players() -> list[dict]:
     return wiped
 
 
-'''
+
 # ────────────────────────────────────────────────────────────────────────────
 # (optional) WARNING SYSTEM 
 # ────────────────────────────────────────────────────────────────────────────
 
 async def get_players_at_risk() -> list[dict]:
+    """Returns a list of players who will be wiped within the next 24 hours if they don't play."""
     db = await _get_db()
-    wipe_cutoff    = (datetime.utcnow() - timedelta(days=INACTIVITY_DAYS)).isoformat()
-    warning_cutoff = (datetime.utcnow() - timedelta(days=max(0, INACTIVITY_DAYS - 1))).isoformat()
-    async with db.execute("""
-        SELECT user_id, username, balance, pending_cashout, last_activity,
-               recent_hands, recent_chips_wagered
-        FROM wallets
-        WHERE (balance > 0 OR pending_cashout > 0)
-          AND last_activity >= ? AND last_activity < ?
-    """, (wipe_cutoff, warning_cutoff)) as c:
-        return [dict(row) for row in await c.fetchall()]
-'''
+    at_risk = []
+
+    # 🚨 FIXED: Only track players who actually have a playable balance to lose
+    async with db.execute("SELECT user_id FROM wallets WHERE balance > 0") as c:
+        rows = await c.fetchall()
+
+    for r in rows:
+        stats = await get_player_activity_stats(r[0])
+        # If they are at risk AND haven't met the hand requirement yet
+        if stats and stats['is_at_risk'] and not stats['meets_hand_requirement']:
+            at_risk.append(stats)
+
+    return at_risk
 
 
 # ────────────────────────────────────────────────────────────────────────────

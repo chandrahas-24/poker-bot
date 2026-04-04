@@ -2894,43 +2894,43 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(embed=embed)
 
-
     @pokeradmin.command(name="check_inactive", description="[Admin] Check who will be wiped soon")
     async def check_inactive(self, interaction: discord.Interaction):
         if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_ID):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
-        
+
         await interaction.response.defer(ephemeral=False)
-        
-        from database import get_inactive_players
-        
-        # At-risk players (will be wiped soon)
-        # at_risk = await get_players_at_risk()
-        # Already inactive (will be wiped on next check)
-        at_risk = []
+
+        # 🚨 FIXED: Import both functions
+        from database import get_inactive_players, get_players_at_risk
+
+        # 🚨 FIXED: Actually fetch the at-risk list instead of forcing it to []
+        at_risk = await get_players_at_risk()
         inactive = await get_inactive_players()
-        
+
         embed = discord.Embed(title="🔍 Inactivity Report", color=0xe74c3c)
-        
+
         if at_risk:
             risk_lines = []
             for p in at_risk[:10]:  # Show top 10
-                days_ago = (datetime.utcnow() - datetime.fromisoformat(p["last_activity"])).days
+                days_ago = p.get("days_inactive", 0)
                 total = p["balance"] + p["pending_cashout"]
                 risk_lines.append(
                     f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
                 )
             embed.add_field(
-                name=f"⚠️ At Risk ({len(at_risk)} players)",
+                name=f"⚠️ At Risk - Wiping in <24h ({len(at_risk)} players)",
                 value="\n".join(risk_lines) if risk_lines else "None",
                 inline=False
             )
-        
+
         if inactive:
             inactive_lines = []
             for p in inactive[:10]:
-                days_ago = (datetime.utcnow() - datetime.fromisoformat(p["last_activity"])).days
+                raw_date = p["last_activity"]
+                days_ago = (datetime.utcnow() - datetime.fromisoformat(raw_date)).days if isinstance(raw_date,
+                                                                                                     str) else 0
                 total = p["balance"] + p["pending_cashout"]
                 inactive_lines.append(
                     f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
@@ -2940,10 +2940,10 @@ class PokerCog(commands.Cog):
                 value="\n".join(inactive_lines) if inactive_lines else "None",
                 inline=False
             )
-        
+
         if not at_risk and not inactive:
             embed.description = "✅ All players are active! No chips will be wiped."
-        
+
         await interaction.followup.send(embed=embed)
 
 

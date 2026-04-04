@@ -14,7 +14,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 wipe_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
-@tasks.loop(time = wipe_time)
+@tasks.loop(time=wipe_time)
 async def daily_inactive_wipe():
     from database import wipe_inactive_players
     try:
@@ -22,15 +22,19 @@ async def daily_inactive_wipe():
         if wiped:
             channel_id = int(os.getenv("INACTIVITY_CHANNEL_ID", "0"))
             if channel_id:
-                channel = bot.get_channel(channel_id)
-                if channel:
+                try:
+                    # 🚨 FIXED: Use fetch_channel instead of get_channel
+                    channel = await bot.fetch_channel(channel_id)
                     summary = "\n".join([
                         f"• {w['username']}: {w['amount_wiped']} chips ({w['recent_hands']} hands)"
                         for w in wiped[:10]
                     ])
                     await channel.send(
-                        f"Wiped {len(wiped)} inactive player(s):\n{summary}"
+                        f"🧹 **Wiped {len(wiped)} inactive player(s):**\n{summary}"
                     )
+                except Exception as e:
+                    print(f"[Daily Wipe] Failed to send to Discord channel: {e}")
+
             print(f"[Daily Wipe] Wiped {len(wiped)} inactive players")
     except Exception as e:
         print(f"[Daily Wipe] Error: {e}")

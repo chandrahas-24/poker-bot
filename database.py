@@ -1675,13 +1675,12 @@ async def get_players_at_risk() -> list[dict]:
     """O(1) Query to find players on their final warning day."""
     db = await _get_db()
     async with db.execute("""
-        SELECT w.user_id, w.username, w.balance, w.pending_cashout, 
-               IFNULL(s.recent_hands, 0) as recent_hands, 
-               IFNULL(s.recent_chips_wagered, 0) as recent_chips_wagered, 
-               s.last_activity
-        FROM wallets w
-        LEFT JOIN stats s ON w.user_id = s.user_id
-        WHERE (w.balance > 0 OR w.pending_cashout > 0) AND s.last_activity IS NOT NULL
+        SELECT user_id, username, balance, pending_cashout, 
+               IFNULL(recent_hands, 0) as recent_hands, 
+               IFNULL(recent_chips_wagered, 0) as recent_chips_wagered, 
+               last_activity
+        FROM wallets
+        WHERE (balance > 0 OR pending_cashout > 0) AND last_activity IS NOT NULL
     """) as cursor:
         rows = [dict(r) for r in await cursor.fetchall()]
 
@@ -1708,13 +1707,12 @@ async def get_inactive_players() -> list[dict]:
     """O(1) Query to find players who missed the deadline."""
     db = await _get_db()
     async with db.execute("""
-        SELECT w.user_id, w.username, w.balance, w.pending_cashout, 
-               IFNULL(s.recent_hands, 0) as recent_hands, 
-               IFNULL(s.recent_chips_wagered, 0) as recent_chips_wagered, 
-               s.last_activity
-        FROM wallets w
-        LEFT JOIN stats s ON w.user_id = s.user_id
-        WHERE (w.balance > 0 OR w.pending_cashout > 0) AND s.last_activity IS NOT NULL
+        SELECT user_id, username, balance, pending_cashout, 
+               IFNULL(recent_hands, 0) as recent_hands, 
+               IFNULL(recent_chips_wagered, 0) as recent_chips_wagered, 
+               last_activity
+        FROM wallets
+        WHERE (balance > 0 OR pending_cashout > 0) AND last_activity IS NOT NULL
     """) as cursor:
         rows = [dict(r) for r in await cursor.fetchall()]
 

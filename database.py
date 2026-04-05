@@ -91,6 +91,7 @@ async def init_db():
             ("resend_after_msgs", 10),
             ("muck_time", 15),
             ("max_wallet", 0),
+            ("rejoin_fee", 50),
         ]:
             try:
                 await db.execute(
@@ -145,6 +146,35 @@ async def init_db():
             if (await c.fetchone())[0] == 0:
                 await db.execute("INSERT INTO jackpot (id, amount) VALUES (1, 0)")
 
+        # ── Currency Log Table ──
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS currency_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                ts TEXT NOT NULL
+            )
+        """)
+
+        # ── The Magic 500-Row Cleanup Trigger ──
+        # Runs at lightning speed on the SQLite C-engine every time a row is added
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS keep_currency_log_200
+            AFTER INSERT ON currency_log
+            BEGIN
+                DELETE FROM currency_log 
+                WHERE user_id = NEW.user_id 
+                  AND id NOT IN (
+                      SELECT id FROM currency_log 
+                      WHERE user_id = NEW.user_id 
+                      ORDER BY id DESC 
+                      LIMIT 200
+                  );
+            END;
+        """)
+
         # Safely upgrade existing stats table
         for col, default in [
             ("total_tipped", 0),
@@ -188,6 +218,9 @@ async def init_db():
                 hidden      INTEGER DEFAULT 0
             )
         """)
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
         
         await db.commit()
         await init_inactivity_tracking(db)
@@ -234,6 +267,7 @@ async def set_settings(guild_id: int, **kwargs):
     current.setdefault("resend_after_msgs", 10)
     current.setdefault("muck_time", 15)
     current.setdefault("max_wallet", 2000)
+    current.setdefault("rejoin_fee", 50)
     db = await _get_db()
     async with _write_lock:
         await db.execute("""
@@ -255,7 +289,8 @@ async def set_settings(guild_id: int, **kwargs):
                 log_channel_id    = :log_channel_id,
                 turn_timeout      = :turn_timeout,
                 resend_after_msgs = :resend_after_msgs,
-                muck_time         = :muck_time
+                muck_time         = :muck_time,
+                rejoin_fee        = :rejoin_fee
         """, current)
         await db.commit()
 
@@ -634,6 +669,8 @@ async def reset_database(admin_id: int, admin_name: str):
         await db.execute("DELETE FROM poker_bans")
         await db.execute("DELETE FROM house_revenue")  # <-- FIXED: Clears the revenue tracker
         await db.execute("DELETE FROM player_cosmetics")
+        await db.execute("DELETE FROM currency_log")
+        await db.execute("DELETE FROM custom_cosmetics")
         await db.execute("DELETE FROM jackpot")
         await db.execute("INSERT INTO jackpot (id, amount) VALUES (1, 0)")
         await db.execute("""
@@ -718,6 +755,45 @@ async def adjust_jackpot(amount: int):
             "UPDATE jackpot SET amount = MAX(0, amount + ?) WHERE rowid = (SELECT MIN(rowid) FROM jackpot)", (amount,))
         await db.commit()
 
+async def pay_jackpot(user_id: int, username: str, amount: int, reason: str) -> int:
+    """
+    Atomically deduct `amount` from the jackpot and credit the player's wallet.
+    Returns the actual amount paid (may be less than requested if jackpot is small).
+    """
+    db = await _get_db()
+    async with _write_lock:
+        # Read current jackpot
+        async with db.execute("SELECT amount FROM jackpot WHERE rowid = (SELECT MIN(rowid) FROM jackpot)") as c:
+            row = await c.fetchone()
+            current = row[0] if row else 0
+
+        actual = min(amount, current)
+        if actual <= 0:
+            return 0
+
+        # Deduct from jackpot
+        await db.execute(
+            "UPDATE jackpot SET amount = amount - ? WHERE rowid = (SELECT MIN(rowid) FROM jackpot)",
+            (actual,)
+        )
+        # Credit wallet
+        now = datetime.utcnow().isoformat()
+        await db.execute("""
+            INSERT INTO wallets (user_id, username, balance, last_activity)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                balance  = balance + ?
+        """, (user_id, username, actual, now, actual))
+        # Audit log
+        await db.execute("""
+            INSERT INTO audit_log (ts, action, user_id, user_name, detail)
+            VALUES (?, 'JACKPOT_PAYOUT', ?, ?, ?)
+        """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), user_id, username,
+              f"{reason}: {actual:,} chips paid out (jackpot was {current:,})"))
+        await db.commit()
+
+    return actual
 
 async def get_revenue_stats() -> dict:
     db = await _get_db()
@@ -810,6 +886,7 @@ RARITY_LABEL = {
     "common":    "Common",
     "uncommon":   "Uncommon",
     "rare":       "Rare",
+    "epic":       "Epic",
     "legendary":  "Legendary",
     "unique":     "Unique",
 }
@@ -837,13 +914,13 @@ TITLES: dict[str, dict] = {
     "champion": {
         "display": "🏆 Champion",
         "description": "Win 500 hands",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     "stupidly_rich": {
         "display": "💸 Stupidly Rich",
         "description": "Net gain of +50,000 chips all-time",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     "hot_streak": {
@@ -855,13 +932,13 @@ TITLES: dict[str, dict] = {
     "unstoppable": {
         "display": "⚡ Unstoppable",
         "description": "Win 10 hands in a row",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     "lucky": {
         "display": "🍀 Lucky",
         "description": "Win 5 hands with pocket aces",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     "all_in_hero": {
@@ -873,19 +950,19 @@ TITLES: dict[str, dict] = {
     "quad_win": {
         "display": "Fantastic Four",
         "description": "Win a hand with Four of a Kind",
-        "rarity": "rare",
+        "rarity": "epic",
         "hidden": False,
     },
     "quads_4": {
         "display": "QuadQuadQuadQuad",
         "description": "Win four hands with Four of a Kind",
-        "rarity": "rare",
+        "rarity": "epic",
         "hidden": False,
     },
     "suited_up": {
         "display": "♠ Suited up.",
         "description": "Win a hand with a Straight Flush",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     "rf_win": {
@@ -896,6 +973,13 @@ TITLES: dict[str, dict] = {
     },
     
     # ── Legendary rare drops ────────────────────────────────────────────────
+    "sarosmommy": {
+        "display": "👶 Saroshi's Mommy",
+        "description": "super secret formula sauce, congrats pro user",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
     "blessed": {
         "display": "🌟 Blessed",
         "description": "Favored by the poker gods. Extremely rare.",
@@ -936,6 +1020,12 @@ WIN_MESSAGES: dict[str, dict] = {
         "hidden": False,
     },
     # ── Achievement unlocks ─────────────────────────────────────────────────
+    "densacasino": {
+        "display": "den is a casino",
+        "description": "welcome to the casino. saroshi approved. trust.",
+        "rarity": "uncommon",
+        "hidden": False,
+    },
     "noobs": {
         "display": "🇱 noobs",
         "description": "Play 50 hands",
@@ -969,13 +1059,13 @@ WIN_MESSAGES: dict[str, dict] = {
     "skill_issue": {
         "display": "🧠 Skill issue",
         "description": "Win 3 hands with pocket aces",
-        "rarity": "rare",
+        "rarity": "epic",
         "hidden": False,
     },
     "touch_grass": {
         "display": "🌿 Touch grass",
         "description": "Play 5000 hands",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     "meow": {
@@ -987,22 +1077,36 @@ WIN_MESSAGES: dict[str, dict] = {
     "quad_winmsg": {
         "display": "Quad squad",
         "description": "Win a hand with Four of a Kind",
-        "rarity": "uncommon",
+        "rarity": "epic",
         "hidden": False,
     },
     "straight_shit": {
         "display": "Got that shit straight 🗣",
         "description": "Win a hand with a Straight Flush",
-        "rarity": "rare",
+        "rarity": "epic",
         "hidden": False,
     },
     "rf_winmsg": {
         "display": "👑 Peak poker achieved",
         "description": "Win a hand with a Royal Flush",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     # ── Legendary rare drop ─────────────────────────────────────────────────
+    "egirl_ace_winmsg": {
+        "display": "uhh... congrats! you can now defile the server owner",
+        "description": "yeah.",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "noo": {
+        "display": "\"NOOOO STOP\" - saroshi, the egirl",
+        "description": "saroshi loves his egirl card",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
     "touched_by_aces": {
         "display": "✨ The cards chose me",
         "description": "??? (extremely rare drop)",
@@ -1107,10 +1211,20 @@ async def unlock_cosmetic(user_id: int, kind: str, cosmetic_id: str) -> bool:
             VALUES (?, '[]', '["gg"]')
             ON CONFLICT(user_id) DO NOTHING
         """, (user_id,))
-        await db.execute(
-            f"UPDATE player_cosmetics SET {col} = ? WHERE user_id = ?",
-            (json.dumps(cosmetics[key]), user_id)
-        )
+        # Atomic additive merge: appends cosmetic_id to the existing JSON array in the DB,
+        # so no concurrent write from check_achievements can silently drop it.
+        await db.execute(f"""
+            UPDATE player_cosmetics
+            SET {col} = (
+                SELECT json_group_array(value)
+                FROM (
+                    SELECT value FROM json_each({col})
+                    UNION
+                    SELECT ?
+                )
+            )
+            WHERE user_id = ?
+        """, (cosmetic_id, user_id))
         await db.commit()
     return True
  
@@ -1426,13 +1540,29 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         return []
 
     # ── 3. One write: persist all newly unlocked cosmetics together ───────────
+    # Uses JSON UNION merge so any cosmetics written by other paths (grant_cosmetic,
+    # unlock_cosmetic) between our read and this write are preserved, never overwritten.
     async with _write_lock:
         await db.execute("""
             INSERT INTO player_cosmetics (user_id, unlocked_titles, unlocked_win_msgs)
             VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                unlocked_titles  = excluded.unlocked_titles,
-                unlocked_win_msgs = excluded.unlocked_win_msgs
+                unlocked_titles   = (
+                    SELECT json_group_array(value)
+                    FROM (
+                        SELECT value FROM json_each(player_cosmetics.unlocked_titles)
+                        UNION
+                        SELECT value FROM json_each(excluded.unlocked_titles)
+                    )
+                ),
+                unlocked_win_msgs = (
+                    SELECT json_group_array(value)
+                    FROM (
+                        SELECT value FROM json_each(player_cosmetics.unlocked_win_msgs)
+                        UNION
+                        SELECT value FROM json_each(excluded.unlocked_win_msgs)
+                    )
+                )
         """, (user_id, json.dumps(new_titles), json.dumps(new_msgs)))
         await db.commit()
 
@@ -1541,54 +1671,70 @@ async def reset_activity_counters(user_id: int):
         await db.commit()
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# INACTIVITY DETECTION
-# ────────────────────────────────────────────────────────────────────────────
+async def get_players_at_risk() -> list[dict]:
+    """O(1) Query to find players on their final warning day."""
+    db = await _get_db()
+    async with db.execute("""
+        SELECT w.user_id, w.username, w.balance, w.pending_cashout, 
+               IFNULL(s.recent_hands, 0) as recent_hands, 
+               IFNULL(s.recent_chips_wagered, 0) as recent_chips_wagered, 
+               s.last_activity
+        FROM wallets w
+        LEFT JOIN stats s ON w.user_id = s.user_id
+        WHERE (w.balance > 0 OR w.pending_cashout > 0) AND s.last_activity IS NOT NULL
+    """) as cursor:
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+    at_risk = []
+    now = datetime.utcnow()
+    for r in rows:
+        try:
+            last_active = datetime.fromisoformat(r['last_activity'])
+            days_inactive = (now - last_active).days
+
+            meets_hands = r['recent_hands'] >= MIN_HANDS_PER_PERIOD
+            meets_wager = r['recent_chips_wagered'] >= MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else True
+
+            # If they missed requirements AND are exactly 1 day away from wipe
+            if not (meets_hands and meets_wager) and days_inactive == (INACTIVITY_DAYS - 1):
+                r['days_inactive'] = days_inactive
+                at_risk.append(r)
+        except Exception:
+            continue
+    return at_risk
+
 
 async def get_inactive_players() -> list[dict]:
-    """
-    Find players who are truly inactive (not gaming the system).
-
-    Returns list of players who:
-    1. Haven't been active for INACTIVITY_DAYS + GRACE_PERIOD_DAYS
-    2. OR have been "active" but below minimum thresholds (cheese detection)
-    """
+    """O(1) Query to find players who missed the deadline."""
     db = await _get_db()
-    cutoff_date = datetime.utcnow() - timedelta(days=INACTIVITY_DAYS + GRACE_PERIOD_DAYS)
-    cutoff_iso = cutoff_date.isoformat()
-
-    # Find players with old activity date AND insufficient engagement
     async with db.execute("""
-        SELECT 
-            user_id, 
-            username, 
-            balance,
-            pending_cashout,
-            last_activity,
-            recent_hands,
-            recent_chips_wagered
-        FROM wallets
-        WHERE (balance > 0)
-          AND (
-              last_activity < ? 
-              OR (
-                  last_activity < ? 
-                  AND recent_hands < ?
-              )
-              OR (
-                  last_activity < ?
-                  AND recent_chips_wagered < ?
-              )
-          )
-    """, (
-            cutoff_iso,  # Truly inactive
-            (datetime.utcnow() - timedelta(days=INACTIVITY_DAYS)).isoformat(),  # Active but not enough hands
-            MIN_HANDS_PER_PERIOD,
-            (datetime.utcnow() - timedelta(days=INACTIVITY_DAYS)).isoformat(),  # Active but not enough wagered
-            MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else -1  # Disable if 0
-    )) as c:
-        return [dict(row) for row in await c.fetchall()]
+        SELECT w.user_id, w.username, w.balance, w.pending_cashout, 
+               IFNULL(s.recent_hands, 0) as recent_hands, 
+               IFNULL(s.recent_chips_wagered, 0) as recent_chips_wagered, 
+               s.last_activity
+        FROM wallets w
+        LEFT JOIN stats s ON w.user_id = s.user_id
+        WHERE (w.balance > 0 OR w.pending_cashout > 0) AND s.last_activity IS NOT NULL
+    """) as cursor:
+        rows = [dict(r) for r in await cursor.fetchall()]
 
+    inactive = []
+    now = datetime.utcnow()
+    for r in rows:
+        try:
+            last_active = datetime.fromisoformat(r['last_activity'])
+            days_inactive = (now - last_active).days
+
+            meets_hands = r['recent_hands'] >= MIN_HANDS_PER_PERIOD
+            meets_wager = r['recent_chips_wagered'] >= MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else True
+
+            # If they missed requirements AND their time is up
+            if not (meets_hands and meets_wager) and days_inactive >= INACTIVITY_DAYS:
+                r['days_inactive'] = days_inactive
+                inactive.append(r)
+        except Exception:
+            continue
+    return inactive
 
 async def wipe_inactive_players() -> list[dict]:
     # Wipe chips from inactive players and return the list of affected users.
@@ -1649,47 +1795,6 @@ async def wipe_inactive_players() -> list[dict]:
     return wiped
 
 
-
-# ────────────────────────────────────────────────────────────────────────────
-# (optional) WARNING SYSTEM 
-# ────────────────────────────────────────────────────────────────────────────
-
-async def get_players_at_risk() -> list[dict]:
-    """Returns a list of players who will be wiped within the next 24 hours if they don't play."""
-    db = await _get_db()
-    at_risk = []
-
-    # 🚨 FIXED: Only track players who actually have a playable balance to lose
-    async with db.execute("SELECT user_id FROM wallets WHERE balance > 0") as c:
-        rows = await c.fetchall()
-
-    for r in rows:
-        stats = await get_player_activity_stats(r[0])
-        # If they are at risk AND haven't met the hand requirement yet
-        if stats and stats['is_at_risk'] and not stats['meets_hand_requirement']:
-            at_risk.append(stats)
-
-    return at_risk
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# BACKGROUND TASK FOR BOT
-# ────────────────────────────────────────────────────────────────────────────
-
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# INTEGRATION POINTS
-# ────────────────────────────────────────────────────────────────────────────
-
-"""
-OPTIONAL: Add admin command to manually check status:
-    @app_commands.command(name="activity_check")
-    async def activity_check(self, interaction: discord.Interaction, user: discord.Member = None):
-        target = user or interaction.user
-        stats = await get_player_activity_stats(target.id)
-        # Display stats...
-"""
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1780,3 +1885,28 @@ async def sync_chips_in_play(player_chip_map: dict[int, int]):
                     "DELETE FROM chips_in_play WHERE user_id=?", (user_id,)
                 )
         await db.commit()
+
+
+# ── Currency Log ──────────────────────────────────────────────────────────────
+
+async def log_currency_event(user_id: int, event_type: str, amount: int, description: str):
+    """
+    Logs a transaction.
+    event_type should be: 'Hands', 'Cash Ins', 'Cash Outs', 'Tips', 'Jackpots', or 'Wipes'
+    """
+    if amount == 0:
+        return  # Don't clutter the log with 0-chip events
+
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO currency_log (user_id, event_type, amount, description, ts)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, event_type, amount, description, datetime.utcnow().isoformat()))
+        await db.commit()
+
+async def get_currency_logs(user_id: int) -> list[dict]:
+    """Fetch all currency logs for a user."""
+    db = await _get_db()
+    async with db.execute("SELECT * FROM currency_log WHERE user_id = ? ORDER BY id DESC", (user_id,)) as c:
+        return [dict(r) for r in await c.fetchall()]

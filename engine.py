@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum, auto
 from math import ceil
+import random
 
 evaluator = Evaluator()
 
@@ -36,6 +37,7 @@ class PokerPlayer:
     acted:         bool = False
     sitting_out:   bool = False
     pending_rebuy: int  = 0
+    egirl_saro:    bool = False
 
     def reset_for_hand(self):
         self.hole_cards  = []
@@ -45,6 +47,7 @@ class PokerPlayer:
         self.all_in      = False
         self.acted       = False
         self.sitting_out = False
+        self.egirl_saro  = False
 
     def reset_for_street(self):
         self.bet   = 0
@@ -92,6 +95,7 @@ class PokerGame:
         self.side_pots:      list[SidePot]     = []
         self.banned_users:   list[int]         = []  # global table ban
         self.kicked_users:   list[int]         = []  # pending kick (force leave after hand)
+        self.egirl_saro_holders: set[int]      = set() # players dealt the ace variant
 
     # Lobby
 
@@ -194,8 +198,16 @@ class PokerGame:
         self.current_bet           = self.BIG_BLIND
         self.players[bb_idx].acted = False
 
+        _ACE_OF_SPADES = Card.new('As')
+        _EGIRL_CHANCE  = 0.0002
+        self.egirl_saro_holders.clear()
         for p in self.players:
             p.hole_cards = self.deck.draw(2)
+
+            if _ACE_OF_SPADES in p.hole_cards:
+                if random.random() < _EGIRL_CHANCE:
+                    p.egirl_saro = True
+                    self.egirl_saro_holders.add(p.user_id)
 
         start            = (bb_idx + 1) % n
         self.current_idx = self._next_active_idx(start)
@@ -533,10 +545,10 @@ class PokerGame:
                 label = "Main pot" if i == 0 else f"Side pot {i}"
                 each  = amt // len(winners)
                 if len(winners) == 1:
-                    lines.append(f"🏆 **{label}** ({amt}<:poker_chip:1488128491881758760>): **{winners[0].display_name}**")
+                    lines.append(f"🏆 **{label}** ({amt}<:poker_chip:1490458259855773707> ): **{winners[0].display_name}**")
                 else:
                     names = ", ".join(w.display_name for w in winners)
-                    lines.append(f"🤝 **{label}** ({amt}<:poker_chip:1488128491881758760>): **{names}** ({each}<:poker_chip:1488128491881758760> each)")
+                    lines.append(f"🤝 **{label}** ({amt}<:poker_chip:1490458259855773707> ): **{names}** ({each}<:poker_chip:1490458259855773707>  each)")
 
         seen        = set()
         all_winners = []

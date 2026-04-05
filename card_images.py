@@ -7,7 +7,7 @@ File naming: 2_of_clubs.png, king_of_hearts.png, ace_of_spades.png, back.png
 
 import os, io
 import discord
-from PIL import Image, ImageOps
+from PIL import Image
 from treys import Card
 
 CARDS_DIR   = os.path.join(os.path.dirname(__file__), "cards")
@@ -22,8 +22,10 @@ RANK_NAMES = {
 SUIT_NAMES = {'s': 'spades', 'h': 'hearts', 'd': 'diamonds', 'c': 'clubs'}
 
 # ── Cache for pre-resized cards (loaded once at startup) ──────────────────────
+_ACE_OF_SPADES_INT: int = Card.new('As')
 _card_cache: dict[int, Image.Image] = {}
 _back_cache: Image.Image | None = None
+_egirl_saro_cache: Image.Image | None = None
 _cache_loaded = False
 
 def card_filename(card_int: int) -> str:
@@ -77,17 +79,25 @@ def _load_cache():
     if os.path.exists(back):
         _back_cache = _resize(back)
 
+    global _egirl_saro_cache
+    egirl_saro_path = os.path.join(CARDS_DIR, "egirl_ace_of_spades.png")
+    if os.path.exists(egirl_saro_path):
+        _egirl_saro_cache = _resize(egirl_saro_path)
+        print("egirl saro cached")
+
     _cache_loaded = True
     print(f"✅ Cached {len(_card_cache)} cards + back in memory")
 
 
-def make_strip(card_ints: list[int], backs: int = 0, is_hole: bool = False) -> discord.File:
+def make_strip(card_ints: list[int], backs: int = 0, is_hole: bool = False, egirl_saro: bool = False) -> discord.File:
     """
     Stitch all cards into one small horizontal strip PNG and return as a File.
     Uses pre-loaded cache — no disk I/O or resampling at call time.
     """
     # Use cached images if available, fall back to live resize if cache missed
     def _get_card(card_int: int) -> Image.Image:
+        if egirl_saro and card_int == _ACE_OF_SPADES_INT and _egirl_saro_cache is not None:
+            return _egirl_saro_cache.copy()
         if card_int in _card_cache:
             return _card_cache[card_int].copy()
         return _resize(card_path(card_int))

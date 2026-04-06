@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 from database import init_db, recover_chips_in_play
 from discord.ext import tasks
 import datetime
-/**/
 
 load_dotenv()
 

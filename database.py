@@ -1781,6 +1781,11 @@ async def wipe_inactive_players() -> list[dict]:
                 f"Wiped {total_wiped} chips after {INACTIVITY_DAYS}+ days inactive (hands: {player['recent_hands']}, wagered: {player['recent_chips_wagered']})"
             ))
 
+            await db.execute("""
+                            INSERT INTO currency_log (user_id, event_type, amount, description, ts)
+                            VALUES (?, 'Wipe', ?, 'Inactivity Wipe', ?)
+                        """, (user_id, -total_wiped, now))
+
             wiped.append({
                 "user_id": user_id,
                 "username": username,

@@ -3168,7 +3168,7 @@ class PokerCog(commands.Cog):
             risk_lines = []
             for p in at_risk[:10]:  # Show top 10
                 days_ago = p.get("days_inactive", 0)
-                total = p["balance"] + p["pending_cashout"]
+                total = p["balance"]
                 risk_lines.append(
                     f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
                 )
@@ -3184,7 +3184,7 @@ class PokerCog(commands.Cog):
                 raw_date = p["last_activity"]
                 days_ago = (datetime.utcnow() - datetime.fromisoformat(raw_date)).days if isinstance(raw_date,
                                                                                                      str) else 0
-                total = p["balance"] + p["pending_cashout"]
+                total = p["balance"]
                 inactive_lines.append(
                     f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
                 )

@@ -862,7 +862,7 @@ async def sweep_all_wallets() -> list[tuple[int, str, int]]:
     async with _write_lock:
         # Get everyone who has usable balance OR pending cashouts
         async with db.execute(
-                "SELECT user_id, username, balance, pending_cashout FROM wallets WHERE balance > 0 OR pending_cashout > 0") as c:
+                "SELECT user_id, username, balance, pending_cashout FROM wallets WHERE balance > 0") as c:
             rows = await c.fetchall()
 
         payouts = []
@@ -1682,7 +1682,7 @@ async def get_players_at_risk() -> list[dict]:
                IFNULL(recent_chips_wagered, 0) as recent_chips_wagered, 
                last_activity
         FROM wallets
-        WHERE (balance > 0 OR pending_cashout > 0) AND last_activity IS NOT NULL
+        WHERE (balance > 0) AND last_activity IS NOT NULL
     """) as cursor:
         rows = [dict(r) for r in await cursor.fetchall()]
 
@@ -1714,7 +1714,7 @@ async def get_inactive_players() -> list[dict]:
                IFNULL(recent_chips_wagered, 0) as recent_chips_wagered, 
                last_activity
         FROM wallets
-        WHERE (balance > 0 OR pending_cashout > 0) AND last_activity IS NOT NULL
+        WHERE (balance > 0) AND last_activity IS NOT NULL
     """) as cursor:
         rows = [dict(r) for r in await cursor.fetchall()]
 

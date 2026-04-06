@@ -613,9 +613,12 @@ def _slog_result(t: TableState, result):
             sign = "+" if gained > 0 else ""
             slog(t, f"🏆 **{w.display_name}** won **{sign}{gained}** <:poker_chip:1490458259855773707>{rs}")
         else:
-            split = result.pot // max(len(result.winners), 1)
-            names = ", ".join(f"**{w.display_name}**" for w in result.winners)
-            slog(t, f"🤝 Split: {names} each **+{split}** <:poker_chip:1490458259855773707>")
+            names_and_nets = []
+            for w in result.winners:
+                gained = result.chip_deltas.get(w.user_id, 0)
+                sign = "+" if gained > 0 else ""
+                names_and_nets.append(f"**{w.display_name}** ({sign}{gained})")
+            slog(t, f"🤝 Split: {', '.join(names_and_nets)} <:poker_chip:1490458259855773707>")
     else:
         for i, (amt, winners) in enumerate(pot_results):
             label = "Main" if i == 0 else f"Side {i}"
@@ -693,13 +696,14 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
             embed.add_field(name="New Stack", value=f"{w.chips} <:poker_chip:1490458259855773707>", inline=True)
         else:
             # ── True Split Pot ──
-            split = result.pot // len(result.winners)
             desc_lines.append("🤝 **Split Pot!**\n")
             for w in result.winners:
+                gained = result.chip_deltas.get(w.user_id, 0)
+                sign = "+" if gained > 0 else ""
                 rank = ranks.get(w.user_id)
                 rs = f" with **{rank}**" if rank else ""
                 desc_lines.append(
-                    f"• **{w.display_name}**{_title_str(w.user_id)} won **+{split}** <:poker_chip:1490458259855773707>{rs}")
+                    f"• **{w.display_name}**{_title_str(w.user_id)} won **{sign}{gained}** <:poker_chip:1490458259855773707>{rs}")
 
             quotes = _build_quotes(result.winners)
             if quotes:
@@ -830,11 +834,35 @@ async def _process_result(guild, channel, t: TableState):
                 score = evaluator.evaluate(sp.hole_cards, result.community)
                 rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
 
+                # 🚨 NEW: Evaluate both the board's RAW SCORE and its STRING RANK
+                board_score = None
+                board_rank_str = ""
+
+                if len(result.community) == 5:
+                    # Treys needs 5 cards split into two lists to evaluate properly
+                    board_score = evaluator.evaluate(result.community[:2], result.community[2:])
+                    board_rank_str = evaluator.class_to_string(evaluator.get_rank_class(board_score))
+                elif len(result.community) == 4:
+                    # If everyone folds on the Turn, manually check if the 4 cards are Quads
+                    ranks = [Card.get_rank_int(c) for c in result.community]
+                    if len(set(ranks)) == 1:
+                        board_score = score
+                        board_rank_str = "Four of a Kind"
+
+                # 1. QUADS LOGIC (Strict High-Roller Rule)
+                # The board cannot ALREADY be Quads. Kickers do NOT count for the jackpot!
                 if rank_str == "Four of a Kind":
-                    quads_win = True
+                    if board_rank_str != "Four of a Kind":
+                        quads_win = True
+
+                # 2. STRAIGHT FLUSH LOGIC (Dynamic Score Rule)
+                # In treys, a LOWER score is better. If score < board_score, they used a
+                # hole card to construct a HIGHER-RANKING Straight Flush than the board!
                 elif rank_str == "Straight Flush":
-                    sf_win = True
-                    rf_win = (score == 1)
+                    played_board = (board_score is not None) and (score >= board_score)
+                    if not played_board:
+                        sf_win = True
+                        rf_win = (score == 1)
 
             # ── Jackpot payout ───────────────────────────────────────────────
             if won:
@@ -1489,6 +1517,7 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
             try:
                 # 🚨 NEW: 100% of the bypass fee is added directly to the Jackpot
                 await db.adjust_jackpot(self.rejoin_fee)
+                await db.log_currency_event(interaction.user.id, "Jackpot", -self.rejoin_fee, "Paid rejoin bypass fee")
             except Exception:
                 pass
 

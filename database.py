@@ -1004,7 +1004,7 @@ TITLES: dict[str, dict] = {
     },
     
     "bay": {
-        "display": "the won't fix",
+        "display": "ꕹ",
         "description": "",
         "rarity": "unique",
         "hidden": True,

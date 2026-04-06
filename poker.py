@@ -957,7 +957,7 @@ async def _process_result(guild, channel, t: TableState):
                 title="🎰 JACKPOT!!!",
                 description=(
                     f"<@{uid}> triggered **{jp_tier}** and won "
-                    f"**{actual:,}** <:poker_chip:1490458259855773707> "
+                    f"⏣ **{actual:,},000,000** "
                     f"from the jackpot! *(added to wallet)*\n\n"
                     f"Jackpot remaining: **{new_jp:,}** <:poker_chip:1490458259855773707>"
                 ),

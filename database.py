@@ -968,7 +968,7 @@ TITLES: dict[str, dict] = {
     "rf_win": {
         "display": "👑 God's Chosen Emperor",
         "description": "Win a hand with a Royal Flush",
-        "rarity": "legendary",
+        "rarity": "epic",
         "hidden": False,
     },
     
@@ -977,7 +977,7 @@ TITLES: dict[str, dict] = {
         "display": "👶 Saroshi's Mommy",
         "description": "super secret formula sauce, congrats pro user",
         "rarity": "legendary",
-        "hidden": True,
+        "hidden": False,
     },
 
     "blessed": {
@@ -986,6 +986,7 @@ TITLES: dict[str, dict] = {
         "rarity": "legendary",
         "hidden": False,
     },
+
     "chosen_one": {
         "display": "✨ Chosen One",
         "description": "One in a million. The cards chose you.",
@@ -1514,6 +1515,7 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
     msg_checks = {
         "gg":             True,
         "noobs":          hands_played >= 50,
+        "densacasino":    hands_won >= 3,
         "l_losers":       hands_played >= 500,
         "too_easy":       hands_won    >= 50,
         "not_even_close": hands_won    >= 250,

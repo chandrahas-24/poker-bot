@@ -248,7 +248,6 @@ async def _auto_next_hand(t: TableState, channel):
 
     t.msg_count = 0
     await refresh(channel, t, new_hand=True, cosmetics_cache=t.cosmetics_cache)
-    await _handle_egirl_saro(channel, t)
 
 async def _close_table(channel, t: TableState):
     if getattr(t, 'is_fully_closed', False):
@@ -866,7 +865,7 @@ async def _process_result(guild, channel, t: TableState):
 
             # ── Jackpot payout ───────────────────────────────────────────────
             if won:
-                egirl_win = p.user_id in t.game.egirl_saro_holders
+                egirl_win = p.egirl_saro
                 jp_pct  = 0.0
                 jp_tier = ""
                 if egirl_win:
@@ -3171,10 +3170,11 @@ class PokerCog(commands.Cog):
         await interaction.response.defer(ephemeral=False)
         jp = await db.get_jackpot()
 
-        # 🚨 Calculate splits: 50% Royal Flush, 20% Straight Flush, 5% Rest to Quads
+        # 🚨 Calculate splits: 80% Saroshina 50% Royal Flush, 20% Straight Flush, 5% to Quads
+        egirl_cut = max(2000,math.ceil(jp * 0.8))
         rf_cut = math.ceil(jp * 0.60)
         sf_cut = math.ceil(jp * 0.20)
-        quads_cut = math.ceil(jp * 0.05)  # The rest goes to Quads
+        quads_cut = math.ceil(jp * 0.05)
 
         desc = (
             "_ _\n"
@@ -3182,6 +3182,7 @@ class PokerCog(commands.Cog):
             f"- **Quads** : {quads_cut:,} <:poker_chip:1490458259855773707>\n\n"
             f"- **Straight Flush** : {sf_cut:,} <:poker_chip:1490458259855773707>\n\n"
             f"- **Royal Flush** : {rf_cut:,} <:poker_chip:1490458259855773707>\n\n"
+            f"- **Shiny Card Win** : {egirl_cut:,} <:poker_chip:1490458259855773707>\n\n"
             "_ _"
         )
 
@@ -3192,7 +3193,7 @@ class PokerCog(commands.Cog):
         )
         embed.set_thumbnail(
             url="https://media.discordapp.net/attachments/1478125269285081211/1488098208986038282/3d-casino-poker-cards-and-playing-chips-on-black-background-illustration-free-vector.png?ex=69cb8af4&is=69ca3974&hm=58f")
-        embed.set_footer(text="• 5% Q, 20% SF, 60% RF")
+        embed.set_footer(text="• 5% Q, 20% SF, 60% RF, 80% Shiny (2b min)")
 
         await interaction.followup.send(embed=embed)
 

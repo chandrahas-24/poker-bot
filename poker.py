@@ -1007,14 +1007,14 @@ async def _process_result(guild, channel, t: TableState):
     except Exception as e:
         print(f"[poker] refresh error: {e}")
 
-        # 1. ALWAYS run the reveal phase if there was a showdown, even if closing
-        if result.showdown_players:
-            try:
-                await _reveal_phase(channel, t, result)
-            except Exception as e:
-                print(f"⚠️ Recovered from Discord API crash during reveal: {e}")
+    # 1. ALWAYS run the reveal phase if there was a showdown, even if closing
+    if result.showdown_players:
+        try:
+            await _reveal_phase(channel, t, result)
+        except Exception as e:
+            print(f"⚠️ Recovered from Discord API crash during reveal: {e}")
 
-        t.game._hand_result = None
+    t.game._hand_result = None
 
     # 2. THEN check if we need to close the table or schedule the next hand
     await _handle_egirl_saro(channel, t)

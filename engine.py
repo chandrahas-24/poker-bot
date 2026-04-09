@@ -70,6 +70,7 @@ class HandResult:
     showdown_players: list = None  # snapshot of all non-folded players at showdown
     is_over: bool = False
     tax: int = 0
+    allin_user_ids: set = None
 
 class PokerGame:
     SMALL_BLIND = 25
@@ -573,6 +574,7 @@ class PokerGame:
             winner_ranks=winner_ranks,
             pot_results=pot_results,
             showdown_players=list(alive),
+            allin_user_ids={p.user_id for p in alive if p.all_in},
             tax=total_tax# snapshot before _end_hand clears state
         )
         self._end_hand()

@@ -825,7 +825,7 @@ async def _process_result(guild, channel, t: TableState):
             if won and p.hole_cards:
                 pocket_aces = [Card.int_to_str(c)[0] for c in p.hole_cards].count('A') == 2
 
-            all_in_win = bool(won and sp and sp.all_in)
+            all_in_win = bool(won and result.allin_user_ids and p.user_id in result.allin_user_ids)
 
             quads_win = sf_win = rf_win = False
 
@@ -1007,11 +1007,14 @@ async def _process_result(guild, channel, t: TableState):
     except Exception as e:
         print(f"[poker] refresh error: {e}")
 
-    # 1. ALWAYS run the reveal phase if there was a showdown, even if closing
-    if result.showdown_players:
-        await _reveal_phase(channel, t, result)
+        # 1. ALWAYS run the reveal phase if there was a showdown, even if closing
+        if result.showdown_players:
+            try:
+                await _reveal_phase(channel, t, result)
+            except Exception as e:
+                print(f"⚠️ Recovered from Discord API crash during reveal: {e}")
 
-    t.game._hand_result = None
+        t.game._hand_result = None
 
     # 2. THEN check if we need to close the table or schedule the next hand
     await _handle_egirl_saro(channel, t)
@@ -1547,6 +1550,46 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
         await refresh(interaction.channel, t)
         await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
 
+
+class LeaveConfirmView(discord.ui.View):
+    """Ephemeral prompt shown when a player clicks Leave."""
+
+    def __init__(self, t: TableState):
+        super().__init__(timeout=30)
+        self.t = t
+
+    @discord.ui.button(label="Yes, Leave", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.t.closing:
+            return await interaction.response.edit_message(content="❌ Table is closing anyway.", view=None)
+
+        chips_back, msg = self.t.game.remove_player(interaction.user.id)
+
+        # 1. DEFER IMMEDIATELY BEFORE DB WRITES
+        await interaction.response.defer()
+
+        # 2. Safely write to DB
+        if chips_back > 0:
+            await db.return_chips(interaction.user.id, chips_back)
+            await db.clear_chips_in_play(interaction.user.id)
+
+        if "will leave" in msg:
+            self.t.leave_cooldown_pending.add(interaction.user.id)
+            await interaction.channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
+        elif "left" in msg or "cashed out" in msg:
+            self.t.rejoin_cooldowns[interaction.user.id] = time.time() + 600
+            await interaction.channel.send(
+                f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
+
+        await interaction.edit_original_response(content="✅ You left the table.", view=None)
+        await refresh(interaction.channel, self.t)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="❌ Leave cancelled.", view=None)
+        self.stop()
+
 # ── Game View ─────────────────────────────────────────────────────────────────
 
 class GameView(discord.ui.View):
@@ -1643,42 +1686,30 @@ class GameView(discord.ui.View):
     async def btn_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.t.closing:
             await interaction.response.send_message("❌ Table is closing — your chips will be returned automatically.",
-                                                    ephemeral=True);
+                                                    ephemeral=True)
             return
         if interaction.user.id in self.t.game.kicked_users:
             await interaction.response.send_message("❌ You have been kicked and will be removed after this hand.",
-                                                    ephemeral=True);
+                                                    ephemeral=True)
             return
         if interaction.user.id in self.t.game.pending_leaves:
             await interaction.response.send_message("❌ You are already queued to leave after this hand.",
-                                                    ephemeral=True);
+                                                    ephemeral=True)
             return
+
         p = self.t.game.get_player(interaction.user.id)
         pj = next((pj for pj in self.t.game.pending_joins if pj.user_id == interaction.user.id), None)
         if not p and not pj:
-            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True);
+            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True)
             return
 
-        chips_back, msg = self.t.game.remove_player(interaction.user.id)
-
-        # 1. DEFER IMMEDIATELY BEFORE DB WRITES
-        await interaction.response.defer()
-
-        # 2. Safely write to DB
-        if chips_back > 0:
-            await db.return_chips(interaction.user.id, chips_back)
-            await db.clear_chips_in_play(interaction.user.id)
-
-        if "will leave" in msg:
-            # Queued — cooldown will be applied in _process_result when they are actually removed
-            self.t.leave_cooldown_pending.add(interaction.user.id)
-            await interaction.channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
-        elif "left" in msg or "cashed out" in msg:
-            # Immediate removal — start cooldown now
-            self.t.rejoin_cooldowns[interaction.user.id] = time.time() + 600
-            await interaction.channel.send(
-                f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
-        await refresh(interaction.channel, self.t)
+        # 🚨 Trigger the completely private ephemeral confirmation prompt!
+        view = LeaveConfirmView(self.t)
+        await interaction.response.send_message(
+            "⚠️ Are you sure you want to leave?\n*(This will trigger a 10-minute rejoin cooldown!)*",
+            view=view,
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Call",  style=discord.ButtonStyle.green,  row=1)
     async def btn_call(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1841,7 +1872,8 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict):
         rarity = db.RARITY_LABEL.get(info["rarity"], "")
         if tid in owned_titles:
             equipped = "  ◀ **equipped**" if tid == active_t else ""
-            t_lines.append(f"✅ {info['display']} {rarity}{equipped}")
+            desc = f" — *{info['description']}*" if info.get('description') else ""
+            t_lines.append(f"✅ {info['display']} {rarity}{desc}{equipped}")
         else:
             desc = info['description'] if info['rarity'] != 'legendary' else "???"
             t_lines.append(f"🔒 ~~{info['display']}~~ — *{desc}*")
@@ -1859,7 +1891,8 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict):
         rarity = db.RARITY_LABEL.get(info["rarity"], "")
         if mid in owned_msgs:
             equipped = "  ◀ **equipped**" if mid == active_m else ""
-            m_lines.append(f"✅ {info['display']} {rarity}{equipped}")
+            desc = f" — *{info['description']}*" if info.get('description') else ""
+            m_lines.append(f"✅ {info['display']} {rarity}{desc}{equipped}")
         else:
             desc = info['description'] if info['rarity'] != 'legendary' else "???"
             m_lines.append(f"🔒 ~~{info['display']}~~ — *{desc}*")
@@ -2620,7 +2653,6 @@ class PokerCog(commands.Cog):
     @poker.command(name="stats", description="View your poker stats")
     @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
     async def stats(self, interaction: discord.Interaction, hidden: bool = False):
-        # 1. Defer using the user's choice
         await interaction.response.defer(ephemeral=hidden)
 
         row = await db.get_player_stats(interaction.user.id)
@@ -2628,27 +2660,12 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("No stats yet!", ephemeral=hidden)
             return
 
-        # FETCH THE RANK
         rank = await db.get_player_rank(interaction.user.id)
         rank_str = f"#{rank}" if rank else "Unranked"
 
-        net = row['net_chips']
-
-        # 🎨 Added the rank directly into the Title to keep the grid clean
-        embed = discord.Embed(title=f"📊 Stats — {row['username']}",
-                              color=0x2ecc71 if net >= 0 else 0xe74c3c)
-
-        wp = f"{row['hands_won'] / row['hands_played'] * 100:.1f}%" if row['hands_played'] else "—"
-
-        embed.add_field(name="Rank", value=str(rank_str), inline=True)
-        embed.add_field(name="Hands", value=str(row['hands_played']), inline=True)
-        embed.add_field(name="Win %", value=wp, inline=True)
-        embed.add_field(name="Net", value=f"{'+' if net >= 0 else ''}{net} <:poker_chip:1490458259855773707>", inline=True)
-        embed.add_field(name="Wallet", value=f"{row['wallet']} <:poker_chip:1490458259855773707>", inline=True)
-        embed.add_field(name="Tipped", value=f"{row.get('total_tipped', 0):,} <:poker_chip:1490458259855773707>", inline=True)
-
-        # 2. Send the final embed using the user's choice
-        await interaction.followup.send(embed=embed, ephemeral=hidden)
+        # Fire up the interactive View!
+        view = StatsView(interaction.user, row, rank_str)
+        await interaction.followup.send(embed=view.build_basic_embed(), view=view, ephemeral=hidden)
 
     # ── Manager settings commands ─────────────────────────────────────────
     @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
@@ -3613,6 +3630,70 @@ class PokerCog(commands.Cog):
 
         view = CurrencyLogView(interaction.user, logs)
         await interaction.followup.send(embed=view.build_embed(), view=view)
+
+
+class StatsView(discord.ui.View):
+    def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
+        super().__init__(timeout=120)
+        self.user = user
+        self.row = row
+        self.rank_str = rank_str
+
+    def build_basic_embed(self) -> discord.Embed:
+        net = self.row['net_chips']
+        embed = discord.Embed(title=f"Player Stats — {self.row['username']}", color=0x2ecc71 if net >= 0 else 0xe74c3c)
+
+        wp = f"{self.row['hands_won'] / self.row['hands_played'] * 100:.1f}%" if self.row['hands_played'] else "—"
+
+        embed.add_field(name="Rank", value=str(self.rank_str), inline=True)
+        embed.add_field(name="Hands Played", value=str(self.row['hands_played']), inline=True)
+        embed.add_field(name="Win %", value=wp, inline=True)
+
+        # 🚨 Custom poker chips restored for currency values
+        embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,} <:poker_chip:1490458259855773707>",
+                        inline=True)
+        embed.add_field(name="Wallet Balance", value=f"{self.row['wallet']:,} <:poker_chip:1490458259855773707>",
+                        inline=True)
+        embed.add_field(name="Total Tipped",
+                        value=f"{self.row.get('total_tipped', 0):,} <:poker_chip:1490458259855773707>", inline=True)
+        return embed
+
+    def build_highlights_embed(self) -> discord.Embed:
+        embed = discord.Embed(title=f"Career Highlights — {self.row['username']}", color=0x2b2d31)
+
+        # 🚨 Clean text formatting with zero emoji spam
+        highlights = (
+            f"**Current Win Streak:** `{self.row['win_streak']}`\n"
+            f"**Best Win Streak:** `{self.row['max_win_streak']}`\n"
+            f"**Pocket Aces Wins:** `{self.row['pocket_aces_wins']}`\n"
+            f"**All-In Wins:** `{self.row['all_in_wins']}`\n"
+            f"**Four of a Kind:** `{self.row['quads_wins']}`\n"
+            f"**Straight Flush:** `{self.row['straight_flush_wins']}`\n"
+            f"**Royal Flush:** `{self.row['royal_flush_wins']}`\n"
+        )
+
+        if self.row.get('times_wiped', 0) > 0:
+            highlights += f"**Times Wiped:** `{self.row['times_wiped']}`"
+
+        embed.description = highlights
+        return embed
+
+    # 🚨 UI Button emojis restored
+    @discord.ui.button(label="Basic Stats", style=discord.ButtonStyle.blurple, disabled=True)
+    async def btn_basic(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        self.btn_basic.disabled = True
+        self.btn_highlights.disabled = False
+        await interaction.response.edit_message(embed=self.build_basic_embed(), view=self)
+
+    @discord.ui.button(label="Highlights", style=discord.ButtonStyle.gray)
+    async def btn_highlights(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        self.btn_basic.disabled = False
+        self.btn_highlights.disabled = True
+        await interaction.response.edit_message(embed=self.build_highlights_embed(), view=self)
 
 
 class CurrencyLogView(discord.ui.View):

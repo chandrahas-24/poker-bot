@@ -491,13 +491,20 @@ async def get_player_stats(user_id: int) -> dict | None:
         SELECT s.username, s.hands_played, s.hands_won, s.chips_won, s.chips_lost,
                COALESCE(s.total_tipped, 0) AS total_tipped,
                (s.chips_won - s.chips_lost) AS net_chips,
-               COALESCE(w.balance, 0) AS wallet
+               COALESCE(w.balance, 0) AS wallet,
+               COALESCE(s.win_streak, 0) AS win_streak,
+               COALESCE(s.max_win_streak, 0) AS max_win_streak,
+               COALESCE(s.pocket_aces_wins, 0) AS pocket_aces_wins,
+               COALESCE(s.all_in_wins, 0) AS all_in_wins,
+               COALESCE(s.quads_wins, 0) AS quads_wins,
+               COALESCE(s.straight_flush_wins, 0) AS straight_flush_wins,
+               COALESCE(s.royal_flush_wins, 0) AS royal_flush_wins,
+               COALESCE(s.times_wiped, 0) AS times_wiped
         FROM stats s LEFT JOIN wallets w ON s.user_id = w.user_id
         WHERE s.user_id = ?
     """, (user_id,)) as c:
         row = await c.fetchone()
         return dict(row) if row else None
-
 
 # ── Hand log ──────────────────────────────────────────────────────────────────
 

@@ -623,7 +623,8 @@ class PokerGame:
         return HandResult(winners=[winner], pot=self.pot,
                           summary="\n".join(lines), chip_deltas=deltas,
                           community=list(self.community),
-                          showdown_players=[winner], tax = tax)
+                          showdown_players=[winner], tax=tax,
+                          allin_user_ids={winner.user_id} if winner.all_in else set())
 
     def _end_hand(self):
         self.street = Street.WAITING

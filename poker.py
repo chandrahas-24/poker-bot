@@ -812,6 +812,7 @@ async def _process_result(guild, channel, t: TableState):
     achievement_announces: list[str] = [] # same pattern, collected then sent after hand result
     try:
         sp_map = {sp.user_id: sp for sp in (result.showdown_players or [])}
+        player_flags: dict[int, dict] = {}  # keyed by user_id, populated for winners only
 
         for p in t.game.players:
             won = any(w.user_id == p.user_id for w in result.winners)
@@ -828,12 +829,12 @@ async def _process_result(guild, channel, t: TableState):
 
             quads_win = sf_win = rf_win = False
 
-            # FIX: Evaluate the winner's hand even if everyone folded (no showdown)
-            if won and sp and sp.hole_cards and result.community and len(result.community) >= 3:
-                score = evaluator.evaluate(sp.hole_cards, result.community)
+            # Evaluate using hole_cards fallback (covers fold wins where sp may be None)
+            hole_cards = sp.hole_cards if sp else p.hole_cards
+            if won and hole_cards and result.community and len(result.community) >= 3:
+                score = evaluator.evaluate(hole_cards, result.community)
                 rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
 
-                # 🚨 NEW: Evaluate both the board's RAW SCORE and its STRING RANK
                 board_score = None
                 board_rank_str = ""
 
@@ -843,8 +844,8 @@ async def _process_result(guild, channel, t: TableState):
                     board_rank_str = evaluator.class_to_string(evaluator.get_rank_class(board_score))
                 elif len(result.community) == 4:
                     # If everyone folds on the Turn, manually check if the 4 cards are Quads
-                    ranks = [Card.get_rank_int(c) for c in result.community]
-                    if len(set(ranks)) == 1:
+                    ranks_on_board = [Card.get_rank_int(c) for c in result.community]
+                    if len(set(ranks_on_board)) == 1:
                         board_score = score
                         board_rank_str = "Four of a Kind"
 
@@ -863,36 +864,15 @@ async def _process_result(guild, channel, t: TableState):
                         sf_win = True
                         rf_win = (score == 1)
 
-            # ── Jackpot payout ───────────────────────────────────────────────
+            # Store flags for jackpot split logic after the player loop
             if won:
-                egirl_win = p.egirl_saro
-                jp_pct  = 0.0
-                jp_tier = ""
-                if egirl_win:
-                    jp_pct  = 0.80
-                    jp_tier = "✨ E-girl Saroshi Ace"
-                elif rf_win:
-                    jp_pct  = 0.60
-                    jp_tier = "👑 Royal Flush"
-                elif sf_win:
-                    jp_pct  = 0.20
-                    jp_tier = "🔥 Straight Flush"
-                elif quads_win:
-                    jp_pct  = 0.05
-                    jp_tier = "🃏 Four of a Kind"
-
-                if jp_pct > 0:
-                    try:
-                        jackpot_now = await db.get_jackpot()
-                        if jackpot_now > 0:
-                            payout = math.ceil(jackpot_now * jp_pct)
-                            actual = await db.pay_jackpot(p.user_id, p.display_name, payout, jp_tier)
-                            if actual > 0:
-                                new_jp = await db.get_jackpot()
-                                await db.log_currency_event(p.user_id, "Jackpot", actual, f"Won {jp_tier}!")
-                                jackpot_hits.append((p.user_id, jp_tier, actual, new_jp))
-                    except Exception as e:
-                        print(f"[poker] jackpot payout error: {e}")
+                player_flags[p.user_id] = {
+                    "player": p,
+                    "egirl":  p.egirl_saro,
+                    "rf":     rf_win,
+                    "sf":     sf_win,
+                    "quads":  quads_win,
+                }
 
             # ────────────────────────────────────────────────────────────────
 
@@ -922,6 +902,40 @@ async def _process_result(guild, channel, t: TableState):
                 icon = "🎖️" if kind == "title" else "💬"
                 lines.append(f"  {icon} **{display}** *{rarity}*")
             achievement_announces.append("\n".join(lines))
+
+        # ── Jackpot split payout ──────────────────────────────────────────────
+        # All percentages are of the same jackpot snapshot taken once.
+        # Egirl blocks all other tiers. RF winners are excluded from SF tier.
+        try:
+            egirl_players = [f["player"] for f in player_flags.values() if f["egirl"]]
+            if egirl_players:
+                tiers = [("✨ E-girl Saroshi Ace", 0.80, egirl_players)]
+            else:
+                tiers = []
+                rf_players    = [f["player"] for f in player_flags.values() if f["rf"]]
+                sf_players    = [f["player"] for f in player_flags.values() if f["sf"] and not f["rf"]]
+                quads_players = [f["player"] for f in player_flags.values() if f["quads"]]
+                if rf_players:
+                    tiers.append(("👑 Royal Flush", 0.60, rf_players))
+                if sf_players:
+                    tiers.append(("🔥 Straight Flush", 0.20, sf_players))
+                if quads_players:
+                    tiers.append(("🃏 Four of a Kind", 0.05, quads_players))
+
+            if tiers:
+                jackpot_now = await db.get_jackpot()
+                if jackpot_now > 0:
+                    for jp_tier, jp_pct, winners in tiers:
+                        each_pct = jp_pct / len(winners)
+                        for p in winners:
+                            payout = math.ceil(jackpot_now * each_pct)
+                            actual = await db.pay_jackpot(p.user_id, p.display_name, payout, jp_tier)
+                            if actual > 0:
+                                new_jp = await db.get_jackpot()
+                                await db.log_currency_event(p.user_id, "Jackpot", actual, f"Won {jp_tier}!")
+                                jackpot_hits.append((p.user_id, jp_tier, actual, new_jp))
+        except Exception as e:
+            print(f"[poker] jackpot payout error: {e}")
 
     except Exception as e:
         print(f"[poker] stats/achievement error: {e}")

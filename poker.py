@@ -48,6 +48,7 @@ class TableState:
         self.auto_task:   asyncio.Task | None = None
         self.timer_task: asyncio.Task | None = None
         self.timer_user_id: int | None = None
+        self.timer_street = None
         self.ping_user_id: int | None = None
         self.msg_count = 0
         self.resend_threshold = TABLE_RESEND_MSGS
@@ -90,6 +91,7 @@ def cancel_timer(t: TableState):
             t.timer_task.cancel()
     t.timer_task = None
     t.timer_user_id = None
+    t.timer_street = None
 
 def start_timer(t: TableState, channel):
     cp = t.game.current_player()
@@ -98,10 +100,12 @@ def start_timer(t: TableState, channel):
         return
     # Same player's timer is already running — leave it completely alone
     if (t.timer_task and not t.timer_task.done()
-            and t.timer_user_id == cp.user_id):
+            and t.timer_user_id == cp.user_id
+            and t.timer_street == t.game.street):
         return
     cancel_timer(t)
     t.timer_user_id = cp.user_id
+    t.timer_street = t.game.street
     t.timer_task = asyncio.create_task(_turn_timer(t, channel, cp.user_id))
 
 async def _turn_timer(t: TableState, channel, user_id: int):

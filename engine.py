@@ -573,10 +573,12 @@ class PokerGame:
             community=list(self.community),
             winner_ranks=winner_ranks,
             pot_results=pot_results,
-            showdown_players=list(alive),
+            showdown_players=list(self.players),
             allin_user_ids={p.user_id for p in alive if p.all_in},
             tax=total_tax# snapshot before _end_hand clears state
         )
+
+        self._hand_result.folded_ids = {p.user_id for p in self.players if p.folded}
         self._end_hand()
         return "\n".join(lines)
 
@@ -620,11 +622,15 @@ class PokerGame:
         for p in self.players:
             d = deltas[p.user_id]
             lines.append(f"  {p.display_name}: {'+' if d >= 0 else ''}{d}")
-        return HandResult(winners=[winner], pot=self.pot,
+        res = HandResult(winners=[winner], pot=self.pot,
                           summary="\n".join(lines), chip_deltas=deltas,
                           community=list(self.community),
-                          showdown_players=[winner], tax=tax,
+                          showdown_players=list(self.players), tax=tax,
                           allin_user_ids={winner.user_id} if winner.all_in else set())
+
+        res.folded_ids = {p.user_id for p in self.players if p.folded}
+
+        return res
 
     def _end_hand(self):
         self.street = Street.WAITING

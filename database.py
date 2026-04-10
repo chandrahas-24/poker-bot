@@ -1387,57 +1387,7 @@ async def update_win_streak(user_id: int, won: bool) -> tuple[int, int]:
         ) as c:
             row = await c.fetchone()
             return (row[0], row[1]) if row else (0, 0)
- 
- 
-async def increment_pocket_aces_wins(user_id: int) -> int:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute(
-            "UPDATE stats SET pocket_aces_wins = pocket_aces_wins + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
-        async with db.execute("SELECT COALESCE(pocket_aces_wins,0) FROM stats WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone(); return row[0] if row else 0
- 
- 
-async def increment_all_in_wins(user_id: int) -> int:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute(
-            "UPDATE stats SET all_in_wins = all_in_wins + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
-        async with db.execute("SELECT COALESCE(all_in_wins,0) FROM stats WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone(); return row[0] if row else 0
 
-
-async def increment_quads_wins(user_id: int) -> int:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute(
-            "UPDATE stats SET quads_wins = quads_wins + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
-        async with db.execute("SELECT COALESCE(quads_wins,0) FROM stats WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone(); return row[0] if row else 0
-
-
-async def increment_straight_flush_wins(user_id: int) -> int:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute(
-            "UPDATE stats SET straight_flush_wins = straight_flush_wins + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
-        async with db.execute("SELECT COALESCE(straight_flush_wins,0) FROM stats WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone(); return row[0] if row else 0
-
-
-async def increment_royal_flush_wins(user_id: int) -> int:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute(
-            "UPDATE stats SET royal_flush_wins = royal_flush_wins + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
-        async with db.execute("SELECT COALESCE(royal_flush_wins,0) FROM stats WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone(); return row[0] if row else 0
- 
 async def _get_times_wiped(user_id: int) -> int:
     db = await _get_db()
     async with db.execute("SELECT COALESCE(times_wiped,0) FROM stats WHERE user_id=?", (user_id,)) as c:

@@ -351,7 +351,6 @@ async def post_hand_log(channel, t: TableState, result):
 
     lines = [header]
 
-    # Build name lookup from result snapshots — safe for players who already left
     _name_map = {}
     for _p in (result.showdown_players or []):
         _name_map[_p.user_id] = _p.display_name
@@ -373,16 +372,26 @@ async def post_hand_log(channel, t: TableState, result):
     pot_results = result.pot_results or []
     ranks = result.winner_ranks or {}
 
+    # 🚨 Grab the folded snapshot from the engine
+    folded_ids = getattr(result, "folded_ids", set())
+
     _player_map = {_p.user_id: _p for _p in (result.showdown_players or [])}
     for uid, delta in result.chip_deltas.items():
         sign = "+" if delta > 0 else ""
         ustr = await uid_str(uid)
         rank = ranks.get(uid)
         sp = _player_map.get(uid)
-        cards = hand_str(sp.hole_cards) if sp and sp.hole_cards else "folded"
+
+        # 🚨 Check the snapshot to append (folded)
+        if sp and sp.hole_cards:
+            cards = hand_str(sp.hole_cards)
+            if uid in folded_ids:
+                cards += " (folded)"
+        else:
+            cards = "no cards"
+
         rank_part = f" [{rank}]" if rank else ""
 
-        # FIX: Explicitly label it as Net Profit/Loss and fix the double math signs
         lines.append(f"  {ustr}: {cards}{rank_part}  Net: {sign}{delta}")
 
     if pot_results:
@@ -397,10 +406,8 @@ async def post_hand_log(channel, t: TableState, result):
 
     body = "\n".join(lines)
     try:
-        # FIRE AND FORGET
         await thread.send(f"```\n{body}\n```")
     except Exception:
-        # If thread was deleted, quietly clear the cache so it rebuilds next hand
         _log_threads.pop(channel.guild.id, None)
 
 
@@ -1012,6 +1019,22 @@ async def _process_result(guild, channel, t: TableState):
         except Exception as e:
             print(f"[poker] jackpot announce error: {e}")
 
+        try:
+            settings = await db.get_settings(channel.guild.id)
+            log_ch_id = settings.get("log_channel_id")
+            if log_ch_id:
+                log_ch = channel.guild.get_channel(int(log_ch_id))
+                if log_ch:
+                    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                    p_obj = t.game.get_player(uid)
+                    p_name = p_obj.display_name if p_obj else f"User {uid}"
+                    await log_ch.send(
+                        f"🎰 **Jackpot Hit** [{ts}] — **{p_name}** ({uid}) won **{actual:,}** from **{jp_tier}** at table `{t.name}`.\n"
+                        f"Remaining Jackpot: {new_jp:,}"
+                    )
+        except Exception as e:
+            print(f"[poker] jackpot log error: {e}")
+
     for msg_text in achievement_announces:
         try:
             await channel.send(msg_text)
@@ -1130,7 +1153,8 @@ async def _reveal_phase(channel, t: TableState, result):
                 await channel.send(caption)
 
     # B. Prompt losers with a Show/Muck button
-    candidates = [p for p in (result.showdown_players or []) if p.user_id not in winner_ids]
+    folded_ids = getattr(result, "folded_ids", set())
+    candidates = [p for p in (result.showdown_players or []) if p.user_id not in winner_ids and p.user_id not in folded_ids]
     if not candidates:
         return  # Chop pot — everyone tied and won, so everyone already showed automatically
 

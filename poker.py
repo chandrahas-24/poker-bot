@@ -2210,6 +2210,13 @@ class PokerCog(commands.Cog):
     pokerset = app_commands.Group(name="pokerset", description="Configure poker settings")
     pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands")
     pokeradmin = app_commands.Group(name="pokeradmin", description="Poker economy and admin commands")
+
+    @poker.command(name="ping", description="Check the bot's latency")
+    async def ping(self, interaction: discord.Interaction):
+        # self.bot.latency is in seconds, multiply by 1000 for ms
+        latency_ms = round(self.bot.latency * 1000)
+        await interaction.response.send_message(f'Pong! 🏓 Latency: {latency_ms}ms', ephemeral=True)
+    
     # ── Table management ──────────────────────────────────────────────────
 
     @poker.command(name="open", description="[Manager] Open a poker table in this channel")

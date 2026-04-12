@@ -3182,7 +3182,7 @@ class PokerCog(commands.Cog):
 
         stats = await db.get_revenue_stats()
 
-        embed = discord.Embed(title="📈 House Revenue (5% Tax)", color=0xf1c40f)
+        embed = discord.Embed(title="📈 House Revenue (4% Tax)", color=0xf1c40f)
         embed.add_field(name="Past 24 Hours", value=f"{stats['daily']:,} <:poker_chip:1490458259855773707>", inline=True)
         embed.add_field(name="Past 7 Days", value=f"{stats['weekly']:,} <:poker_chip:1490458259855773707>", inline=True)
         embed.add_field(name="Past 30 Days", value=f"{stats['monthly']:,} <:poker_chip:1490458259855773707>", inline=True)

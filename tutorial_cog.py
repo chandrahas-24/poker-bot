@@ -1345,13 +1345,6 @@ class TutorialCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(
-        name="tutorial",
-        description=(
-            "Learn Texas Hold'em with a guided 3-hand walkthrough "
-            "(private · fake chips · wallet never touched)"
-        ),
-    )
     async def tutorial(self, interaction: discord.Interaction):
 
         allowed_channel_id = int(os.getenv("TUTORIAL_CHANNEL_ID", "0"))

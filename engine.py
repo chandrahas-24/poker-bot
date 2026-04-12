@@ -147,15 +147,26 @@ class PokerGame:
                 return f"✅ **{pj.display_name}** added **{amount}** chips. Stack at join: **{pj.chips}**."
         return "❌ You're not at the table."
 
-    def _process_pending(self):
+    def _process_pending(self, target_dealer_id: int | None = None):
         for uid in self.pending_leaves:
             p = self.get_player(uid)
             if p:
                 self.players.remove(p)
         self.pending_leaves.clear()
+
+        # Find the safest physical seat to place new players (before the dealer)
+        insert_idx = len(self.players)
+        if target_dealer_id:
+            for i, p in enumerate(self.players):
+                if p.user_id == target_dealer_id:
+                    insert_idx = i
+                    break
+
         for p in self.pending_joins:
             p.sitting_out = False
-            self.players.append(p)
+            self.players.insert(insert_idx, p)
+            insert_idx += 1  # Keep multiple joiners in order
+
         self.pending_joins.clear()
 
     # Hand lifecycle
@@ -170,7 +181,8 @@ class PokerGame:
         if self.players:
             target_dealer_id = self.players[(self.dealer_idx + 1) % len(self.players)].user_id
 
-        self._process_pending()
+        self._process_pending(target_dealer_id)
+
         active = [p for p in self.players if p.chips > 0]
         if len(active) < 2:
             return False, "❌ Need at least 2 players with chips to start."

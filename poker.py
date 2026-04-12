@@ -11,6 +11,7 @@ import os, asyncio, uuid, zipfile
 from datetime import datetime, timedelta, time as dt_time, timezone as _tz
 import time
 import math
+from tutorial_cog import TutorialCog
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -3694,6 +3695,16 @@ class PokerCog(commands.Cog):
 
         view = CurrencyLogView(interaction.user, logs)
         await interaction.followup.send(embed=view.build_embed(), view=view)
+
+    @poker.command(name="tutorial",
+                   description="Learn Texas Hold'em with a guided 3-hand walkthrough (private · fake chips · wallet never touched)")
+    async def tutorial(self, interaction: discord.Interaction):
+        # Find the loaded TutorialCog and delegate to its handler
+        cog = self.bot.get_cog("TutorialCog")
+        if cog:
+            await cog.tutorial(interaction)
+        else:
+            await interaction.response.send_message("❌ Tutorial is not available.", ephemeral=True)
 
 
 class StatsView(discord.ui.View):

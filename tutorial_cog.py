@@ -1269,6 +1269,8 @@ async def _finish_hand(
 ):
     """Wrap up a hand: record outcome, advance state, post reward if first-ever completion."""
     s      = session
+    s.game._rigged_hands = {}
+    s.game._rigged_community = []
     g      = s.game
     result = g._hand_result
 

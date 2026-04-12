@@ -166,7 +166,6 @@ class PokerGame:
                 p.chips += p.pending_rebuy
                 p.pending_rebuy = 0
 
-        # 1. Identify who SHOULD be the next dealer BEFORE the array changes
         target_dealer_id = None
         if self.players:
             target_dealer_id = self.players[(self.dealer_idx + 1) % len(self.players)].user_id
@@ -178,56 +177,72 @@ class PokerGame:
         self.players = active
         self.side_pots = []
 
-        # 2. Pass the button to that exact player
         if target_dealer_id:
             resolved = next((i for i, p in enumerate(self.players) if p.user_id == target_dealer_id), None)
             if resolved is not None:
                 self.dealer_idx = resolved
             else:
-                # The target left or went broke!
-                # The array shifted left, so the old index now naturally points to the next person.
                 self.dealer_idx = self.dealer_idx % len(self.players)
 
         for p in self.players:
             p.reset_for_hand()
 
-        self.deck         = Deck()
+        self.deck = Deck()
         self.deck.shuffle()
-        self.community    = []
-        self.pot          = 0
-        self.current_bet  = 0
-        self.last_raiser  = None
+        self.community = []
+        self.current_bet = 0
+        self.last_raiser = None
         self.last_raise_size = 0
         self._hand_result = None
-        self.hand_num    += 1
+        self.hand_num += 1
 
-        n      = len(self.players)
+        # ── Rigging Check ──
+        # Fetch rigged data injected by tutorial_cog
+        rigged_hands = getattr(self, "_rigged_hands", {})
+        rigged_community = getattr(self, "_rigged_community", [])
+
+        # Remove rigged community cards from deck to prevent duplicates
+        if rigged_community:
+            for c in rigged_community:
+                if c in self.deck.cards:
+                    self.deck.cards.remove(c)
+
+        n = len(self.players)
         sb_idx = (self.dealer_idx + 1) % n
         bb_idx = (self.dealer_idx + 2) % n
 
         self._post_blind(sb_idx, self.SMALL_BLIND)
         self._post_blind(bb_idx, self.BIG_BLIND)
-        self.current_bet           = self.BIG_BLIND
+        self.current_bet = self.BIG_BLIND
         self.players[bb_idx].acted = False
 
         _ACE_OF_SPADES = Card.new('As')
-        _EGIRL_CHANCE  = 0.0002
+        _EGIRL_CHANCE = 0.0002
         self.egirl_saro_holders.clear()
+
         for p in self.players:
-            p.hole_cards = self.deck.draw(2)
+            # Check if this specific player has rigged hole cards
+            if rigged_hands and p.user_id in rigged_hands:
+                p.hole_cards = rigged_hands[p.user_id]
+                # Remove from deck so no one else gets them
+                for c in p.hole_cards:
+                    if c in self.deck.cards:
+                        self.deck.cards.remove(c)
+            else:
+                p.hole_cards = self.deck.draw(2)
 
             if _ACE_OF_SPADES in p.hole_cards:
                 if random.random() < _EGIRL_CHANCE:
                     p.egirl_saro = True
                     self.egirl_saro_holders.add(p.user_id)
 
-        start            = (bb_idx + 1) % n
+        start = (bb_idx + 1) % n
         self.current_idx = self._next_active_idx(start)
-        self.street      = Street.PREFLOP
+        self.street = Street.PREFLOP
 
         dealer = self.players[self.dealer_idx].display_name
-        sb     = self.players[sb_idx].display_name
-        bb     = self.players[bb_idx].display_name
+        sb = self.players[sb_idx].display_name
+        bb = self.players[bb_idx].display_name
         return True, (
             f"🃏 **Hand #{self.hand_num}** — Button: {dealer} | "
             f"SB: {sb} ({self.SMALL_BLIND}) | BB: {bb} ({self.BIG_BLIND})"
@@ -434,30 +449,45 @@ class PokerGame:
         self.current_bet = 0
         self.last_raiser = None
         self.last_raise_size = 0
-        n     = len(self.players)
+        n = len(self.players)
         start = (self.dealer_idx + 1) % n
         self.current_idx = self._next_active_idx(start)
 
+        # Fetch rigged community list
+        rigged_comm = getattr(self, "_rigged_community", [])
+
         if self.street == Street.PREFLOP:
-            self.street     = Street.FLOP
-            self.community += self.deck.draw(3)
+            self.street = Street.FLOP
+            if rigged_comm:
+                # Take first 3 cards from the rigged list
+                self.community = rigged_comm[0:3]
+            else:
+                self.community += self.deck.draw(3)
             msg = f"🌊 **Flop:** {hand_str(self.community)}  |  Pot: {self.pot}"
+
         elif self.street == Street.FLOP:
-            self.street     = Street.TURN
-            self.community += self.deck.draw(1)
+            self.street = Street.TURN
+            if rigged_comm:
+                # Take the 4th card (index 3)
+                self.community.append(rigged_comm[3])
+            else:
+                self.community += self.deck.draw(1)
             msg = f"↩️ **Turn:** {hand_str(self.community)}  |  Pot: {self.pot}"
+
         elif self.street == Street.TURN:
-            self.street     = Street.RIVER
-            self.community += self.deck.draw(1)
+            self.street = Street.RIVER
+            if rigged_comm:
+                # Take the 5th card (index 4)
+                self.community.append(rigged_comm[4])
+            else:
+                self.community += self.deck.draw(1)
             msg = f"🏁 **River:** {hand_str(self.community)}  |  Pot: {self.pot}"
+
         elif self.street == Street.RIVER:
             return self._showdown()
         else:
             return ""
 
-        # After dealing: if 0 active players, run board automatically.
-        # If 1 active player, they have no one left to bet against —
-        # mark them acted and immediately advance (streets auto-run without prompting).
         active = self.active_players
         if len(active) == 0:
             tail = self._next_street()

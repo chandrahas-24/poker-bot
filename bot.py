@@ -3,6 +3,7 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 from database import init_db, recover_chips_in_play
+from tutorial_db import init_db as init_tutorial_db
 from discord.ext import tasks
 import datetime
 
@@ -43,6 +44,7 @@ async def daily_inactive_wipe():
 @bot.event
 async def on_ready():
     await init_db()
+    await init_tutorial_db()
 
     recovered = await recover_chips_in_play()
     if recovered:
@@ -51,6 +53,7 @@ async def on_ready():
             print(f"   {r['username']}: +{r['amount']} chips returned to wallet")
 
     await bot.load_extension("poker")
+    await bot.load_extension("tutorial_cog")
 
     YOUR_GUILD_ID = int(os.getenv("GUILD_ID", "0"))
     if YOUR_GUILD_ID:

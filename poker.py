@@ -243,6 +243,7 @@ async def _auto_next_hand(t: TableState, channel):
     t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
 
     slog_clear(t)
+    t.game.tax_rate, _ = db.get_tax_config()
     success, msg = t.game.start_hand()
     slog(t, msg)
 
@@ -345,9 +346,14 @@ async def post_hand_log(channel, t: TableState, result):
         return
     game = t.game
 
+    rate, is_special = db.get_tax_config()
+
     header = f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"
     if getattr(result, "tax", 0) > 0:
-        header += f" | Tax: {result.tax}"
+        if is_special:
+            header += f" | Tax: {result.tax} (No revenue)"
+        else:
+            header += f" | Tax: {result.tax}"
 
     lines = [header]
 
@@ -441,7 +447,7 @@ STREET_LABEL = {
 }
 
 def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
-    tag       = " 🎰" if idx == game.dealer_idx else ""
+    tag       = " 🔘" if idx == game.dealer_idx else ""
     title_str = f" `{title}`" if title else ""
     mention   = f"<@{p.user_id}>"
     if p.folded:
@@ -772,7 +778,10 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
         if stack_lines:
             embed.add_field(name="💰 Final Stacks", value="\n".join(stack_lines), inline=False)
 
-        # Removed Total Pot from the bottom entirely
+    rate, is_special = db.get_tax_config()
+    if is_special:
+        pct_string = f"{rate * 100:g}%"
+        embed.set_footer(text=f"✨ Low-Tax Day! Tax is {pct_string} (All of it goes to Jackpot) ✨")
 
     # 🚀 Send the final embed
     await channel.send(embed=embed)
@@ -1292,7 +1301,7 @@ class RebuyModal(discord.ui.Modal, title="Add Chips from Wallet"):
             await interaction.followup.send(msg, ephemeral=True);
             return
 
-        await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, chips)
+        await db.mark_chips_in_play(interaction.user.id, interaction.user.name, chips)
         await interaction.followup.send(msg, ephemeral=False)
 
 class BetweenHandsView(discord.ui.View):
@@ -2140,6 +2149,7 @@ class PokerCog(commands.Cog):
             t.hand_msg = None
             await refresh(message.channel, t, new_hand=True)
 
+
     # ── THE BACKUP ENGINE (Hidden Helper) ──────────────────────────────────
     async def _send_backup(self, user: discord.User):
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
@@ -2149,7 +2159,7 @@ class PokerCog(commands.Cog):
         clean_zip_name = f"poker_backup_{date_str}.zip"
         zip_path = os.path.join("/app/data", clean_zip_name)
 
-        files_to_zip = ["/app/data/poker.db", "/app/data/poker.db-wal", "/app/data/poker.db-shm"]
+        files_to_zip = ["/app/data/poker.db", "/app/datapoker.db-wal", "/app/data/poker.db-shm"]
 
         try:
             # Force SQLite to flush the WAL to the main DB safely
@@ -2173,9 +2183,12 @@ class PokerCog(commands.Cog):
             if os.path.exists(zip_path):
                 os.remove(zip_path)
 
-    # ── THE AUTO TIMER (Every 24 Hours) ────────────────────────────────────
-    time_to_run = dt_time(hour=4, minute=0, tzinfo=_tz.utc)
-    @tasks.loop(time=time_to_run)
+    # ── THE AUTO TIMER (Every 2 Hours) ────────────────────────────────────
+    backup_times = [
+        dt_time(hour=h, minute=30, tzinfo=_tz.utc)
+        for h in range(1, 23, 2)
+    ]
+    @tasks.loop(time=backup_times)
     async def daily_backup(self):
         try:
             for dev_id in self.DEV_USER_IDS:
@@ -2216,7 +2229,7 @@ class PokerCog(commands.Cog):
         # self.bot.latency is in seconds, multiply by 1000 for ms
         latency_ms = round(self.bot.latency * 1000)
         await interaction.response.send_message(f'Pong! 🏓 Latency: {latency_ms}ms', ephemeral=True)
-    
+
     # ── Table management ──────────────────────────────────────────────────
 
     @poker.command(name="open", description="[Manager] Open a poker table in this channel")
@@ -2304,6 +2317,7 @@ class PokerCog(commands.Cog):
         t.game.kicked_users.clear()
 
         slog_clear(t)
+        t.game.tax_rate, _ = db.get_tax_config()
         success, msg = t.game.start_hand()
         slog(t, msg)
         if not success:

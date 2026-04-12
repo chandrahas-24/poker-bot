@@ -97,6 +97,7 @@ class PokerGame:
         self.banned_users:   list[int]         = []  # global table ban
         self.kicked_users:   list[int]         = []  # pending kick (force leave after hand)
         self.egirl_saro_holders: set[int]      = set() # players dealt the ace variant
+        self.tax_rate: float = 0.05
 
     # Lobby
 
@@ -165,17 +166,27 @@ class PokerGame:
                 p.chips += p.pending_rebuy
                 p.pending_rebuy = 0
 
+        # 1. Identify who SHOULD be the next dealer BEFORE the array changes
+        target_dealer_id = None
+        if self.players:
+            target_dealer_id = self.players[(self.dealer_idx + 1) % len(self.players)].user_id
+
         self._process_pending()
         active = [p for p in self.players if p.chips > 0]
         if len(active) < 2:
             return False, "❌ Need at least 2 players with chips to start."
-        self.players   = active
+        self.players = active
         self.side_pots = []
 
-        # Rotate dealer now, after _process_pending has trimmed the player list.
-        # Doing it in _end_hand uses the stale pre-leave list and can corrupt the index.
-        if self.players:
-            self.dealer_idx = (self.dealer_idx % len(self.players) + 1) % len(self.players)
+        # 2. Pass the button to that exact player
+        if target_dealer_id:
+            resolved = next((i for i, p in enumerate(self.players) if p.user_id == target_dealer_id), None)
+            if resolved is not None:
+                self.dealer_idx = resolved
+            else:
+                # The target left or went broke!
+                # The array shifted left, so the old index now naturally points to the next person.
+                self.dealer_idx = self.dealer_idx % len(self.players)
 
         for p in self.players:
             p.reset_for_hand()
@@ -218,7 +229,7 @@ class PokerGame:
         sb     = self.players[sb_idx].display_name
         bb     = self.players[bb_idx].display_name
         return True, (
-            f"🃏 **Hand #{self.hand_num}** — Dealer: {dealer} | "
+            f"🃏 **Hand #{self.hand_num}** — Button: {dealer} | "
             f"SB: {sb} ({self.SMALL_BLIND}) | BB: {bb} ({self.BIG_BLIND})"
         )
 
@@ -370,11 +381,11 @@ class PokerGame:
                 winner.bet -= uncalled
                 self.pot -= uncalled
 
-            # 🚨 6% TAX ON NET WINNINGS ONLY
+            # 🚨 5% TAX ON NET WINNINGS ONLY
             profit = self.pot - winner.total_bet
             tax = 0
             if profit > 0:
-                tax = ceil(profit * 0.06)
+                tax = ceil(profit * self.tax_rate)
 
             self.pot -= tax
             winner.chips += self.pot
@@ -517,11 +528,11 @@ class PokerGame:
                 chip_deltas[w.user_id] += award
             pot_results.append((sp.amount, winners))
 
-        # 🚨 2. APPLY 6% TAX ONLY TO PLAYERS WITH NET PROFIT
+        # 🚨 2. APPLY 5% TAX ONLY TO PLAYERS WITH NET PROFIT
         total_tax = 0
         for p in self.players:
             if chip_deltas[p.user_id] > 0:  # Only tax them if they actually made a profit!
-                profit_tax = ceil(chip_deltas[p.user_id] * 0.06)
+                profit_tax = ceil(chip_deltas[p.user_id] * self.tax_rate)
                 if profit_tax > 0:
                     p.chips -= profit_tax
                     chip_deltas[p.user_id] -= profit_tax

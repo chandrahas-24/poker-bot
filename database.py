@@ -735,16 +735,39 @@ async def pay_cashout(user_id: int, amount: int) -> bool:
 
 # --- REVENUE & ECONOMY FUNCTIONS ---
 
+def get_tax_config() -> tuple[float, bool]:
+    """Returns (tax_rate, is_special_day)."""
+    special_day = os.getenv("TAX_FREE_DAY", "").strip().lower()
+    current_day = datetime.utcnow().strftime("%A").lower()
+
+    if special_day and current_day == special_day:
+        # Default to 5% if SPECIAL_TAX_RATE isn't in .env yet
+        rate = float(os.getenv("SPECIAL_TAX_RATE", "0.05"))
+        return rate, True
+
+    return 0.05, False  # Standard 5% rate
+
 async def log_tax(tax_amount: int):
-    """Splits the 6% engine tax: 1/6th goes to Jackpot, 5/6ths to House."""
+    """Splits the 5% engine tax: 1% to Jackpot, 4% to House. On Tax-Free Day, 5% goes to Jackpot."""
     if tax_amount <= 0: return
-    jackpot_cut = (tax_amount // 6) # 1% of the original profit
-    house_cut = tax_amount - jackpot_cut # 5% of the original profit
+
+    rate, is_special = get_tax_config()
+
+    if is_special:
+        jackpot_cut = tax_amount
+        house_cut = 0
+    else:
+        jackpot_cut = (tax_amount + 4) // 5
+        house_cut = tax_amount - jackpot_cut
+
     db = await _get_db()
     async with _write_lock:
-        await db.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)", (datetime.utcnow().isoformat(), house_cut))
-        # 🚨 FIX: Safely target only the primary row
-        await db.execute("UPDATE jackpot SET amount = amount + ? WHERE rowid = (SELECT MIN(rowid) FROM jackpot)", (jackpot_cut,))
+        if house_cut > 0:
+            await db.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
+                             (datetime.utcnow().isoformat(), house_cut))
+        if jackpot_cut > 0:
+            await db.execute("UPDATE jackpot SET amount = amount + ? WHERE rowid = (SELECT MIN(rowid) FROM jackpot)",
+                             (jackpot_cut,))
         await db.commit()
 
 async def get_jackpot() -> int:

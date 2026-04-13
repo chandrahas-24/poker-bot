@@ -1122,6 +1122,19 @@ class ShowdownRevealView(discord.ui.View):
             await interaction.response.send_message(caption)
         await self._resolve(interaction.user.id)
 
+    @discord.ui.button(label="Muck 🗑️", style=discord.ButtonStyle.grey)
+    async def muck_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 1. Ignore people who aren't prompted
+        if interaction.user.id not in self.pending:
+            await interaction.response.send_message("❌ You have nothing to muck.", ephemeral=True)
+            return
+
+        # 2. Silently confirm the muck
+        await interaction.response.send_message("🗑️ You quietly mucked your hand.", ephemeral=True)
+
+        # 3. Resolve them from the queue! If the queue empties, the hand instantly ends.
+        await self._resolve(interaction.user.id)
+
 
 async def _reveal_phase(channel, t: TableState, result):
     settings = await db.get_settings(channel.guild.id)

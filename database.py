@@ -219,6 +219,11 @@ async def init_db():
             )
         """)
 
+        try:
+            await db.execute("ALTER TABLE wallets ADD COLUMN autorebuy_amount INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
         
@@ -1895,3 +1900,22 @@ async def get_currency_logs(user_id: int) -> list[dict]:
     db = await _get_db()
     async with db.execute("SELECT * FROM currency_log WHERE user_id = ? ORDER BY id DESC", (user_id,)) as c:
         return [dict(r) for r in await c.fetchall()]
+
+
+# Auto rebuy
+
+async def get_autorebuy(user_id: int) -> int:
+    db = await _get_db()
+    async with db.execute("SELECT autorebuy_amount FROM wallets WHERE user_id=?", (user_id,)) as c:
+        row = await c.fetchone()
+        return row[0] if row else 0
+
+async def set_autorebuy(user_id: int, amount: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO wallets (user_id, username, balance, autorebuy_amount)
+            VALUES (?, 'Unknown Player', 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET autorebuy_amount = ?
+        """, (user_id, amount, amount))
+        await db.commit()

@@ -212,23 +212,84 @@ async def _auto_next_hand(t: TableState, channel):
     # pending_leaves chips were already returned in _process_result.
     # Don't return again — just let start_hand->_process_pending remove them from game.players.
 
-    # Auto-remove players below big blind
+    # Auto-remove or auto-rebuy players below big blind
     bb = t.game.BIG_BLIND
     for p in list(t.game.players):
         if (p.chips + p.pending_rebuy) < bb and p.user_id not in t.game.pending_leaves:
-            # FIX: Include pending_rebuy and remove them immediately
-            total_to_return = p.chips + p.pending_rebuy
-            if total_to_return > 0:
-                await db.return_chips(p.user_id, total_to_return)
-            await db.clear_chips_in_play(p.user_id)
 
-            t.game.players.remove(p)  # <-- Remove them right now
+            autorebuy_amount = await db.get_autorebuy(p.user_id)
+            triggered = False
 
-            try:
-                await channel.send(
-                    f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** <:poker_chip:1490458259855773707>) is below the big blind (**{bb}** <:poker_chip:1490458259855773707>). Chips returned to wallet.")
-            except Exception:
-                pass
+            if autorebuy_amount > 0:
+                settings = await db.get_settings(channel.guild.id)
+                max_wallet = settings.get("max_wallet", 0)
+                current_total = p.chips + p.pending_rebuy
+
+                # Set our target stack size
+                target_stack = autorebuy_amount
+
+                # Clamp the target stack to the table's max limit if there is one
+                if max_wallet > 0:
+                    target_stack = min(target_stack, max_wallet)
+
+                # Calculate exactly how many chips are needed to reach the target
+                top_up_needed = target_stack - current_total
+
+                # Only proceed if they actually need chips, and the target is at least the Big Blind
+                if top_up_needed > 0 and target_stack >= bb:
+                    wallet_bal = await db.get_balance(p.user_id)
+
+                    # STRICT ALL-OR-NOTHING CHECK
+                    if wallet_bal >= top_up_needed:
+                        success = await db.deduct_chips(p.user_id, top_up_needed)
+                        if success:
+                            await db.mark_chips_in_play(p.user_id, p.display_name, top_up_needed)
+                            t.game.queue_rebuy(p.user_id, top_up_needed)
+                            await db.log_currency_event(p.user_id, "Cash In", -top_up_needed,
+                                                        f"Auto-rebuy: +{top_up_needed} chips")
+                            triggered = True
+                            try:
+                                await channel.send(
+                                    f"♻️ **{p.display_name}** auto-topped up **{top_up_needed:,}** chips to reach a stack of **{target_stack:,}** <:poker_chip:1490458259855773707>.")
+                            except Exception as e:
+                                # 1. Log it to the console so the developer sees it
+                                print(f"[Error] Channel send failed for auto-rebuy ({p.user_id}): {e}")
+
+                                # 2. Force a backup receipt to your admin log channel
+                                try:
+                                    settings = await db.get_settings(channel.guild.id)
+                                    log_ch_id = settings.get("log_channel_id")
+                                    if log_ch_id:
+                                        log_ch = channel.guild.get_channel(int(log_ch_id))
+                                        if log_ch:
+                                            await log_ch.send(
+                                                f"⚠️ **SILENT REBUY:** {p.display_name} ({p.user_id}) auto-bought {top_up_needed} chips, but the public channel message failed to send.")
+                                except Exception:
+                                    pass
+                    # If wallet_bal < top_up_needed, triggered remains False.
+                    # The system will naturally skip the rebuy and kick them below.
+
+            if not triggered:
+                total_to_return = p.chips + p.pending_rebuy
+                if total_to_return > 0:
+                    await db.return_chips(p.user_id, total_to_return)
+                await db.clear_chips_in_play(p.user_id)
+                t.game.players.remove(p)
+                try:
+                    await channel.send(
+                        f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** <:poker_chip:1490458259855773707>) is below the big blind (**{bb}** <:poker_chip:1490458259855773707>). Chips returned to wallet.")
+                except Exception as e:
+                    print(f"[Error] Failed to send below-BB kick msg for {p.user_id}: {e}")
+                    try:
+                        settings = await db.get_settings(channel.guild.id)
+                        log_ch_id = settings.get("log_channel_id")
+                        if log_ch_id:
+                            log_ch = channel.guild.get_channel(int(log_ch_id))
+                            if log_ch:
+                                await log_ch.send(
+                                    f"⚠️ **SILENT KICK:** {p.display_name} ({p.user_id}) was removed for being below BB. Chips returned. Public message failed.")
+                    except Exception:
+                        pass
 
     active = [p for p in t.game.players if (p.chips + p.pending_rebuy) >= bb and p.user_id not in t.game.pending_leaves]
     pending_with_chips = [p for p in t.game.pending_joins if (p.chips + p.pending_rebuy) >= bb]
@@ -811,8 +872,8 @@ async def _handle_egirl_saro(channel, t: TableState):
                 await channel.send(
                     f"✨ **{name}** was dealt the shiny **e-girl Saroshi** again!"
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] Failed to announce E-girl Saro drop for {uid}: {e}")
     t.game.egirl_saro_holders.clear()
 
 
@@ -3718,6 +3779,32 @@ class PokerCog(commands.Cog):
             await cog.tutorial(interaction)
         else:
             await interaction.response.send_message("❌ Tutorial is not available.", ephemeral=True)
+
+    @poker.command(name="autorebuy",
+                   description="Automatically top up your stack between hands when you fall below the big blind")
+    @app_commands.describe(amount="Chips to top up to (0 = disabled, remove 'amount' option to check current setting)")
+    async def autorebuy(self, interaction: discord.Interaction, amount: int = None):
+
+        if amount is None:
+            current = await db.get_autorebuy(interaction.user.id)
+            if current > 0:
+                return await interaction.response.send_message(
+                    f"ℹ️ Your auto-rebuy is currently set to **{current:,}** chips.", ephemeral=True)
+            else:
+                return await interaction.response.send_message("ℹ️ Your auto-rebuy is currently **disabled**.",
+                                                               ephemeral=True)
+
+        if amount < 0:
+            return await interaction.response.send_message("❌ Amount can't be negative.", ephemeral=True)
+
+        await db.set_autorebuy(interaction.user.id, amount)
+
+        if amount == 0:
+            return await interaction.response.send_message("✅ Auto-rebuy disabled.", ephemeral=True)
+
+        await interaction.response.send_message(
+            f"✅ Auto-rebuy set to **{amount:,}** chips. Your stack will be topped up automatically between hands if lower than bb.",
+            ephemeral=True)
 
 
 class StatsView(discord.ui.View):

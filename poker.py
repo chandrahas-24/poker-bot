@@ -1434,6 +1434,63 @@ class BetweenHandsView(discord.ui.View):
 
 # ── Raise picker view ─────────────────────────────────────────────────────────
 
+class AllInConfirmView(discord.ui.View):
+    """Ephemeral prompt shown when a player clicks All In."""
+
+    def __init__(self, t: TableState, channel, guild):
+        super().__init__(timeout=30)
+        self.t = t
+        self.channel = channel
+        self.guild = guild
+
+    @discord.ui.button(label="Yes, All In 🚀", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 1. Defer right away
+        await interaction.response.defer()
+
+        uid = interaction.user.id
+        if not self.t.game.is_turn(uid):
+            await interaction.edit_original_response(content="❌ It is no longer your turn.", view=None)
+            self.stop()
+            return
+
+        g = self.t.game
+        p = g.get_player(uid)
+
+        # 2. Execute the All-In math
+        call_needed = g.call_amount(p)
+        raise_on_top = p.chips - call_needed
+
+        if raise_on_top <= 0:
+            success, msg = g.check_or_call(uid)
+        else:
+            success, msg = g.raise_bet(uid, raise_on_top)
+
+        if not success:
+            await interaction.edit_original_response(content=msg, view=None)
+            self.stop()
+            return
+
+        # 3. Clean up the ephemeral prompt
+        await interaction.edit_original_response(content="✅ You went all in!", view=None)
+
+        # 4. Advance the game state
+        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+            slog_clear(self.t)
+        slog(self.t, msg)
+
+        if self.t.game._hand_result:
+            await _process_result(self.guild, self.channel, self.t)
+        else:
+            await refresh(self.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="❌ All-In cancelled.", view=None)
+        self.stop()
+
 class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
     amount = discord.ui.TextInput(label="Raise BY how many chips?", placeholder="e.g. 200", min_length=1, max_length=7)
 
@@ -1524,26 +1581,14 @@ class RaisePickerView(discord.ui.View):
         if not self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
             return
-        await interaction.response.defer()
-        g = self.t.game
-        p = g.get_player(interaction.user.id)
-        if not p:
-            await interaction.followup.send("❌ Not your turn.", ephemeral=True); return
-        call_needed  = g.call_amount(p)
-        raise_on_top = p.chips - call_needed
-        if raise_on_top <= 0:
-            success, msg = g.check_or_call(interaction.user.id)
-        else:
-            success, msg = g.raise_bet(interaction.user.id, raise_on_top)
-        if not success:
-            await interaction.followup.send(msg, ephemeral=True); return
-        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-            slog_clear(self.t)
-        slog(self.t, msg)
-        if self.t.game._hand_result:
-            await _process_result(self.guild, self.channel, self.t)
-        else:
-            await refresh(self.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+
+        # Trigger the private confirmation prompt!
+        view = AllInConfirmView(self.t, self.channel, self.guild)
+        await interaction.response.send_message(
+            "⚠️ **Are you sure you want to go ALL IN?**\n*(This will commit all your remaining chips to the pot!)*",
+            view=view,
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Custom…", style=discord.ButtonStyle.grey, row=0)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button):

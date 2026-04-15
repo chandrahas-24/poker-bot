@@ -850,7 +850,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     rate, is_special = db.get_tax_config()
     if is_special:
         pct_string = f"{rate * 100:g}%"
-        embed.set_footer(text=f"✨ Low-Tax Day! Tax is {pct_string} (All of it goes to Jackpot) ✨")
+        embed.set_footer(text=f"✨ Jackpot Friday! Tax is {pct_string} (All of it goes to Jackpot) ✨")
 
     # 🚀 Send the final embed
     await channel.send(embed=embed)

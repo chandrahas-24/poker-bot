@@ -525,14 +525,20 @@ def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
         status = "—"
     return f"{mention}{title_str} **{p.chips} <:poker_chip:1490458259855773707>** — {status}{tag}"
 
-def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None) -> discord.Embed:
+def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None, manager_name: str = "Unknown") -> discord.Embed:
     game  = t.game
     color = STREET_COLOR.get(game.street, 0x5865F2)
     label = STREET_LABEL.get(game.street, "")
     cp    = game.current_player()
-    title = f"🃏 {t.name}  ·  Hand #{game.hand_num}" if game.hand_num else f"🃏 {t.name}"
+
+    title = f"🃏 {t.name}"
+    if game.hand_num:
+        title += f"  ·  Hand #{game.hand_num}"
+    title += f"  ·  {manager_name}"
+
     embed = discord.Embed(title=title, color=color)
     footer = f"{label}  ·  Table ID: {t.id}"
+
     if t.closing:
         footer += "  ·  Closing after this hand"
     embed.set_footer(text=footer)
@@ -646,7 +652,18 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
     except Exception:
         pass
 
-    embed = build_embed(t, title_cache)   # sets attachment://board.png if file present
+    p_mgr = t.game.get_player(t.manager_id)
+    if p_mgr:
+        manager_name = p_mgr.display_name
+    else:
+        # Look them up in the server cache
+        member = channel.guild.get_member(t.manager_id)
+        if member:
+            manager_name = member.name  # Uses their global username instead of server nickname
+        else:
+            manager_name = f"User {t.manager_id}"  # Absolute fallback if they leave the server
+
+    embed = build_embed(t, title_cache, manager_name)   # sets attachment://board.png if file present
 
     if getattr(t, 'active_view', None):
         t.active_view.stop()

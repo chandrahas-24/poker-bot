@@ -33,7 +33,7 @@ def parse_chips(value: str) -> int | None:
         return None
 
 class TableState:
-    def __init__(self, name: str, manager_id: int):
+    def __init__(self, name: str, manager_id: int, manager_name: str = "Unknown"):
         self.id           = str(uuid.uuid4())[:8]
         self.name         = name
         self.manager_id   = manager_id

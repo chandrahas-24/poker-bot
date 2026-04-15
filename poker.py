@@ -37,6 +37,7 @@ class TableState:
         self.id           = str(uuid.uuid4())[:8]
         self.name         = name
         self.manager_id   = manager_id
+        self.manager_name = manager_name
         self.game         = PokerGame()
         self.cosmetics_cache: dict = {}
         self.active_view: discord.ui.View | None = None
@@ -652,18 +653,7 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
     except Exception:
         pass
 
-    p_mgr = t.game.get_player(t.manager_id)
-    if p_mgr:
-        manager_name = p_mgr.display_name
-    else:
-        # Look them up in the server cache
-        member = channel.guild.get_member(t.manager_id)
-        if member:
-            manager_name = member.name  # Uses their global username instead of server nickname
-        else:
-            manager_name = f"User {t.manager_id}"  # Absolute fallback if they leave the server
-
-    embed = build_embed(t, title_cache, manager_name)   # sets attachment://board.png if file present
+    embed = build_embed(t, title_cache, t.manager_name)   # sets attachment://board.png if file present
 
     if getattr(t, 'active_view', None):
         t.active_view.stop()
@@ -2381,7 +2371,7 @@ class PokerCog(commands.Cog):
                 await interaction.followup.send(
                     f"❌ A table is already running in <#{cid}>. Close it first.", ephemeral=True);
                 return
-        t = TableState(name, interaction.user.id)
+        t = TableState(name, interaction.user.id, interaction.user.name)
         tables[(interaction.guild_id, interaction.channel_id)] = t
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
@@ -2960,6 +2950,7 @@ class PokerCog(commands.Cog):
 
         # Switch the tip recipient
         t.manager_id = user.id
+        t.manager_name = user.name  # Update the saved name!
 
         await interaction.followup.send(
             f"🔄 **{user.mention}** has taken over as the dealer! All new tips will go to them.")

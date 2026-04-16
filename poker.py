@@ -222,7 +222,6 @@ async def _auto_next_hand(t: TableState, channel):
             triggered = False
 
             if autorebuy_amount > 0:
-                settings = await db.get_settings(channel.guild.id)
                 max_wallet = settings.get("max_wallet", 0)
                 current_total = p.chips + p.pending_rebuy
 
@@ -304,6 +303,7 @@ async def _auto_next_hand(t: TableState, channel):
     t.game.SMALL_BLIND = settings["small_blind"]
     t.game.BIG_BLIND   = settings["big_blind"]
     t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
+    t.game.MIN_BUYIN = settings.get("min_wallet", 50)
 
     slog_clear(t)
     t.game.tax_rate, _ = db.get_tax_config()
@@ -1045,7 +1045,9 @@ async def _process_result(guild, channel, t: TableState):
     try:
         log_task = asyncio.create_task(post_hand_log(channel, t, result))
         log_task.add_done_callback(lambda task: print(f"[Log Error] {task.exception()}") if task.exception() else None)
-        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary)
+
+        # Pass the manager's ID and Name directly from table memory!
+        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary, t.manager_id, t.manager_name)
     except Exception as e:
         print(f"[poker] log_hand error: {e}")
 

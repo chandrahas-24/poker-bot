@@ -60,6 +60,14 @@ async def init_db():
                 summary    TEXT NOT NULL
             )
         """)
+
+        try:
+            await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_id INTEGER")
+            await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_name TEXT")
+            await db.commit()
+        except Exception:
+            pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chip_log (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -513,14 +521,14 @@ async def get_player_stats(user_id: int) -> dict | None:
 
 # ── Hand log ──────────────────────────────────────────────────────────────────
 
-async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str):
-    db = await _get_db()
+async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str, dealer_id: int, dealer_name: str):
+    conn = await _get_db()
     async with _write_lock:
-        await db.execute("""
-            INSERT INTO hand_log (ts, guild_id, table_id, table_name, hand_num, summary)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), guild_id, table_id, table_name, hand_num, summary))
-        await db.commit()
+        await conn.execute("""
+            INSERT INTO hand_log (guild_id, table_id, table_name, hand_num, summary, ts, dealer_id, dealer_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (guild_id, table_id, table_name, hand_num, summary, datetime.utcnow().isoformat(), dealer_id, dealer_name))
+        await conn.commit()
 
 
 # ── In-play chip recovery ─────────────────────────────────────────────────────
@@ -1522,6 +1530,7 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
     if won and "touched_by_aces" not in owned_msgs and random.random() < 0.001:
         newly.append(("winmsg", "touched_by_aces"))
         new_msgs.append("touched_by_aces")
+        owned_msgs.add("touched_by_aces")
 
     if not newly:
         return []

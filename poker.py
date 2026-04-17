@@ -3827,12 +3827,12 @@ class PokerCog(commands.Cog):
                                                         ephemeral=True)
                 return
 
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         logs = await db.get_currency_logs(target.id)
 
         # Pass the caller (to verify button clicks) AND the target (for the embed profile)
         view = CurrencyLogView(caller=interaction.user, target=target, logs=logs)
-        await interaction.followup.send(embed=view.build_embed(), view=view)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral = True)
 
     @poker.command(name="tutorial",
                    description="Learn Texas Hold'em with a guided 3-hand walkthrough (private · fake chips · wallet never touched)")

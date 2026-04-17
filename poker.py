@@ -3463,16 +3463,24 @@ class PokerCog(commands.Cog):
             f"🧹 **Wiped {len(wiped)} inactive player(s):**\n{summary}"
         )
 
+    @poker.command(name="myactivity", description="Check activity status and see if a player is at risk")
+    @app_commands.describe(user="Player to check (Admins/Devs only, leave blank for yourself)")
+    async def myactivity(self, interaction: discord.Interaction, user: discord.Member = None):
+        target = user or interaction.user
 
-    @poker.command(name="myactivity", description="Check your activity status and see if you're at risk")
-    async def myactivity(self, interaction: discord.Interaction):
+        # 🚨 Permission Check: Block regular users from checking others
+        if target.id != interaction.user.id:
+            if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+                await interaction.response.send_message(
+                    "❌ Only Administrators or Devs can check other players' activity.", ephemeral=True)
+                return
+
         await interaction.response.defer(ephemeral=True)
-
-
-        stats = await db.get_player_activity_stats(interaction.user.id)
+        stats = await db.get_player_activity_stats(target.id)
 
         if not stats:
-            await interaction.followup.send("❌ You don't have a wallet yet! Use `/wallet` to get started.", ephemeral=True)
+            name_str = "You don't" if target.id == interaction.user.id else f"**{target.display_name}** doesn't"
+            await interaction.followup.send(f"❌ {name_str} have a wallet yet!", ephemeral=True)
             return
 
         # Calculate wipe timestamp
@@ -3484,10 +3492,8 @@ class PokerCog(commands.Cog):
 
         # 2. Snap to the NEXT scheduled bot wipe (03:30 UTC)
         if exact_expiration.hour < 3 or (exact_expiration.hour == 3 and exact_expiration.minute <= 30):
-            # The exact expiration happens before 3:30 AM today, so they get wiped today
             wipe_date = exact_expiration.replace(hour=3, minute=30, second=0, microsecond=0)
         else:
-            # The exact expiration happens after 3:30 AM, so they survive until tomorrow's wipe
             wipe_date = (exact_expiration + timedelta(days=1)).replace(hour=3, minute=30, second=0, microsecond=0)
 
         wipe_timestamp = int(wipe_date.timestamp())
@@ -3495,86 +3501,70 @@ class PokerCog(commands.Cog):
         # Build embed
         embed = discord.Embed(title=f"📊 Activity Status: {stats['username']}", color=0x3498db)
 
-        # Basic Info with Discord Timestamps
+        # Basic Info
         total_chips = stats['balance'] + stats['pending_cashout']
         embed.add_field(name="💰 Total Chips", value=f"{total_chips:,} chips", inline=True)
         embed.add_field(name="📅 Last Active", value=f"<t:{int(last_active.timestamp())}:R>", inline=True)
 
-        # Wipe deadline with Discord timestamp
+        # Wipe deadline
         if stats['days_until_wipe'] > 0:
-            embed.add_field(
-                name="⏰ Chips Wiped",
-                value=f"<t:{wipe_timestamp}:R>",
-                inline=True
-            )
+            embed.add_field(name="⏰ Chips Wiped", value=f"<t:{wipe_timestamp}:R>", inline=True)
         else:
-            embed.add_field(
-                name="⏰ Chips Wiped",
-                value="**Next cleanup run!**",
-                inline=True
-            )
+            embed.add_field(name="⏰ Chips Wiped", value="**Next cleanup run!**", inline=True)
 
         # Progress Bar Helper Function
         def progress_bar(current: int, required: int, length: int = 10) -> str:
             filled = min(int((current / max(required, 1)) * length), length)
-            done   = "🟩" * filled
-            empty  = "⬜" * (length - filled)
-            pct    = min(int((current / max(required, 1)) * 100), 100)
+            done = "🟩" * filled
+            empty = "⬜" * (length - filled)
+            pct = min(int((current / max(required, 1)) * 100), 100)
             return f"{done}{empty}  **{current}/{required}** ({pct}%)"
 
-        # Hands Progress with Visual Bar
+        # Hands Progress
         hands_bar = progress_bar(stats['recent_hands'], db.MIN_HANDS_PER_PERIOD)
         hands_status = "✅" if stats['meets_hand_requirement'] else "❌"
-        embed.add_field(
-            name=f"🃏 Hands Played {hands_status}",
-            value=hands_bar,
-            inline=False
-        )
+        embed.add_field(name=f"🃏 Hands Played {hands_status}", value=hands_bar, inline=False)
 
         # Chips Wagered Progress (if enabled)
         if db.MIN_CHIPS_WAGERED > 0:
             chips_bar = progress_bar(stats['recent_chips_wagered'], db.MIN_CHIPS_WAGERED)
             chips_status = "✅" if stats['meets_wager_requirement'] else "❌"
-            embed.add_field(
-                name=f"💵 Chips Wagered {chips_status}",
-                value=chips_bar,
-                inline=False
-            )
+            embed.add_field(name=f"💵 Chips Wagered {chips_status}", value=chips_bar, inline=False)
 
-            # Status with Dynamic Color
+            # Status logic
             days_left = stats['days_until_wipe']
+            is_self = target.id == interaction.user.id
+            pronoun = "You are" if is_self else "They are"
+            action_pronoun = "You" if is_self else "They"
 
-            # Override: If they did their homework, they are safe!
             if stats['meets_hand_requirement'] and (db.MIN_CHIPS_WAGERED == 0 or stats['meets_wager_requirement']):
                 status = "🟢 **SAFE** - Requirements met!"
-                color = 0x2ecc71  # Green
-                action = "You are fully protected from the next wipe."
+                color = 0x2ecc71
+                action = f"{pronoun} fully protected from the next wipe."
             elif days_left >= 2:
-                status = "🟢 **SAFE** - You have time."
-                color = 0x2ecc71  # Green
+                status = "🟢 **SAFE** - Time remaining."
+                color = 0x2ecc71
                 needed = db.MIN_HANDS_PER_PERIOD - stats['recent_hands']
-                action = f"Play {needed} more hand(s) before the deadline."
+                action = f"{action_pronoun} need to play {needed} more hand(s) before the deadline."
             elif days_left == 1:
                 status = "🟡 **WARNING** - 1 day left!"
-                color = 0xf39c12  # Yellow
+                color = 0xf39c12
                 needed = db.MIN_HANDS_PER_PERIOD - stats['recent_hands']
-                action = f"**Play {needed} more hand(s) TODAY!**"
+                action = f"**{action_pronoun} need to play {needed} more hand(s) TODAY!**"
             else:
                 status = "🔴 **CRITICAL** - Wipe imminent!"
-                color = 0xe74c3c  # Red
+                color = 0xe74c3c
                 needed = db.MIN_HANDS_PER_PERIOD - stats['recent_hands']
-                action = f"**Play {needed} more hand(s) IMMEDIATELY!**"
+                action = f"**{action_pronoun} need to play {needed} more hand(s) IMMEDIATELY!**"
 
             embed.color = color
             embed.add_field(name="📈 Status", value=status, inline=False)
 
-            # Clear action needed (if requirements not met)
-            if not stats['meets_hand_requirement'] or (db.MIN_CHIPS_WAGERED > 0 and not stats['meets_wager_requirement']):
-                embed.add_field(name="🎯 What You Need", value=action, inline=False)
+            if not stats['meets_hand_requirement'] or (
+                    db.MIN_CHIPS_WAGERED > 0 and not stats['meets_wager_requirement']):
+                embed.add_field(name="🎯 What Is Needed", value=action, inline=False)
 
-        # Footer with helpful reminder
-        embed.set_footer(text=f"Requirements reset every {db.INACTIVITY_DAYS} days. Run this command after playing to see updates!")
-
+        embed.set_footer(text=f"Requirements reset every {db.INACTIVITY_DAYS} days.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3817,12 +3807,23 @@ class PokerCog(commands.Cog):
         # 4. Send the result!
         await interaction.followup.send(f"🃏 Test Hand: {hand_str(cards)}", file=file)
 
-    @poker.command(name="currencylog", description="View your recent chip transactions")
-    async def currencylog(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
-        logs = await db.get_currency_logs(interaction.user.id)
+    @poker.command(name="currencylog", description="View recent chip transactions")
+    @app_commands.describe(user="Player to check (Admins/Devs only, leave blank for yourself)")
+    async def currencylog(self, interaction: discord.Interaction, user: discord.Member = None):
+        target = user or interaction.user
 
-        view = CurrencyLogView(interaction.user, logs)
+        # 🚨 Permission Check
+        if target.id != interaction.user.id:
+            if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+                await interaction.response.send_message("❌ Only Administrators or Devs can check other players' logs.",
+                                                        ephemeral=True)
+                return
+
+        await interaction.response.defer(ephemeral=False)
+        logs = await db.get_currency_logs(target.id)
+
+        # Pass the caller (to verify button clicks) AND the target (for the embed profile)
+        view = CurrencyLogView(caller=interaction.user, target=target, logs=logs)
         await interaction.followup.send(embed=view.build_embed(), view=view)
 
     @poker.command(name="tutorial",
@@ -3927,9 +3928,10 @@ class StatsView(discord.ui.View):
 
 
 class CurrencyLogView(discord.ui.View):
-    def __init__(self, user: discord.User, logs: list[dict]):
+    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, logs: list[dict]):
         super().__init__(timeout=120)
-        self.user = user
+        self.caller = caller   # The person clicking the buttons
+        self.target = target   # The person whose logs we are viewing
         self.all_logs = logs
         self.logs = logs
         self.page = 0
@@ -3946,7 +3948,8 @@ class CurrencyLogView(discord.ui.View):
 
     def build_embed(self):
         embed = discord.Embed(title="Currency Log", color=0xF1C40F)
-        embed.set_author(name=self.user.display_name, icon_url=self.user.display_avatar.url)
+        # 🚨 Use the TARGET for the profile picture and name
+        embed.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
 
         if not self.logs:
             embed.description = "No transactions found for this filter."
@@ -3958,12 +3961,9 @@ class CurrencyLogView(discord.ui.View):
 
         desc_lines = []
         for log in page_logs:
-            # Convert ISO string to UNIX timestamp for Discord
             dt = datetime.fromisoformat(log['ts']).replace(tzinfo=_tz.utc)
             unix_ts = int(dt.timestamp())
-
             sign = "+" if log['amount'] > 0 else ""
-
             desc_lines.append(f"**{log['description']}**")
             desc_lines.append(f"└ <t:{unix_ts}:R>")
             desc_lines.append(f"└ {sign}{log['amount']:,} <:poker_chip:1490458259855773707>")
@@ -3988,9 +3988,9 @@ class CurrencyLogView(discord.ui.View):
         row=0
     )
     async def filter_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        if interaction.user.id != self.user.id:
-            await interaction.response.send_message("❌ This is not your log.", ephemeral=True);
-            return
+        # 🚨 Verify the CALLER is the one clicking
+        if interaction.user.id != self.caller.id:
+            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True); return
 
         self.filter = select.values[0]
         if self.filter == "All":
@@ -4004,21 +4004,21 @@ class CurrencyLogView(discord.ui.View):
 
     @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.blurple, row=1)
     async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user.id: return
+        if interaction.user.id != self.caller.id: return
         self.page = 0
         self.update_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.blurple, row=1)
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user.id: return
+        if interaction.user.id != self.caller.id: return
         self.page = max(0, self.page - 1)
         self.update_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.blurple, row=1)
     async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user.id: return
+        if interaction.user.id != self.caller.id: return
         max_pages = max(1, math.ceil(len(self.logs) / self.per_page))
         self.page = min(max_pages - 1, self.page + 1)
         self.update_buttons()
@@ -4026,7 +4026,7 @@ class CurrencyLogView(discord.ui.View):
 
     @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.blurple, row=1)
     async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user.id: return
+        if interaction.user.id != self.caller.id: return
         max_pages = max(1, math.ceil(len(self.logs) / self.per_page))
         self.page = max_pages - 1
         self.update_buttons()

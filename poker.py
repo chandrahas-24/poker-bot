@@ -2290,12 +2290,12 @@ class PokerCog(commands.Cog):
 
         # 🚨 FIX: Added the missing slash to poker.db-wal, and added all 3 tutorial files!
         files_to_zip = [
-            "/app/data/poker.db",
-            "/app/data/poker.db-wal",
-            "/app/data/poker.db-shm",
-            "/app/data/tutorial.db",
-            "/app/data/tutorial.db-wal",
-            "/app/data/tutorial.db-shm"
+            "poker.db",
+            "poker.db-wal",
+            "poker.db-shm",
+            "tutorial.db",
+            "tutorial.db-wal",
+            "tutorial.db-shm"
         ]
 
         try:

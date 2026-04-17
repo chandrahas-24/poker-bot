@@ -2,7 +2,7 @@ import aiosqlite
 import asyncio
 from datetime import datetime
 
-DB_PATH = "/app/data/tutorial.db"
+DB_PATH = "tutorial.db"
 _db: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()
 

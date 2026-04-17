@@ -2288,10 +2288,18 @@ class PokerCog(commands.Cog):
         clean_zip_name = f"poker_backup_{date_str}.zip"
         zip_path = os.path.join("/app/data", clean_zip_name)
 
-        files_to_zip = ["/app/data/poker.db", "/app/datapoker.db-wal", "/app/data/poker.db-shm"]
+        # 🚨 FIX: Added the missing slash to poker.db-wal, and added all 3 tutorial files!
+        files_to_zip = [
+            "/app/data/poker.db",
+            "/app/data/poker.db-wal",
+            "/app/data/poker.db-shm",
+            "/app/data/tutorial.db",
+            "/app/data/tutorial.db-wal",
+            "/app/data/tutorial.db-shm"
+        ]
 
         try:
-            # Force SQLite to flush the WAL to the main DB safely
+            # Force SQLite to flush the WAL to the main DB safely for the main poker DB
             async with db._write_lock:
                 conn = await db._get_db()
                 await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -2302,7 +2310,7 @@ class PokerCog(commands.Cog):
                     if os.path.exists(full_path):
                         zipf.write(full_path, arcname=os.path.basename(full_path))
 
-                        # 3. Send the file to Discord
+            # 3. Send the file to Discord
             with open(zip_path, 'rb') as f:
                 discord_file = discord.File(f, filename=clean_zip_name)
                 await user.send(f"📦 **Database Backup** ({date_str})", file=discord_file)

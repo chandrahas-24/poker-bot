@@ -2286,7 +2286,7 @@ class PokerCog(commands.Cog):
         # 1. Get the absolute path to the directory this script lives in
         base_dir = os.path.dirname(os.path.abspath(__file__))
         clean_zip_name = f"poker_backup_{date_str}.zip"
-        zip_path = os.path.join("/app/data", clean_zip_name)
+        zip_path = os.path.join("", clean_zip_name)
 
         # 🚨 FIX: Added the missing slash to poker.db-wal, and added all 3 tutorial files!
         files_to_zip = [

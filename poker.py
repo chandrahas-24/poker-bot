@@ -583,7 +583,7 @@ async def update_board(t: TableState):
     backs = max(0, 5 - len(game.community))
 
     # Push image generation to a background thread!
-    t.board_file = await asyncio.to_thread(card_images.make_strip, game.community, backs)
+    t.board_file = await asyncio.to_thread(card_images.make_strip, list(game.community), backs)
 # ── Auto-delete helper ────────────────────────────────────────────────────────
 
 async def _delete_after(message: discord.Message, delay: float):

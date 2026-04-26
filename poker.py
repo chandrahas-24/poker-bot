@@ -80,6 +80,17 @@ async def is_manager(interaction: discord.Interaction) -> bool:
             return True
     return interaction.user.guild_permissions.administrator
 
+def _task_catcher(task: asyncio.Task):
+    """Catches and prints silent errors from background tasks."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass  # Normal behavior when we cancel a timer
+    except Exception as e:
+        print(f"🚨 [FATAL TABLE ERROR] Background task crashed: {e}")
+        import traceback
+        traceback.print_exc()
+
 # ── Turn timer ────────────────────────────────────────────────────────────────
 
 def cancel_timer(t: TableState):
@@ -109,6 +120,7 @@ def start_timer(t: TableState, channel):
     t.timer_user_id = cp.user_id
     t.timer_street = t.game.street
     t.timer_task = asyncio.create_task(_turn_timer(t, channel, cp.user_id))
+    t.timer_task.add_done_callback(_task_catcher)
 
 async def _turn_timer(t: TableState, channel, user_id: int):
     settings   = await db.get_settings(channel.guild.id)
@@ -180,6 +192,7 @@ def schedule_next_hand(t: TableState, channel):
     if t.auto_task and not t.auto_task.done():
         t.auto_task.cancel()
     t.auto_task = asyncio.create_task(_auto_next_hand(t, channel))
+    t.auto_task.add_done_callback(_task_catcher)
 
 async def _auto_next_hand(t: TableState, channel):
     settings = await db.get_settings(channel.guild.id)
@@ -188,8 +201,10 @@ async def _auto_next_hand(t: TableState, channel):
     try:
         view = BetweenHandsView(t)
         t.between_msg = await channel.send(f"⏳ Next hand starting in **{delay}s**...", view=view)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"🚨 [ERROR] {e}")
+        import traceback
+        traceback.print_exc()
 
     try:
         await asyncio.sleep(delay)
@@ -264,8 +279,10 @@ async def _auto_next_hand(t: TableState, channel):
                                         if log_ch:
                                             await log_ch.send(
                                                 f"⚠️ **SILENT REBUY:** {p.display_name} ({p.user_id}) auto-bought {top_up_needed} chips, but the public channel message failed to send.")
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    print(f"🚨 [ERROR] {e}")
+                                    import traceback
+                                    traceback.print_exc()
                     # If wallet_bal < top_up_needed, triggered remains False.
                     # The system will naturally skip the rebuy and kick them below.
 
@@ -288,8 +305,10 @@ async def _auto_next_hand(t: TableState, channel):
                             if log_ch:
                                 await log_ch.send(
                                     f"⚠️ **SILENT KICK:** {p.display_name} ({p.user_id}) was removed for being below BB. Chips returned. Public message failed.")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"🚨 [ERROR] {e}")
+                        import traceback
+                        traceback.print_exc()
 
     active = [p for p in t.game.players if (p.chips + p.pending_rebuy) >= bb and p.user_id not in t.game.pending_leaves]
     pending_with_chips = [p for p in t.game.pending_joins if (p.chips + p.pending_rebuy) >= bb]
@@ -337,8 +356,10 @@ async def _close_table(channel, t: TableState):
         try:
             # Fire-and-forget: Tell Discord to remove the buttons, but DO NOT wait for it to finish
             asyncio.create_task(t.hand_msg.edit(view=None))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"🚨 [ERROR] {e}")
+            import traceback
+            traceback.print_exc()
 
     for uid in list(t.game.pending_leaves):
         p = t.game.get_player(uid)
@@ -555,13 +576,31 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
     lines = [player_line(p, game, i, tc.get(p.user_id)) for i, p in enumerate(game.players)]
     for p in game.pending_joins:
         lines.append(f"<@{p.user_id}> **{p.chips} <:poker_chip:1490458259855773707>** — ⏳ next hand")
+
+    # 1. SAFE PLAYER CHUNKS (Groups of 6)
     if lines:
-        embed.add_field(name=f"Players ({len(game.players)}/12)", value="\n".join(lines), inline=False)
+        chunk_size = 6
+        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+        for i, chunk in enumerate(chunks):
+            field_title = f"Players ({len(game.players)}/12)" if i == 0 else "\u200b"
 
+            # Fallback just in case Discord strips the invisible character
+            if not field_title.strip():
+                field_title = "\u200b"
+
+            chunk_text = "\n".join(chunk)
+            if len(chunk_text) > 1024:
+                chunk_text = chunk_text[:1020] + "..."
+            embed.add_field(name=field_title, value=chunk_text, inline=False)
+
+    # 2. SAFE STREET LOG (Hard-capped at 1024 characters)
     if t.street_log:
-        embed.add_field(name="This round", value="\n".join(t.street_log[-8:]), inline=False)
+        log_text = "\n".join(t.street_log[-8:])
+        if len(log_text) > 1024:
+            log_text = log_text[:1020] + "..."
+        embed.add_field(name="This round", value=log_text, inline=False)
 
-    # Pot / turn as last field — sits right above the board image
+    # 3. POT / TURN LOGIC
     if game.street not in (Street.WAITING,):
         pot_line = f"**Pot:** {game.pot} <:poker_chip:1490458259855773707>"
         if game.current_bet:
@@ -650,8 +689,10 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
             tid = cosmetics.get("active_title")
             if tid and tid in db.TITLES:
                 title_cache[uid] = db.TITLES[tid]["display"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"🚨 [ERROR] {e}")
+        import traceback
+        traceback.print_exc()
 
     embed = build_embed(t, title_cache, t.manager_name)   # sets attachment://board.png if file present
 
@@ -1329,8 +1370,10 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
                 member = interaction.guild.get_member(manager_id)
                 if member:
                     manager_name = member.display_name
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"🚨 [ERROR] {e}")
+            import traceback
+            traceback.print_exc()
 
         await db.add_chips(interaction.user.id, interaction.user.display_name,
                            manager_id, manager_name, tip, f"Tip from {interaction.user.display_name}")
@@ -1700,8 +1743,10 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
                 # 🚨 NEW: 100% of the bypass fee is added directly to the Jackpot
                 await db.adjust_jackpot(self.rejoin_fee)
                 await db.log_currency_event(interaction.user.id, "Jackpot", -self.rejoin_fee, "Paid rejoin bypass fee")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"🚨 [ERROR] {e}")
+                import traceback
+                traceback.print_exc()
 
             await interaction.channel.send(
                 f"🎰 **{interaction.user.display_name}** paid **{self.rejoin_fee}** <:poker_chip:1490458259855773707> directly to the **Jackpot** to bypass the rejoin cooldown!")
@@ -1961,8 +2006,10 @@ class GameView(discord.ui.View):
                 # Add '0' for backs, and 'True' for is_hole
                 file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, True, p.egirl_saro)
                 await interaction.edit_original_response(attachments=[file])
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"🚨 [ERROR] {e}")
+                import traceback
+                traceback.print_exc()
 
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2761,8 +2808,10 @@ class PokerCog(commands.Cog):
                 member = interaction.guild.get_member(manager_id)
                 if member:
                     manager_name = member.display_name
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"🚨 [ERROR] {e}")
+            import traceback
+            traceback.print_exc()
 
         # Log and send
         await db.add_chips(interaction.user.id, interaction.user.display_name,
@@ -3246,8 +3295,10 @@ class PokerCog(commands.Cog):
                     ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1490458259855773707>"
                     if note: ticket_msg += f"\n**Notes:** {note}"
                     await ch.send(ticket_msg)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"🚨 [ERROR] {e}")
+                import traceback
+                traceback.print_exc()
 
         # FIXED: Send the final receipt ephemerally
         await interaction.followup.send(

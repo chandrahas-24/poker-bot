@@ -13,7 +13,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, allowed_mentions=discord.AllowedMentions(users=True))
 
 wipe_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
 @tasks.loop(time=wipe_time)

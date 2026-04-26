@@ -2945,7 +2945,7 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(
             f"✅ **+{amount}** chips → **{user.mention}** |  Balance: **{new_bal}** <:poker_chip:1490458259855773707>"
-            + (f"\n> {note}" if note else ""), ephemeral=False)
+            + (f"\n> {note}" if note else ""), ephemeral=False, allowed_mentions=discord.AllowedMentions(users=True))
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
@@ -2991,7 +2991,7 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(
             f"✅ **-{amount}** chips from **{user.mention}** |  Balance: **{new_bal}** <:poker_chip:1490458259855773707>"
-            + (f"\n> {note}" if note else ""), ephemeral=False)
+            + (f"\n> {note}" if note else ""), ephemeral=False, allowed_mentions=discord.AllowedMentions(users=True))
 
     @pokermgr.command(name="setdealer", description="[Manager] Change the dealer (who receives tips) for this table")
     @app_commands.describe(user="The new dealer")

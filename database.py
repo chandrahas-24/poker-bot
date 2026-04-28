@@ -1175,7 +1175,7 @@ WIN_MESSAGES: dict[str, dict] = {
     },
     
     "bay": {
-        "display": "Diagnosis: winning. <:bay_lolipop:1488128797864890460>",
+        "display": "I ate all your chips. <:bay_yum:1498765555795103827>",
         "description": "",
         "rarity": "unique",
         "hidden": True,

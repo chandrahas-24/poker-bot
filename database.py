@@ -1175,7 +1175,7 @@ WIN_MESSAGES: dict[str, dict] = {
     },
     
     "bay": {
-        "display": "I ate all your chips. <:bay_yum:1498765555795103827>",
+        "display": "I ate all your chips. <:bay_full:1498767677605548272>",
         "description": "",
         "rarity": "unique",
         "hidden": True,

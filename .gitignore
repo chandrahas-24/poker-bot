@@ -1,0 +1,9 @@
+.venv/
+.idea/
+.env*
+poker.db*
+poker_beta.db*
+tutorial.db*
+__pycache__/
+*.pyc
+*.pyo

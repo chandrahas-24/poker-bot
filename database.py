@@ -20,7 +20,7 @@ async def _get_db() -> aiosqlite.Connection:
     if _db is None:
         _db = await aiosqlite.connect(DB_PATH, timeout=30)
         await _db.execute("PRAGMA journal_mode=WAL")
-        await _db.execute("PRAGMA synchronous=NORMAL") # 🚨 ADD THIS: Makes commits instant!
+        await _db.execute("PRAGMA synchronous=NORMAL")  # 🚨 ADD THIS: Makes commits instant!
         await _db.execute("PRAGMA busy_timeout=10000")
 
         await _db.execute("PRAGMA temp_store=MEMORY")
@@ -205,7 +205,7 @@ async def init_db():
             await db.execute("ALTER TABLE wallets ADD COLUMN pending_cashout INTEGER DEFAULT 0")
         except Exception:
             pass
-        
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS player_cosmetics (
                 user_id          INTEGER PRIMARY KEY,
@@ -215,7 +215,7 @@ async def init_db():
                 unlocked_win_msgs TEXT DEFAULT '["gg"]'
             )
         """)
-        
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS custom_cosmetics (
                 cosmetic_id TEXT PRIMARY KEY,
@@ -234,7 +234,7 @@ async def init_db():
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
-        
+
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
@@ -332,6 +332,7 @@ async def get_balance(user_id: int) -> int:
         row = await c.fetchone()
         return row[0] if row else 0
 
+
 async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str,
                     amount: int, note: str = "") -> int:
     db = await _get_db()
@@ -362,6 +363,7 @@ async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str
         async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
             row = await c.fetchone()
             return row[0] if row else 0
+
 
 async def deduct_chips(user_id: int, amount: int) -> bool:
     db = await _get_db()
@@ -399,16 +401,16 @@ async def upsert_wallet_name(user_id: int, username: str):
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 async def record_hand_full(
-    user_id: int,
-    username: str,
-    won: bool,
-    net_chips: int,
-    pocket_aces: bool = False,
-    all_in_win: bool = False,
-    quads_win: bool = False,
-    straight_flush_win: bool = False,
-    royal_flush_win: bool = False,
-    chips_wagered: int = 0,
+        user_id: int,
+        username: str,
+        won: bool,
+        net_chips: int,
+        pocket_aces: bool = False,
+        all_in_win: bool = False,
+        quads_win: bool = False,
+        straight_flush_win: bool = False,
+        royal_flush_win: bool = False,
+        chips_wagered: int = 0,
 ):
     """
     Single-commit replacement for the record_hand + update_win_streak +
@@ -448,7 +450,7 @@ async def record_hand_full(
             # INSERT values
             user_id, username,
             1 if won else 0, net_chips, -net_chips,
-            (1 if won else 0), (1 if won else 0),          # win_streak seed / max_win_streak seed
+            (1 if won else 0), (1 if won else 0),  # win_streak seed / max_win_streak seed
             1 if pocket_aces else 0,
             1 if all_in_win else 0,
             1 if quads_win else 0,
@@ -457,7 +459,7 @@ async def record_hand_full(
             # ON CONFLICT SET values
             1 if won else 0,
             net_chips, -net_chips,
-            won, won,                                       # win_streak CASE / max_win_streak CASE
+            won, won,  # win_streak CASE / max_win_streak CASE
             1 if pocket_aces else 0,
             1 if all_in_win else 0,
             1 if quads_win else 0,
@@ -519,9 +521,11 @@ async def get_player_stats(user_id: int) -> dict | None:
         row = await c.fetchone()
         return dict(row) if row else None
 
+
 # ── Hand log ──────────────────────────────────────────────────────────────────
 
-async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str, dealer_id: int, dealer_name: str):
+async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str, dealer_id: int,
+                   dealer_name: str):
     conn = await _get_db()
     async with _write_lock:
         await conn.execute("""
@@ -760,6 +764,7 @@ def get_tax_config() -> tuple[float, bool]:
 
     return 0.05, False  # Standard 5% rate
 
+
 async def log_tax(tax_amount: int):
     """Splits the 5% engine tax: 1% to Jackpot, 4% to House. On Tax-Free Day, 5% goes to Jackpot."""
     if tax_amount <= 0: return
@@ -783,12 +788,14 @@ async def log_tax(tax_amount: int):
                              (jackpot_cut,))
         await db.commit()
 
+
 async def get_jackpot() -> int:
     """Returns current jackpot size."""
     db = await _get_db()
     async with db.execute("SELECT amount FROM jackpot") as c:
         row = await c.fetchone()
         return row[0] if row else 0
+
 
 async def adjust_jackpot(amount: int):
     """Admin command to add or remove chips from the jackpot."""
@@ -797,6 +804,7 @@ async def adjust_jackpot(amount: int):
         await db.execute(
             "UPDATE jackpot SET amount = MAX(0, amount + ?) WHERE rowid = (SELECT MIN(rowid) FROM jackpot)", (amount,))
         await db.commit()
+
 
 async def pay_jackpot(user_id: int, username: str, amount: int, reason: str) -> int:
     """
@@ -838,12 +846,13 @@ async def pay_jackpot(user_id: int, username: str, amount: int, reason: str) -> 
 
     return actual
 
+
 async def get_revenue_stats() -> dict:
     db = await _get_db()
     now = datetime.utcnow()
-    daily_cut  = (now - timedelta(hours=24)).isoformat()
+    daily_cut = (now - timedelta(hours=24)).isoformat()
     weekly_cut = (now - timedelta(hours=168)).isoformat()
-    monthly_cut= (now - timedelta(hours=720)).isoformat()
+    monthly_cut = (now - timedelta(hours=720)).isoformat()
 
     async with db.execute("""
         SELECT
@@ -857,9 +866,9 @@ async def get_revenue_stats() -> dict:
 
     return {
         "all_time": row[0],
-        "monthly":  row[1],
-        "weekly":   row[2],
-        "daily":    row[3],
+        "monthly": row[1],
+        "weekly": row[2],
+        "daily": row[3],
     }
 
 
@@ -922,18 +931,18 @@ async def sweep_all_wallets() -> list[tuple[int, str, int]]:
 
 
 # ── Cosmetics: Titles & Win Messages ─────────────────────────────────────────
- 
+
 import json, random
- 
+
 RARITY_LABEL = {
-    "common":    "Common",
-    "uncommon":   "Uncommon",
-    "rare":       "Rare",
-    "epic":       "Epic",
-    "legendary":  "Legendary",
-    "unique":     "Unique",
+    "common": "Common",
+    "uncommon": "Uncommon",
+    "rare": "Rare",
+    "epic": "Epic",
+    "legendary": "Legendary",
+    "unique": "Unique",
 }
- 
+
 TITLES: dict[str, dict] = {
     # ── Achievement titles ──────────────────────────────────────────────────
     "grinder": {
@@ -1020,7 +1029,7 @@ TITLES: dict[str, dict] = {
         "rarity": "epic",
         "hidden": False,
     },
-    
+
     # ── Legendary rare drops ────────────────────────────────────────────────
     "sarosmommy": {
         "display": "👶 Saroshi's Mommy",
@@ -1042,7 +1051,7 @@ TITLES: dict[str, dict] = {
         "rarity": "legendary",
         "hidden": False,
     },
-    
+
     # ── Nothing to see here ─────────────────────────────────────────────────
     "guard": {
         "display": "BELIEVES IN EGIRL SAROSHINA FOREVER 😍😍😍",
@@ -1051,7 +1060,7 @@ TITLES: dict[str, dict] = {
         "hidden": True,
         "special_user": 804762802451382283,
     },
-    
+
     "bay": {
         "display": "ꕹ",
         "description": "",
@@ -1060,7 +1069,7 @@ TITLES: dict[str, dict] = {
         "special_user": 1339935869598961728,
     },
 }
- 
+
 WIN_MESSAGES: dict[str, dict] = {
     # ── Common ─────────────────────────────────────────────────────────────
     "gg": {
@@ -1163,14 +1172,14 @@ WIN_MESSAGES: dict[str, dict] = {
         "rarity": "legendary",
         "hidden": False,
     },
-    
+
     "blown_away": {
         "display": "🌬 Blown Away",
         "description": "Net loss of 10,000 all-time",
         "rarity": "legendary",
         "hidden": False,
     },
-    
+
     # ── Nothing to see here ──────────────────────────────────────────────
     "guard": {
         "display": "dev hacks enabled 🗿",
@@ -1179,7 +1188,7 @@ WIN_MESSAGES: dict[str, dict] = {
         "hidden": True,
         "special_user": 804762802451382283,
     },
-    
+
     "bay": {
         "display": "I ate all your chips. <:bay_full:1498767677605548272>",
         "description": "",
@@ -1188,8 +1197,8 @@ WIN_MESSAGES: dict[str, dict] = {
         "special_user": 1339935869598961728,
     },
 }
- 
- 
+
+
 async def get_cosmetics(user_id: int) -> dict:
     """
     Returns the player's cosmetics dict (always safe to call, never None).
@@ -1197,15 +1206,15 @@ async def get_cosmetics(user_id: int) -> dict:
     """
     db = await _get_db()
     async with db.execute(
-        "SELECT active_title, active_win_msg, unlocked_titles, unlocked_win_msgs FROM player_cosmetics WHERE user_id=?",
-        (user_id,)
+            "SELECT active_title, active_win_msg, unlocked_titles, unlocked_win_msgs FROM player_cosmetics WHERE user_id=?",
+            (user_id,)
     ) as c:
         row = await c.fetchone()
-    
+
     if row:
         cosmetics = {
-            "active_title":    row[0],
-            "active_win_msg":  row[1],
+            "active_title": row[0],
+            "active_win_msg": row[1],
             "unlocked_titles": json.loads(row[2] or "[]"),
             "unlocked_win_msgs": json.loads(row[3] or '["gg"]'),
         }
@@ -1217,13 +1226,13 @@ async def get_cosmetics(user_id: int) -> dict:
             "unlocked_titles": [],
             "unlocked_win_msgs": ["gg"],
         }
-    
+
     # Auto-unlock special user cosmetics
-    special_titles = [tid for tid, info in TITLES.items() 
-                     if info.get("special_user") == user_id and tid not in cosmetics["unlocked_titles"]]
-    special_winmsgs = [mid for mid, info in WIN_MESSAGES.items() 
-                      if info.get("special_user") == user_id and mid not in cosmetics["unlocked_win_msgs"]]
-    
+    special_titles = [tid for tid, info in TITLES.items()
+                      if info.get("special_user") == user_id and tid not in cosmetics["unlocked_titles"]]
+    special_winmsgs = [mid for mid, info in WIN_MESSAGES.items()
+                       if info.get("special_user") == user_id and mid not in cosmetics["unlocked_win_msgs"]]
+
     if special_titles or special_winmsgs:
         cosmetics["unlocked_titles"].extend(special_titles)
         cosmetics["unlocked_win_msgs"].extend(special_winmsgs)
@@ -1238,14 +1247,14 @@ async def get_cosmetics(user_id: int) -> dict:
                 UPDATE player_cosmetics 
                 SET unlocked_titles = ?, unlocked_win_msgs = ?
                 WHERE user_id = ?
-            """, (json.dumps(cosmetics["unlocked_titles"]), 
-                  json.dumps(cosmetics["unlocked_win_msgs"]), 
+            """, (json.dumps(cosmetics["unlocked_titles"]),
+                  json.dumps(cosmetics["unlocked_win_msgs"]),
                   user_id))
             await db.commit()
-    
+
     return cosmetics
- 
- 
+
+
 async def unlock_cosmetic(user_id: int, kind: str, cosmetic_id: str) -> bool:
     """Unlock a title ('title') or win message ('winmsg'). Returns True if newly unlocked."""
     cosmetics = await get_cosmetics(user_id)
@@ -1277,8 +1286,8 @@ async def unlock_cosmetic(user_id: int, kind: str, cosmetic_id: str) -> bool:
         """, (cosmetic_id, user_id))
         await db.commit()
     return True
- 
- 
+
+
 async def set_active_title(user_id: int, title_id: str | None) -> bool:
     """Equip a title. Pass None to remove. Returns False if not unlocked."""
     if title_id is not None:
@@ -1295,8 +1304,8 @@ async def set_active_title(user_id: int, title_id: str | None) -> bool:
         await db.execute("UPDATE player_cosmetics SET active_title = ? WHERE user_id = ?", (title_id, user_id))
         await db.commit()
     return True
- 
- 
+
+
 async def set_active_win_msg(user_id: int, msg_id: str | None) -> bool:
     """Equip a win message. Pass None to remove. Returns False if not unlocked."""
     if msg_id is not None:
@@ -1313,10 +1322,10 @@ async def set_active_win_msg(user_id: int, msg_id: str | None) -> bool:
         await db.execute("UPDATE player_cosmetics SET active_win_msg = ? WHERE user_id = ?", (msg_id, user_id))
         await db.commit()
     return True
- 
 
-async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, description: str = "", 
-                                  rarity: str = "rare", hidden: bool = False) -> bool:
+
+async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, description: str = "",
+                                 rarity: str = "rare", hidden: bool = False) -> bool:
     """
     Create a custom title or win message dynamically and persist it to the database.
     kind: 'title' or 'winmsg'
@@ -1325,14 +1334,14 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
     description: optional description
     rarity: common, uncommon, rare, legendary, or unique
     hidden: if True, only visible to users who own it
-    
+
     Returns True if created, False if ID already exists.
     """
     catalog = TITLES if kind == "title" else WIN_MESSAGES
-    
+
     if cosmetic_id in catalog:
         return False  # ID already exists
-    
+
     # Add to in-memory catalog
     catalog[cosmetic_id] = {
         "display": display,
@@ -1340,7 +1349,7 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
         "rarity": rarity,
         "hidden": hidden,
     }
-    
+
     # Persist to database
     db = await _get_db()
     async with _write_lock:
@@ -1362,13 +1371,14 @@ async def load_custom_cosmetics():
     """Load all custom cosmetics from the database into memory on startup."""
     db = await _get_db()
     try:
-        async with db.execute("SELECT cosmetic_id, kind, display, description, rarity, hidden FROM custom_cosmetics") as c:
+        async with db.execute(
+                "SELECT cosmetic_id, kind, display, description, rarity, hidden FROM custom_cosmetics") as c:
             rows = await c.fetchall()
-            
+
         for row in rows:
             cosmetic_id, kind, display, description, rarity, hidden = row
             catalog = TITLES if kind == "title" else WIN_MESSAGES
-            
+
             # Only load if not already defined (hardcoded cosmetics take precedence)
             if cosmetic_id not in catalog:
                 catalog[cosmetic_id] = {
@@ -1377,7 +1387,7 @@ async def load_custom_cosmetics():
                     "rarity": rarity,
                     "hidden": bool(hidden),
                 }
-        
+
         if rows:
             print(f"✅ Loaded {len(rows)} custom cosmetic(s) from database")
     except Exception as e:
@@ -1390,7 +1400,7 @@ def get_visible_cosmetics_for_user(user_id: int, owned_ids: set[str], catalog: d
     - Non-hidden cosmetics (visible to everyone)
     - Hidden cosmetics that the user owns
     - Special user cosmetics for that user
-    
+
     Returns a filtered catalog dict.
     """
     visible = {}
@@ -1404,38 +1414,17 @@ def get_visible_cosmetics_for_user(user_id: int, owned_ids: set[str], catalog: d
         # Show if it's a special cosmetic for this user
         elif info.get("special_user") == user_id:
             visible[cid] = info
-    
+
     return visible
 
-
- 
-async def update_win_streak(user_id: int, won: bool) -> tuple[int, int]:
-    """Increment or reset win streak. Returns (current_streak, max_streak)."""
-    db = await _get_db()
-    async with _write_lock:
-        if won:
-            await db.execute("""
-                UPDATE stats
-                SET win_streak     = win_streak + 1,
-                    max_win_streak = MAX(max_win_streak, win_streak + 1)
-                WHERE user_id = ?
-            """, (user_id,))
-        else:
-            await db.execute("UPDATE stats SET win_streak = 0 WHERE user_id = ?", (user_id,))
-        await db.commit()
-        async with db.execute(
-            "SELECT COALESCE(win_streak,0), COALESCE(max_win_streak,0) FROM stats WHERE user_id=?",
-            (user_id,)
-        ) as c:
-            row = await c.fetchone()
-            return (row[0], row[1]) if row else (0, 0)
 
 async def _get_times_wiped(user_id: int) -> int:
     db = await _get_db()
     async with db.execute("SELECT COALESCE(times_wiped,0) FROM stats WHERE user_id=?", (user_id,)) as c:
         row = await c.fetchone()
         return row[0] if row else 0
- 
+
+
 async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) -> list[tuple[str, str]]:
     """
     Check for newly unlocked titles and win messages. Call after updating stats.
@@ -1468,12 +1457,12 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
 
     net = chips_won - chips_lost
     owned_titles = set(json.loads(_titles_json))
-    owned_msgs   = set(json.loads(_msgs_json))
+    owned_msgs = set(json.loads(_msgs_json))
 
     # ── 2. Compute everything in-memory — zero DB calls ──────────────────────
     newly: list[tuple[str, str]] = []
     new_titles = list(owned_titles)
-    new_msgs   = list(owned_msgs)
+    new_msgs = list(owned_msgs)
 
     # Only query times_wiped if meow isn't already owned — avoids a DB hit every hand
     times_wiped = 0
@@ -1481,26 +1470,26 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         times_wiped = await _get_times_wiped(user_id)
 
     title_checks = {
-        "grinder":       hands_played >= 100,
-        "no_lifer":      hands_played >= 1000,
-        "high_roller":   hands_won    >= 100,
-        "champion":      hands_won    >= 500,
-        "stupidly_rich": net          >= 50000,
-        "hot_streak":    max_streak   >= 5,
-        "unstoppable":   max_streak   >= 10,
-        "lucky":         aa_wins      >= 5,
-        "all_in_hero":   allin_wins   >= 25,
-        "bread":         allin_wins   >= 100,
-        "quad_win":      quads_wins   >= 1,
-        "quads_4":       quads_wins   >= 4,
-        "suited_up":     sf_wins      >= 1,
-        "rf_win":        rf_wins      >= 1,
+        "grinder": hands_played >= 100,
+        "no_lifer": hands_played >= 1000,
+        "high_roller": hands_won >= 100,
+        "champion": hands_won >= 500,
+        "stupidly_rich": net >= 50000,
+        "hot_streak": max_streak >= 5,
+        "unstoppable": max_streak >= 10,
+        "lucky": aa_wins >= 5,
+        "all_in_hero": allin_wins >= 25,
+        "bread": allin_wins >= 100,
+        "quad_win": quads_wins >= 1,
+        "quads_4": quads_wins >= 4,
+        "suited_up": sf_wins >= 1,
+        "rf_win": rf_wins >= 1,
     }
     for tid, condition in title_checks.items():
         if condition and tid not in owned_titles:
             newly.append(("title", tid))
             new_titles.append(tid)
-            owned_titles.add(tid)   # prevent duplicates within this run
+            owned_titles.add(tid)  # prevent duplicates within this run
 
     if won:
         if "blessed" not in owned_titles and random.random() < 0.001:
@@ -1513,20 +1502,20 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
             owned_titles.add("chosen_one")
 
     msg_checks = {
-        "gg":             True,
-        "noobs":          hands_played >= 50,
-        "densacasino":    hands_won >= 3,
-        "l_losers":       hands_played >= 500,
-        "too_easy":       hands_won    >= 50,
-        "not_even_close": hands_won    >= 250,
-        "boring":         max_streak   >= 3,
-        "skill_issue":    aa_wins      >= 3,
-        "touch_grass":    hands_played >= 5000,
-        "meow":           times_wiped  >= 1,
-        "quad_winmsg":    quads_wins   >= 1,
-        "straight_shit":  sf_wins      >= 1,
-        "rf_winmsg":      rf_wins      >= 1,
-        "blown_away":     net          <= -10000,
+        "gg": True,
+        "noobs": hands_played >= 50,
+        "densacasino": hands_won >= 3,
+        "l_losers": hands_played >= 500,
+        "too_easy": hands_won >= 50,
+        "not_even_close": hands_won >= 250,
+        "boring": max_streak >= 3,
+        "skill_issue": aa_wins >= 3,
+        "touch_grass": hands_played >= 5000,
+        "meow": times_wiped >= 1,
+        "quad_winmsg": quads_wins >= 1,
+        "straight_shit": sf_wins >= 1,
+        "rf_winmsg": rf_wins >= 1,
+        "blown_away": net <= -10000,
     }
     for mid, condition in msg_checks.items():
         if condition and mid not in owned_msgs:
@@ -1570,6 +1559,7 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         await db.commit()
 
     return newly
+
 
 # INACTIVITY MONITOR
 
@@ -1737,6 +1727,7 @@ async def get_inactive_players() -> list[dict]:
             continue
     return inactive
 
+
 async def wipe_inactive_players() -> list[dict]:
     # Wipe chips from inactive players and return the list of affected users.
     # Also logs the action
@@ -1801,8 +1792,6 @@ async def wipe_inactive_players() -> list[dict]:
     return wiped
 
 
-
-
 # ────────────────────────────────────────────────────────────────────────────
 # HELPER: Get player's current activity status
 # ────────────────────────────────────────────────────────────────────────────
@@ -1829,6 +1818,8 @@ async def get_player_activity_stats(user_id: int) -> dict | None:
             return None
 
         data = dict(row)
+        if not data.get("last_activity"):
+            return None
         last_active = datetime.fromisoformat(data["last_activity"])
         days_inactive = (datetime.utcnow() - last_active).days
         days_until_wipe = max(0, (INACTIVITY_DAYS + GRACE_PERIOD_DAYS) - days_inactive)
@@ -1842,6 +1833,7 @@ async def get_player_activity_stats(user_id: int) -> dict | None:
 
         return data
 
+
 async def get_cosmetics_bulk(user_ids: list[int]) -> dict[int, dict]:
     """Fetch active_title for multiple players in one query. Returns {user_id: cosmetics_dict}."""
     if not user_ids:
@@ -1849,18 +1841,18 @@ async def get_cosmetics_bulk(user_ids: list[int]) -> dict[int, dict]:
     db = await _get_db()
     placeholders = ",".join("?" * len(user_ids))
     async with db.execute(
-        f"SELECT user_id, active_title, active_win_msg, unlocked_titles, unlocked_win_msgs "
-        f"FROM player_cosmetics WHERE user_id IN ({placeholders})",
-        tuple(user_ids)
+            f"SELECT user_id, active_title, active_win_msg, unlocked_titles, unlocked_win_msgs "
+            f"FROM player_cosmetics WHERE user_id IN ({placeholders})",
+            tuple(user_ids)
     ) as c:
         rows = await c.fetchall()
 
     result = {}
     for row in rows:
         result[row[0]] = {
-            "active_title":     row[1],
-            "active_win_msg":   row[2],
-            "unlocked_titles":  json.loads(row[3] or "[]"),
+            "active_title": row[1],
+            "active_win_msg": row[2],
+            "unlocked_titles": json.loads(row[3] or "[]"),
             "unlocked_win_msgs": json.loads(row[4] or '["gg"]'),
         }
     # Fill in defaults for players not yet in player_cosmetics
@@ -1871,6 +1863,7 @@ async def get_cosmetics_bulk(user_ids: list[int]) -> dict[int, dict]:
                 "unlocked_titles": [], "unlocked_win_msgs": ["gg"],
             }
     return result
+
 
 async def sync_chips_in_play(player_chip_map: dict[int, int]):
     """
@@ -1911,6 +1904,7 @@ async def log_currency_event(user_id: int, event_type: str, amount: int, descrip
         """, (user_id, event_type, amount, description, datetime.utcnow().isoformat()))
         await db.commit()
 
+
 async def get_currency_logs(user_id: int) -> list[dict]:
     """Fetch all currency logs for a user."""
     db = await _get_db()
@@ -1925,6 +1919,7 @@ async def get_autorebuy(user_id: int) -> int:
     async with db.execute("SELECT autorebuy_amount FROM wallets WHERE user_id=?", (user_id,)) as c:
         row = await c.fetchone()
         return row[0] if row else 0
+
 
 async def set_autorebuy(user_id: int, amount: int):
     db = await _get_db()

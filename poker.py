@@ -260,8 +260,6 @@ async def _auto_next_hand(t: TableState, channel):
                         if success:
                             await db.mark_chips_in_play(p.user_id, p.display_name, top_up_needed)
                             t.game.queue_rebuy(p.user_id, top_up_needed)
-                            await db.log_currency_event(p.user_id, "Cash In", -top_up_needed,
-                                                        f"Auto-rebuy: +{top_up_needed} chips")
                             triggered = True
                             try:
                                 await channel.send(
@@ -531,7 +529,7 @@ STREET_LABEL = {
 }
 
 def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
-    tag       = " 🔘" if idx == game.dealer_idx else ""
+    tag = " 🔘" if p.seat == game.dealer_seat else ""
     title_str = f" `{title}`" if title else ""
     mention   = f"<@{p.user_id}>"
     if p.folded:
@@ -695,9 +693,6 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
         traceback.print_exc()
 
     embed = build_embed(t, title_cache, t.manager_name)   # sets attachment://board.png if file present
-
-    if getattr(t, 'active_view', None):
-        t.active_view.stop()
 
     view  = GameView(t)
     t.active_view = view
@@ -1338,7 +1333,8 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
         await interaction.response.defer(ephemeral=False)
 
         p           = self.t.game.get_player(interaction.user.id)
-        table_chips = p.chips if p else 0
+        hand_running = self.t.game.street != Street.WAITING
+        table_chips = 0 if hand_running else (p.chips if p else 0)
         wallet_bal  = await db.get_balance(interaction.user.id)
 
         from_table  = min(tip, table_chips)
@@ -1445,7 +1441,8 @@ class BetweenHandsView(discord.ui.View):
         if interaction.user.id == t.manager_id:
             await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True); return
         p           = t.game.get_player(interaction.user.id)
-        table_chips = p.chips if p else 0
+        hand_running = self.t.game.street != Street.WAITING
+        table_chips = 0 if hand_running else (p.chips if p else 0)
         # wallet_bal and zero-chips check moved into TipModal.on_submit (which defers first)
         await interaction.response.send_modal(TipModal(t, 0, table_chips))
 
@@ -2771,7 +2768,8 @@ class PokerCog(commands.Cog):
             return
 
         p = t.game.get_player(interaction.user.id)
-        table_chips = p.chips if p else 0
+        hand_running = t.game.street != Street.WAITING
+        table_chips = 0 if hand_running else (p.chips if p else 0)
         wallet_bal = await db.get_balance(interaction.user.id)
 
         # Pull from table first, then wallet
@@ -3465,7 +3463,7 @@ class PokerCog(commands.Cog):
 
         if at_risk:
             risk_lines = []
-            for p in at_risk[:10]:  # Show top 10
+            for p in at_risk[:15]:  # Show top 15
                 days_ago = p.get("days_inactive", 0)
                 total = p["balance"]
                 risk_lines.append(

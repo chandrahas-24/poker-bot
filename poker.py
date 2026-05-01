@@ -260,8 +260,6 @@ async def _auto_next_hand(t: TableState, channel):
                         if success:
                             await db.mark_chips_in_play(p.user_id, p.display_name, top_up_needed)
                             t.game.queue_rebuy(p.user_id, top_up_needed)
-                            await db.log_currency_event(p.user_id, "Cash In", -top_up_needed,
-                                                        f"Auto-rebuy: +{top_up_needed} chips")
                             triggered = True
                             try:
                                 await channel.send(
@@ -695,9 +693,6 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
         traceback.print_exc()
 
     embed = build_embed(t, title_cache, t.manager_name)   # sets attachment://board.png if file present
-
-    if getattr(t, 'active_view', None):
-        t.active_view.stop()
 
     view  = GameView(t)
     t.active_view = view
@@ -3457,44 +3452,41 @@ class PokerCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=False)
 
-        # 🚨 FIXED: Actually fetch the at-risk list instead of forcing it to []
         at_risk = await db.get_players_at_risk()
         inactive = await db.get_inactive_players()
 
         embed = discord.Embed(title="🔍 Inactivity Report", color=0xe74c3c)
 
+        if inactive:
+            inactive_lines = []
+            for p in inactive[:15]:
+                days_ago = p.get("days_inactive", 0)
+                total = p["balance"]
+                inactive_lines.append(
+                    f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
+                )
+            embed.add_field(
+                name=f"💀 Wiped Next Run ({len(inactive)} players)",
+                value="\n".join(inactive_lines),
+                inline=False
+            )
+
         if at_risk:
             risk_lines = []
-            for p in at_risk[:10]:  # Show top 10
+            for p in at_risk[:15]:
                 days_ago = p.get("days_inactive", 0)
                 total = p["balance"]
                 risk_lines.append(
                     f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
                 )
             embed.add_field(
-                name=f"⚠️ At Risk - Wiping in <24h ({len(at_risk)} players)",
-                value="\n".join(risk_lines) if risk_lines else "None",
-                inline=False
-            )
-
-        if inactive:
-            inactive_lines = []
-            for p in inactive[:10]:
-                raw_date = p["last_activity"]
-                days_ago = (datetime.utcnow() - datetime.fromisoformat(raw_date)).days if isinstance(raw_date,
-                                                                                                     str) else 0
-                total = p["balance"]
-                inactive_lines.append(
-                    f"• **{p['username']}**: {total} chips ({days_ago}d ago, {p['recent_hands']} hands)"
-                )
-            embed.add_field(
-                name=f"💀 Will Be Wiped Next Run ({len(inactive)} players)",
-                value="\n".join(inactive_lines) if inactive_lines else "None",
+                name=f"⚠️ Wiped Next Next Run ({len(at_risk)} players)",
+                value="\n".join(risk_lines),
                 inline=False
             )
 
         if not at_risk and not inactive:
-            embed.description = "✅ All players are active! No chips will be wiped."
+            embed.description = "✅ All players are active! No chips will be wiped in the next two runs."
 
         await interaction.followup.send(embed=embed)
 

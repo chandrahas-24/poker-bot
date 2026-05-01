@@ -1407,6 +1407,29 @@ def get_visible_cosmetics_for_user(user_id: int, owned_ids: set[str], catalog: d
     
     return visible
 
+
+ 
+async def update_win_streak(user_id: int, won: bool) -> tuple[int, int]:
+    """Increment or reset win streak. Returns (current_streak, max_streak)."""
+    db = await _get_db()
+    async with _write_lock:
+        if won:
+            await db.execute("""
+                UPDATE stats
+                SET win_streak     = win_streak + 1,
+                    max_win_streak = MAX(max_win_streak, win_streak + 1)
+                WHERE user_id = ?
+            """, (user_id,))
+        else:
+            await db.execute("UPDATE stats SET win_streak = 0 WHERE user_id = ?", (user_id,))
+        await db.commit()
+        async with db.execute(
+            "SELECT COALESCE(win_streak,0), COALESCE(max_win_streak,0) FROM stats WHERE user_id=?",
+            (user_id,)
+        ) as c:
+            row = await c.fetchone()
+            return (row[0], row[1]) if row else (0, 0)
+
 async def _get_times_wiped(user_id: int) -> int:
     db = await _get_db()
     async with db.execute("SELECT COALESCE(times_wiped,0) FROM stats WHERE user_id=?", (user_id,)) as c:
@@ -1806,8 +1829,6 @@ async def get_player_activity_stats(user_id: int) -> dict | None:
             return None
 
         data = dict(row)
-        if not data.get("last_activity"):
-            return None
         last_active = datetime.fromisoformat(data["last_activity"])
         days_inactive = (datetime.utcnow() - last_active).days
         days_until_wipe = max(0, (INACTIVITY_DAYS + GRACE_PERIOD_DAYS) - days_inactive)

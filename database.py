@@ -174,9 +174,11 @@ async def init_db():
             BEGIN
                 DELETE FROM currency_log 
                 WHERE user_id = NEW.user_id 
+                  AND NOT (event_type = 'Jackpot' AND amount > 0)
                   AND id NOT IN (
                       SELECT id FROM currency_log 
-                      WHERE user_id = NEW.user_id 
+                      WHERE user_id = NEW.user_id
+                      AND NOT (event_type = 'Jackpot' AND amount > 0)
                       ORDER BY id DESC 
                       LIMIT 200
                   );

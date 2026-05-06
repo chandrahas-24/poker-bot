@@ -3443,7 +3443,7 @@ class PokerCog(commands.Cog):
         )
         embed.set_thumbnail(
             url="https://media.discordapp.net/attachments/1478125269285081211/1488098208986038282/3d-casino-poker-cards-and-playing-chips-on-black-background-illustration-free-vector.png?ex=69cb8af4&is=69ca3974&hm=58f")
-        embed.set_footer(text="• 5% Q, 20% SF, 60% RF, 80% Shiny (2b min)")
+        embed.set_footer(text="• 5% Q, 20% SF, 60% RF, 80% Shiny")
 
         await interaction.followup.send(embed=embed)
 

@@ -1002,9 +1002,9 @@ TITLES: dict[str, dict] = {
         "hidden": False,
     },
     "bread": {
-        "display": "🍞",
-        "description": "Win 100 all-in hands",
-        "rarity": "rare",
+        "display": "🥪",
+        "description": "Win 200 all-in hands",
+        "rarity": "epic",
         "hidden": False,
     },
     "quad_win": {

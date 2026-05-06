@@ -1007,6 +1007,12 @@ TITLES: dict[str, dict] = {
         "rarity": "epic",
         "hidden": False,
     },
+    "sandwich": {
+        "display": "🍞",
+        "description": "Win 100 all-in hands",
+        "rarity": "rare",
+        "hidden": False,
+    },
     "quad_win": {
         "display": "Fantastic Four",
         "description": "Win a hand with Four of a Kind",
@@ -1482,6 +1488,7 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         "lucky": aa_wins >= 5,
         "all_in_hero": allin_wins >= 25,
         "bread": allin_wins >= 100,
+        "sandwich": allin_wins >= 200,
         "quad_win": quads_wins >= 1,
         "quads_4": quads_wins >= 4,
         "suited_up": sf_wins >= 1,

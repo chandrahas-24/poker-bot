@@ -1823,7 +1823,15 @@ class GameView(discord.ui.View):
 
         self.btn_leave.disabled = t.closing  # <-- ADD THIS LINE
 
-        for b in [self.btn_call, self.btn_check, self.btn_raise, self.btn_fold]:
+        cp = t.game.current_player()
+        if cp and t.game.call_amount(cp) > 0:
+            self.btn_check_call.label = "Call"
+            self.btn_check_call.style = discord.ButtonStyle.green
+        else:
+            self.btn_check_call.label = "Check"
+            self.btn_check_call.style = discord.ButtonStyle.blurple
+
+        for b in [self.btn_check_call, self.btn_raise, self.btn_fold]:
             b.disabled = not in_hand
 
     async def _do_action(self, interaction: discord.Interaction, fn, *args):
@@ -1932,20 +1940,11 @@ class GameView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Call",  style=discord.ButtonStyle.green,  row=1)
-    async def btn_call(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Check", style=discord.ButtonStyle.green, row=1)
+    async def btn_check_call(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
-        await self._do_action(interaction, self.t.game.check_or_call, interaction.user.id)
-
-    @discord.ui.button(label="Check", style=discord.ButtonStyle.blurple, row=1)
-    async def btn_check(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
-        p = self.t.game.get_player(interaction.user.id)
-        if p and self.t.game.call_amount(p) > 0:
-            await interaction.response.send_message(
-                f"❌ There's **{self.t.game.call_amount(p)}** to call. Use Call or Fold.", ephemeral=True); return
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True);
+            return
         await self._do_action(interaction, self.t.game.check_or_call, interaction.user.id)
 
     @discord.ui.button(label="Raise", style=discord.ButtonStyle.green, row=1)

@@ -2010,17 +2010,9 @@ class GameView(discord.ui.View):
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "**Hand Rankings** *(best → worst)*\n```\n"
-            "1.  Royal Flush       A K Q J 10 — same suit\n"
-            "2.  Straight Flush    5 in a row — same suit\n"
-            "3.  Four of a Kind    4 of same rank\n"
-            "4.  Full House        3-of-a-kind + pair\n"
-            "5.  Flush             Any 5 of same suit\n"
-            "6.  Straight          5 in a row — any suits\n"
-            "7.  Three of a Kind   3 of same rank\n"
-            "8.  Two Pair          Two different pairs\n"
-            "9.  One Pair          Two of same rank\n"
-            "10. High Card         None of the above\n```", ephemeral=True)
+            "**Hand Rankings** *(best → worst)*\nhttps://media.discordapp.net/attachments/1479529924510613624/1501920657582198927/image.png?ex=69fdd41d&is=69fc829d&hm=dada0ee72bc584e7c26c8bd6b1d5e63bc947a865fd4367e9aca0c4a546c7e141&=&format=webp&quality=lossless&width=1136&height=1466",
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Wallet", style=discord.ButtonStyle.grey, row=2)
     async def btn_wallet(self, interaction: discord.Interaction, button: discord.ui.Button):

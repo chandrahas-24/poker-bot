@@ -2358,7 +2358,7 @@ class PokerCog(commands.Cog):
     # ── THE AUTO TIMER (Every 2 Hours) ────────────────────────────────────
     backup_times = [
         dt_time(hour=h, minute=30, tzinfo=_tz.utc)
-        for h in range(1, 23, 2)
+        for h in range(0, 23)
     ]
     @tasks.loop(time=backup_times)
     async def daily_backup(self):

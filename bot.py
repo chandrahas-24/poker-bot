@@ -6,6 +6,7 @@ from database import init_db, recover_chips_in_play
 from tutorial_db import init_db as init_tutorial_db
 from discord.ext import tasks
 import datetime
+import subprocess
 
 load_dotenv()
 
@@ -82,6 +83,30 @@ async def on_message(message: discord.Message):
 async def on_command_error(ctx, error):
     if isinstance(error, discord.ext.commands.CommandNotFound):
         return
+
+# Your specific Discord User ID
+AUTHORIZED_ADMINS = [1339935869598961728,412651268142792704,804762802451382283]
+
+
+@bot.command()
+async def restart(ctx):
+    if ctx.author.id not in AUTHORIZED_ADMINS:
+        await ctx.send("**Access Denied.** This command is restricted.")
+        return
+
+    await ctx.send("**Initiating Deployment...**")
+
+    try:
+        # Pull latest changes from Git
+        pull_output = subprocess.check_output(["git", "pull"]).decode("utf-8")
+        await ctx.send(f"**Git Pull Success:**\n```\n{pull_output}\n```")
+
+        # Kill the bot. Systemd will restart it immediately.
+        await ctx.send("**Restarting bot service...**")
+        os._exit(0)
+
+    except Exception as e:
+        await ctx.send(f"**Deployment Failed:**\n```python\n{e}\n```")
 
 
 if __name__ == "__main__":

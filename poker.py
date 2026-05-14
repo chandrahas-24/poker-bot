@@ -11,14 +11,17 @@ import os, asyncio, uuid, zipfile
 from datetime import datetime, timedelta, time as dt_time, timezone as _tz
 import time
 import math
+import config
+import jackpot
+import taxation
 from tutorial_cog import TutorialCog
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
 
-TURN_TIMEOUT_DEFAULT    = 300
-NEXT_HAND_DELAY_DEFAULT = 30
-TABLE_RESEND_MSGS       = 10
+TURN_TIMEOUT_DEFAULT    = config.TURN_TIMEOUT_DEFAULT
+NEXT_HAND_DELAY_DEFAULT = config.NEXT_HAND_DELAY_DEFAULT
+TABLE_RESEND_MSGS       = config.TABLE_RESEND_MSGS
 
 # ── TableState ────────────────────────────────────────────────────────────────
 
@@ -57,6 +60,7 @@ class TableState:
         self.session_allin_winners: set[int] = set()
         self.rejoin_cooldowns: dict[int, float] = {}
         self.leave_cooldown_pending: set[int] = set()
+        self.action_lock = asyncio.Lock()
 
 tables: dict[tuple, TableState] = {}
 
@@ -323,7 +327,6 @@ async def _auto_next_hand(t: TableState, channel):
     t.game.MIN_BUYIN = settings.get("min_wallet", 50)
 
     slog_clear(t)
-    t.game.tax_rate, _ = db.get_tax_config()
     success, msg = t.game.start_hand()
     slog(t, msg)
 
@@ -428,7 +431,7 @@ async def post_hand_log(channel, t: TableState, result):
         return
     game = t.game
 
-    rate, is_special = db.get_tax_config()
+    rate, is_special = taxation.get_tax_config()
 
     header = f"Hand #{game.hand_num} | Table: {t.name} ({t.id}) | Pot: {result.pot}"
     if getattr(result, "tax", 0) > 0:
@@ -577,10 +580,10 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
 
     # 1. SAFE PLAYER CHUNKS (Groups of 6)
     if lines:
-        chunk_size = 6
+        chunk_size = config.PLAYERS_PER_FIELD
         chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
         for i, chunk in enumerate(chunks):
-            field_title = f"Players ({len(game.players)}/12)" if i == 0 else "\u200b"
+            field_title = f"Players ({len(game.players)}/{config.MAX_PLAYERS})" if i == 0 else "\u200b"
 
             # Fallback just in case Discord strips the invisible character
             if not field_title.strip():
@@ -883,7 +886,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
         if stack_lines:
             embed.add_field(name="💰 Final Stacks", value="\n".join(stack_lines), inline=False)
 
-    rate, is_special = db.get_tax_config()
+    rate, is_special = taxation.get_tax_config()
     if is_special:
         pct_string = f"{rate * 100:g}%"
         embed.set_footer(text=f"✨ Jackpot Friday! Tax is {pct_string} (All of it goes to Jackpot) ✨")
@@ -937,7 +940,6 @@ async def _process_result(guild, channel, t: TableState):
     achievement_announces: list[str] = [] # same pattern, collected then sent after hand result
     try:
         sp_map = {sp.user_id: sp for sp in (result.showdown_players or [])}
-        player_flags: dict[int, dict] = {}  # keyed by user_id, populated for winners only
 
         for p in t.game.players:
             won = any(w.user_id == p.user_id for w in result.winners)
@@ -953,51 +955,8 @@ async def _process_result(guild, channel, t: TableState):
             all_in_win = bool(won and result.allin_user_ids and p.user_id in result.allin_user_ids)
 
             quads_win = sf_win = rf_win = False
-
-            # Evaluate using hole_cards fallback (covers fold wins where sp may be None)
-            hole_cards = sp.hole_cards if sp else p.hole_cards
-            if won and hole_cards and result.community and len(result.community) >= 3:
-                score = evaluator.evaluate(hole_cards, result.community)
-                rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
-
-                board_score = None
-                board_rank_str = ""
-
-                if len(result.community) == 5:
-                    # Treys needs 5 cards split into two lists to evaluate properly
-                    board_score = evaluator.evaluate(result.community[:2], result.community[2:])
-                    board_rank_str = evaluator.class_to_string(evaluator.get_rank_class(board_score))
-                elif len(result.community) == 4:
-                    # If everyone folds on the Turn, manually check if the 4 cards are Quads
-                    ranks_on_board = [Card.get_rank_int(c) for c in result.community]
-                    if len(set(ranks_on_board)) == 1:
-                        board_score = score
-                        board_rank_str = "Four of a Kind"
-
-                # 1. QUADS LOGIC (Strict High-Roller Rule)
-                # The board cannot ALREADY be Quads. Kickers do NOT count for the jackpot!
-                if rank_str == "Four of a Kind":
-                    if board_rank_str != "Four of a Kind":
-                        quads_win = True
-
-                # 2. STRAIGHT FLUSH LOGIC (Dynamic Score Rule)
-                # In treys, a LOWER score is better. If score < board_score, they used a
-                # hole card to construct a HIGHER-RANKING Straight Flush than the board!
-                elif rank_str == "Straight Flush":
-                    played_board = (board_score is not None) and (score >= board_score)
-                    if not played_board:
-                        sf_win = True
-                        rf_win = (score == 1)
-
-            # Store flags for jackpot split logic after the player loop
             if won:
-                player_flags[p.user_id] = {
-                    "player": p,
-                    "egirl":  p.egirl_saro,
-                    "rf":     rf_win,
-                    "sf":     sf_win,
-                    "quads":  quads_win,
-                }
+                quads_win, sf_win, rf_win = jackpot.evaluate_jackpot_tiers(p, result.community)
 
             # ────────────────────────────────────────────────────────────────
 
@@ -1029,38 +988,8 @@ async def _process_result(guild, channel, t: TableState):
             achievement_announces.append("\n".join(lines))
 
         # ── Jackpot split payout ──────────────────────────────────────────────
-        # All percentages are of the same jackpot snapshot taken once.
-        # Egirl blocks all other tiers. RF winners are excluded from SF tier.
-        try:
-            egirl_players = [f["player"] for f in player_flags.values() if f["egirl"]]
-            if egirl_players:
-                tiers = [("✨ E-girl Saroshi Ace", 0.80, egirl_players)]
-            else:
-                tiers = []
-                rf_players    = [f["player"] for f in player_flags.values() if f["rf"]]
-                sf_players    = [f["player"] for f in player_flags.values() if f["sf"] and not f["rf"]]
-                quads_players = [f["player"] for f in player_flags.values() if f["quads"]]
-                if rf_players:
-                    tiers.append(("👑 Royal Flush", 0.60, rf_players))
-                if sf_players:
-                    tiers.append(("🔥 Straight Flush", 0.20, sf_players))
-                if quads_players:
-                    tiers.append(("🃏 Four of a Kind", 0.05, quads_players))
-
-            if tiers:
-                jackpot_now = await db.get_jackpot()
-                if jackpot_now > 0:
-                    for jp_tier, jp_pct, winners in tiers:
-                        each_pct = jp_pct / len(winners)
-                        for p in winners:
-                            payout = math.ceil(jackpot_now * each_pct)
-                            actual = await db.pay_jackpot(p.user_id, p.display_name, payout, jp_tier)
-                            if actual > 0:
-                                new_jp = await db.get_jackpot()
-                                await db.log_currency_event(p.user_id, "Jackpot", actual, f"Won {jp_tier}!")
-                                jackpot_hits.append((p.user_id, jp_tier, actual, new_jp))
-        except Exception as e:
-            print(f"[poker] jackpot payout error: {e}")
+        eligible_for_jackpot = [p for p in (result.showdown_players or []) if not p.folded]
+        jackpot_hits = await jackpot.process_jackpot_hits(eligible_for_jackpot, result.community)
 
     except Exception as e:
         print(f"[poker] stats/achievement error: {e}")
@@ -1074,7 +1003,7 @@ async def _process_result(guild, channel, t: TableState):
     # 🚨 LOG THE TAX TO REVENUE/JACKPOT
     try:
         if getattr(result, "tax", 0) > 0:
-            await db.log_tax(result.tax)
+            await taxation.process_and_log_tax(result.tax)
     except Exception as e:
         print(f"[poker] log_tax error: {e}")
 
@@ -1082,10 +1011,10 @@ async def _process_result(guild, channel, t: TableState):
         log_task = asyncio.create_task(post_hand_log(channel, t, result))
         log_task.add_done_callback(lambda task: print(f"[Log Error] {task.exception()}") if task.exception() else None)
 
-        # Pass the manager's ID and Name directly from table memory!
-        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary, t.manager_id, t.manager_name)
+        # Update the specific row we created when this hand started
+        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary, t.manager_id, t.manager_name, result.action_history)
     except Exception as e:
-        print(f"[poker] log_hand error: {e}")
+        print(f"[poker] complete_hand_log error: {e}")
 
     try:
         for uid in list(t.game.pending_leaves):
@@ -1526,7 +1455,10 @@ class AllInConfirmView(discord.ui.View):
         # 4. Advance the game state
         if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
             slog_clear(self.t)
-        slog(self.t, msg)
+
+        for part in msg.split("\n"):
+            if part.strip():
+                slog(self.t, part)
 
         if self.t.game._hand_result:
             await _process_result(self.guild, self.channel, self.t)
@@ -1564,7 +1496,10 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
             await interaction.followup.send(msg, ephemeral=True); return
         if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
             slog_clear(self.t)
-        slog(self.t, msg)
+
+        for part in msg.split("\n"):
+            if part.strip():
+                slog(self.t, part)
         if self.t.game._hand_result:
             await _process_result(interaction.guild, self.channel, self.t)
         else:
@@ -1586,7 +1521,10 @@ class RaisePickerView(discord.ui.View):
             await interaction.followup.send(msg, ephemeral=True); return
         if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
             slog_clear(self.t)
-        slog(self.t, msg)
+
+        for part in msg.split("\n"):
+            if part.strip():
+                slog(self.t, part)
         if self.t.game._hand_result:
             await _process_result(self.guild, self.channel, self.t)
         else:
@@ -1835,22 +1773,25 @@ class GameView(discord.ui.View):
             b.disabled = not in_hand
 
     async def _do_action(self, interaction: discord.Interaction, fn, *args):
-        ok, msg = fn(*args)
-        if not ok:
-            await interaction.response.send_message(msg, ephemeral=True); return
-        parts = msg.split("\n")
-        street_markers = ["🌊", "↩️", "🏁"]
-        if any(m in msg for m in street_markers + ["Showdown"]):
-            slog_clear(self.t)
-        slog(self.t, parts[0])
-        for part in parts[1:]:
-            if any(m in part for m in street_markers):
-                slog(self.t, part); break
-        await interaction.response.defer()
-        if self.t.game._hand_result:
-            await _process_result(interaction.guild, interaction.channel, self.t)
-        else:
-            await refresh(interaction.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+        await interaction.response.defer()  # defer FIRST before lock
+        async with self.t.action_lock:
+            ok, msg = fn(*args)
+            if not ok:
+                await interaction.followup.send(msg, ephemeral=True);
+                return
+            parts = msg.split("\n")
+            street_markers = ["🌊", "↩️", "🏁"]
+            if any(m in msg for m in street_markers + ["Showdown"]):
+                slog_clear(self.t)
+
+            # Loop through everything and log every action in the chain!
+            for part in parts:
+                if part.strip():
+                    slog(self.t, part)
+            if self.t.game._hand_result:
+                await _process_result(interaction.guild, interaction.channel, self.t)
+            else:
+                await refresh(interaction.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
 
     @discord.ui.button(label="Join", style=discord.ButtonStyle.green, row=0)
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1877,7 +1818,7 @@ class GameView(discord.ui.View):
         if expiry and time.time() < expiry:
 
             # 🚨 NEW: Fee is dynamically set to 2x the table's current Big Blind
-            fee = self.t.game.BIG_BLIND * 2
+            fee = self.t.game.BIG_BLIND * config.REJOIN_FEE_MULTIPLIER
 
             if fee > 0 and bal >= fee and bal - fee >= min_w:
                 await interaction.response.send_message(
@@ -2023,6 +1964,21 @@ class GameView(discord.ui.View):
         table_str = f"  |  **At table:** {p.chips} <:poker_chip:1490458259855773707>" if p else ""
         pending_str = f"  |  **Pending Cashout:** 🔒 {pending} <:poker_chip:1490458259855773707>" if pending > 0 else ""
         await interaction.followup.send(f"**Your Wallet:** {bal} <:poker_chip:1490458259855773707>{table_str}{pending_str}", ephemeral=True)
+
+    @discord.ui.button(label="Premove", style=discord.ButtonStyle.grey, row=0)
+    async def btn_premove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self.t.game.get_player(interaction.user.id)
+        if not p:
+            await interaction.response.send_message("❌ You're not at the table.", ephemeral=True);
+            return
+        if self.t.game.is_turn(interaction.user.id):
+            await interaction.response.send_message("❌ It's your turn — just act normally.", ephemeral=True);
+            return
+        await interaction.response.send_message(
+            "**Set a premove** — executes automatically when it's your turn:",
+            view=PremoveView(self.t, interaction.user.id),
+            ephemeral=True
+        )
 
 # ── Confirm DB reset ──────────────────────────────────────────────────────────
 
@@ -2285,11 +2241,7 @@ async def _autocomplete_grant_cosmetic(
 
 class PokerCog(commands.Cog):
 
-    DEV_USER_IDS = {
-        1339935869598961728, # baymax for backups
-        804762802451382283, # real baymax
-    }
-
+    DEV_USER_IDS = config.DEV_USER_IDS
 
     def __init__(self, bot):
         self.bot = bot
@@ -2489,7 +2441,6 @@ class PokerCog(commands.Cog):
         t.game.kicked_users.clear()
 
         slog_clear(t)
-        t.game.tax_rate, _ = db.get_tax_config()
         success, msg = t.game.start_hand()
         slog(t, msg)
         if not success:
@@ -2914,13 +2865,10 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
-        allowed_str = os.getenv("ADD_CHIPS_CHANNELS", "")
-        if allowed_str:
-            allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
-            if allowed_channels and interaction.channel_id not in allowed_channels:
-                mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
-                await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
-                return
+        if config.ADD_CHIPS_CHANNELS and interaction.channel_id not in config.ADD_CHIPS_CHANNELS:
+            mentions = ", ".join(f"<#{cid}>" for cid in config.ADD_CHIPS_CHANNELS)
+            await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+            return
 
         if amount <= 0:
             await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
@@ -2946,13 +2894,11 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
-        allowed_str = os.getenv("REMOVE_CHIPS_CHANNELS", "")
-        if allowed_str:
-            allowed_channels = [int(c.strip()) for c in allowed_str.split(",") if c.strip().isdigit()]
-            if allowed_channels and interaction.channel_id not in allowed_channels:
-                mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
-                await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
-                return
+        import config
+        if config.REMOVE_CHIPS_CHANNELS and interaction.channel_id not in config.REMOVE_CHIPS_CHANNELS:
+            mentions = ", ".join(f"<#{cid}>" for cid in config.REMOVE_CHIPS_CHANNELS)
+            await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+            return
 
         if amount <= 0:
             await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
@@ -3276,10 +3222,9 @@ class PokerCog(commands.Cog):
         desc = f"Requested Cashout: {note}" if note else "Requested Cashout"
         await db.log_currency_event(interaction.user.id, "Cash Out", -chips, desc)
 
-        cashout_ch_id = os.getenv("CASHOUT_CHANNEL_ID")
-        if cashout_ch_id:
+        if config.CASHOUT_CHANNEL_ID:
             try:
-                ch = interaction.guild.get_channel(int(cashout_ch_id))
+                ch = interaction.guild.get_channel(config.CASHOUT_CHANNEL_ID)
                 if ch:
                     ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1490458259855773707>"
                     if note: ticket_msg += f"\n**Notes:** {note}"
@@ -3303,11 +3248,9 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
-        cashout_ch_id_str = os.getenv("CASHOUT_CHANNEL_ID")
-        if cashout_ch_id_str:
-            cashout_ch_id = int(cashout_ch_id_str)
-            if interaction.channel_id != cashout_ch_id:
-                await interaction.followup.send(f"❌ This command can only be used in <#{cashout_ch_id}>.",
+        if config.CASHOUT_CHANNEL_ID:
+            if interaction.channel_id != config.CASHOUT_CHANNEL_ID:
+                await interaction.followup.send(f"❌ This command can only be used in <#{config.CASHOUT_CHANNEL_ID}>.",
                                                 ephemeral=True)
                 return
 
@@ -3407,15 +3350,9 @@ class PokerCog(commands.Cog):
         )
 
     @poker.command(name="jackpot", description="View the current casino jackpot!")
-    async def jackpot(self, interaction: discord.Interaction):
+    async def jackpot_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=False)
-        jp = await db.get_jackpot()
-
-        # 🚨 Calculate splits: 80% Saroshina 50% Royal Flush, 20% Straight Flush, 5% to Quads
-        egirl_cut = max(2000,math.ceil(jp * 0.8))
-        rf_cut = math.ceil(jp * 0.60)
-        sf_cut = math.ceil(jp * 0.20)
-        quads_cut = math.ceil(jp * 0.05)
+        jp, egirl_cut, rf_cut, sf_cut, quads_cut = await jackpot.get_jackpot_display_cuts()
 
         desc = (
             "_ _\n"
@@ -3959,7 +3896,6 @@ class PokerCog(commands.Cog):
             # If they try to run an UPDATE or INSERT, this will catch the SQLite Read-Only error
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
-
 class StatsView(discord.ui.View):
     def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
         super().__init__(timeout=120)
@@ -4128,6 +4064,73 @@ class CurrencyLogView(discord.ui.View):
         self.page = max_pages - 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+class PremoveView(discord.ui.View):
+    def __init__(self, t: TableState, user_id: int):
+        super().__init__(timeout=60)
+        self.t = t
+        self.user_id = user_id
+
+    def _set(self, interaction, move: dict, label: str):
+        p = self.t.game.get_player(self.user_id)
+        if p:
+            p.premove = move
+        return label
+
+    @discord.ui.button(label="✅ Check", style=discord.ButtonStyle.blurple, row=0)
+    async def pm_check(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._set(interaction, {"action": "check"}, "Check")
+        await interaction.response.edit_message(content="⚡ Premove set: **Check** *(fires only if no bet)*", view=None)
+
+    @discord.ui.button(label="📞 Call Any", style=discord.ButtonStyle.red, row=1)
+    async def pm_call_any(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._set(interaction, {"action": "call_any"}, "Call Any")
+        await interaction.response.edit_message(content="⚡ Premove set: **Call Any**", view=None)
+
+    @discord.ui.button(label="📞 Call upto X", style=discord.ButtonStyle.green, row=0)
+    async def pm_call_upto(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PremoveAmountModal(self.t, self.user_id, "call_upto"))
+
+    @discord.ui.button(label="🏳 Fold >0", style=discord.ButtonStyle.red, row=1)
+    async def pm_fold_any(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._set(interaction, {"action": "fold_any"}, "Fold Any Bet")
+        await interaction.response.edit_message(content="⚡ Premove set: **Fold Any Bet**", view=None)
+
+    @discord.ui.button(label="🏳 Fold >X", style=discord.ButtonStyle.red, row=0)
+    async def pm_fold_if_gt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PremoveAmountModal(self.t, self.user_id, "fold_if_gt"))
+
+    @discord.ui.button(label="🚫 Cancel Premove", style=discord.ButtonStyle.grey, row=2)
+    async def pm_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self.t.game.get_player(self.user_id)
+        if p:
+            p.premove = None
+        await interaction.response.edit_message(content="🚫 Premove cancelled.", view=None)
+
+
+class PremoveAmountModal(discord.ui.Modal):
+    def __init__(self, t: TableState, user_id: int, action: str):
+        label = "Call up to amount" if action == "call_upto" else "Fold if bet greater than"
+        super().__init__(title=label)
+        self.t = t
+        self.user_id = user_id
+        self.action = action
+        self.amount_input = discord.ui.TextInput(
+            label="Amount",
+            placeholder="e.g. 500",
+            min_length=1, max_length=10
+        )
+        self.add_item(self.amount_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        amt = parse_chips(self.amount_input.value)
+        if amt is None or amt <= 0:
+            await interaction.response.send_message("❌ Invalid amount.", ephemeral=True); return
+        p = self.t.game.get_player(self.user_id)
+        if p:
+            p.premove = {"action": self.action, "amount": amt}
+        action_label = f"Call up to **{amt}**" if self.action == "call_upto" else f"Fold if bet > **{amt}**"
+        await interaction.response.send_message(f"⚡ Premove set: {action_label}", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(PokerCog(bot))

@@ -2,10 +2,12 @@ import aiosqlite
 import asyncio
 import os
 from datetime import datetime, timedelta
+import config
+import json
 
 # 1. FORCE the bot to look inside the Railway Volume
 # Replace '/app/data/poker.db' with whatever your Mount Path + filename is
-DB_PATH = "poker.db"
+DB_PATH = config.DB_PATH
 
 _db: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()
@@ -63,10 +65,25 @@ async def init_db():
 
         try:
             await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_id INTEGER")
-            await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_name TEXT")
-            await db.commit()
         except Exception:
             pass
+
+        try:
+            await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_name TEXT")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE hand_log ADD COLUMN state TEXT DEFAULT 'completed'")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE hand_log ADD COLUMN actions_json TEXT")
+        except Exception:
+            pass
+
+        await db.commit()
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chip_log (
@@ -526,14 +543,14 @@ async def get_player_stats(user_id: int) -> dict | None:
 
 # ── Hand log ──────────────────────────────────────────────────────────────────
 
-async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str, dealer_id: int,
-                   dealer_name: str):
+async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str, dealer_id: int, dealer_name: str, action_history: list):
+    """Saves the completed hand and its JSON replay in one single strike."""
     conn = await _get_db()
     async with _write_lock:
         await conn.execute("""
-            INSERT INTO hand_log (guild_id, table_id, table_name, hand_num, summary, ts, dealer_id, dealer_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (guild_id, table_id, table_name, hand_num, summary, datetime.utcnow().isoformat(), dealer_id, dealer_name))
+            INSERT INTO hand_log (guild_id, table_id, table_name, hand_num, summary, ts, dealer_id, dealer_name, state, actions_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)
+        """, (guild_id, table_id, table_name, hand_num, summary, datetime.utcnow().isoformat(), dealer_id, dealer_name, json.dumps(action_history)))
         await conn.commit()
 
 
@@ -754,42 +771,13 @@ async def pay_cashout(user_id: int, amount: int) -> bool:
 
 # --- REVENUE & ECONOMY FUNCTIONS ---
 
-def get_tax_config() -> tuple[float, bool]:
-    """Returns (tax_rate, is_special_day)."""
-    special_day = os.getenv("TAX_FREE_DAY", "").strip().lower()
-    current_day = datetime.utcnow().strftime("%A").lower()
-
-    if special_day and current_day == special_day:
-        # Default to 5% if SPECIAL_TAX_RATE isn't in .env yet
-        rate = float(os.getenv("SPECIAL_TAX_RATE", "0.05"))
-        return rate, True
-
-    return 0.05, False  # Standard 5% rate
-
-
-async def log_tax(tax_amount: int):
-    """Splits the 5% engine tax: 1% to Jackpot, 4% to House. On Tax-Free Day, 5% goes to Jackpot."""
-    if tax_amount <= 0: return
-
-    rate, is_special = get_tax_config()
-
-    if is_special:
-        jackpot_cut = tax_amount
-        house_cut = 0
-    else:
-        jackpot_cut = (tax_amount + 4) // 5
-        house_cut = tax_amount - jackpot_cut
-
+async def log_house_revenue(amount: int):
+    """Safely adds chips to the house revenue tracker."""
     db = await _get_db()
     async with _write_lock:
-        if house_cut > 0:
-            await db.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
-                             (datetime.utcnow().isoformat(), house_cut))
-        if jackpot_cut > 0:
-            await db.execute("UPDATE jackpot SET amount = amount + ? WHERE rowid = (SELECT MIN(rowid) FROM jackpot)",
-                             (jackpot_cut,))
+        await db.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
+                         (datetime.utcnow().isoformat(), amount))
         await db.commit()
-
 
 async def get_jackpot() -> int:
     """Returns current jackpot size."""
@@ -1585,10 +1573,10 @@ Inactivity Monitor Extension
 # CONFIGURATION
 # ────────────────────────────────────────────────────────────────────────────
 
-INACTIVITY_DAYS = 2  # Days before considering inactive
-MIN_HANDS_PER_PERIOD = 10  # Minimum hands to count as "active" (prevents one-hand cheese)
-MIN_CHIPS_WAGERED = 500  # Minimum total chips bet to count as active (optional, 0 to disable)
-GRACE_PERIOD_DAYS = 0  # Extra day grace period before wiping (total = INACTIVITY_DAYS + GRACE_PERIOD)
+INACTIVITY_DAYS = config.INACTIVITY_DAYS
+MIN_HANDS_PER_PERIOD = config.MIN_HANDS_PER_PERIOD
+MIN_CHIPS_WAGERED = config.MIN_CHIPS_WAGERED
+GRACE_PERIOD_DAYS = 0
 
 
 # ────────────────────────────────────────────────────────────────────────────

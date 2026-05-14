@@ -7,6 +7,7 @@ from tutorial_db import init_db as init_tutorial_db
 from discord.ext import tasks
 import datetime
 import subprocess
+import config
 
 load_dotenv()
 
@@ -85,8 +86,7 @@ async def on_command_error(ctx, error):
         return
 
 # Your specific Discord User ID
-AUTHORIZED_ADMINS = [1339935869598961728,412651268142792704,804762802451382283]
-
+AUTHORIZED_ADMINS = config.DEV_USER_IDS
 
 @bot.command()
 async def restart(ctx):

@@ -5,6 +5,9 @@ from enum import Enum, auto
 from math import ceil
 import random
 
+import config
+import taxation
+
 evaluator = Evaluator()
 
 SUIT_EMOJI = {"s": "♠️", "h": "♥️", "d": "♦️", "c": "♣️"}
@@ -39,6 +42,7 @@ class PokerPlayer:
     sitting_out:   bool = False
     pending_rebuy: int  = 0
     egirl_saro:    bool = False
+    premove:       dict | None = None
 
     def reset_for_hand(self):
         self.hole_cards  = []
@@ -53,6 +57,7 @@ class PokerPlayer:
     def reset_for_street(self):
         self.bet   = 0
         self.acted = False
+        self.premove = None
 
 @dataclass
 class SidePot:
@@ -72,12 +77,13 @@ class HandResult:
     is_over: bool = False
     tax: int = 0
     allin_user_ids: set = None
+    action_history: list = None
 
 class PokerGame:
-    SMALL_BLIND = 25
-    BIG_BLIND   = 50
-    MIN_BUYIN   = 50
-    MAX_PLAYERS = 12
+    SMALL_BLIND = config.DEFAULT_SMALL_BLIND
+    BIG_BLIND   = config.DEFAULT_BIG_BLIND
+    MIN_BUYIN   = config.DEFAULT_MIN_BUYIN
+    MAX_PLAYERS = config.MAX_PLAYERS
 
     def __init__(self):
         self.players:        list[PokerPlayer] = []
@@ -98,7 +104,8 @@ class PokerGame:
         self.banned_users:   list[int]         = []  # global table ban
         self.kicked_users:   list[int]         = []  # pending kick (force leave after hand)
         self.egirl_saro_holders: set[int]      = set() # players dealt the ace variant
-        self.tax_rate: float = 0.05
+        self.action_history: list = []
+        self.tax_rate, _ = taxation.get_tax_config()
 
     # Lobby
 
@@ -208,6 +215,9 @@ class PokerGame:
         self._hand_result = None
         self.hand_num += 1
 
+        self.action_history = []
+        self.action_history.append({"type": "street", "name": "PREFLOP"})
+
         # ── Rigging Check ──
         # Fetch rigged data injected by tutorial_cog
         rigged_hands = getattr(self, "_rigged_hands", {})
@@ -241,7 +251,7 @@ class PokerGame:
         self.street = Street.PREFLOP
 
         _ACE_OF_SPADES = Card.new('As')
-        _EGIRL_CHANCE = 0.0002
+        _EGIRL_CHANCE = config.EGIRL_SARO_CHANCE
         self.egirl_saro_holders.clear()
 
         for p in self.players:
@@ -279,6 +289,11 @@ class PokerGame:
         self.pot    += actual
         if p.chips == 0:
             p.all_in = True
+
+        self.action_history.append({
+            "type": "action", "player_id": p.user_id,
+            "action": "post_blind", "amount": actual, "street": "PREFLOP"
+        })
 
     # Helpers
 
@@ -326,6 +341,10 @@ class PokerGame:
             return False, "❌ It's not your turn."
         p.folded = True
         p.acted  = True
+        self.action_history.append({
+            "type": "action", "player_id": user_id,
+            "action": "fold", "amount": 0, "street": self.street.name
+        })
         msg = f"🏳️ **{p.display_name}** folds."
         end = self._advance()
         return True, msg + ("\n" + end if end else "")
@@ -345,6 +364,11 @@ class PokerGame:
             if p.chips == 0:
                 p.all_in = True
             msg = f"📞 **{p.display_name}** calls {amount}. (Pot: {self.pot})"
+        self.action_history.append({
+            "type": "action", "player_id": user_id,
+            "action": "check" if amount == 0 else "call",
+            "amount": amount, "street": self.street.name
+        })
         p.acted = True
         end = self._advance()
         return True, msg + ("\n" + end if end else "")
@@ -380,6 +404,11 @@ class PokerGame:
         # Track raise size for future min-raise enforcement (only if a full raise)
         if actual_raise >= min_raise:
             self.last_raise_size = actual_raise
+
+        self.action_history.append({
+            "type": "action", "player_id": user_id,
+            "action": "raise", "amount": total_needed, "street": self.street.name
+        })
 
         p.chips -= total_needed
         p.bet += total_needed
@@ -431,7 +460,46 @@ class PokerGame:
             return self._next_street()
 
         self.current_idx = self._next_active_idx((self.current_idx + 1) % len(self.players))
+        # Check if next player has a premove queued
+        cp = self.current_player()
+        if cp and cp.premove:
+            fired, premove_msg = self._try_fire_premove(cp)
+            if fired:
+                return premove_msg
         return ""
+
+    def _try_fire_premove(self, p: PokerPlayer) -> tuple[bool, str]:
+        """
+        Attempts to fire a queued premove for the given player.
+        Returns True if an action was taken, False if conditions weren't met.
+        Clears the premove regardless.
+        """
+        move = p.premove
+        p.premove = None  # always clear, one-shot only
+
+        if move is None:
+            return False, ""
+
+        action = move["action"]
+        call_amt = self.call_amount(p)
+
+        if action == "check" and call_amt == 0:
+            return self.check_or_call(p.user_id)
+        elif action == "call_any":
+            return self.check_or_call(p.user_id)
+        elif action == "call_upto":
+            if call_amt <= move["amount"]:
+                return self.check_or_call(p.user_id)
+        elif action == "fold_any":
+            if call_amt == 0:
+                return self.check_or_call(p.user_id)
+            else:
+                return self.fold(p.user_id)
+        elif action == "fold_if_gt":
+            if call_amt > move["amount"]:
+                return self.fold(p.user_id)
+
+        return False, ""
 
     def _betting_closed(self) -> bool:
         """
@@ -473,6 +541,7 @@ class PokerGame:
 
         if self.street == Street.PREFLOP:
             self.street = Street.FLOP
+            self.action_history.append({"type": "street", "name": "FLOP"})
             if rigged_comm:
                 # Take first 3 cards from the rigged list
                 self.community = rigged_comm[0:3]
@@ -482,6 +551,7 @@ class PokerGame:
 
         elif self.street == Street.FLOP:
             self.street = Street.TURN
+            self.action_history.append({"type": "street", "name": "TURN"})
             if rigged_comm:
                 # Take the 4th card (index 3)
                 self.community.append(rigged_comm[3])
@@ -491,6 +561,7 @@ class PokerGame:
 
         elif self.street == Street.TURN:
             self.street = Street.RIVER
+            self.action_history.append({"type": "street", "name": "RIVER"})
             if rigged_comm:
                 # Take the 5th card (index 4)
                 self.community.append(rigged_comm[4])
@@ -621,7 +692,8 @@ class PokerGame:
             pot_results=pot_results,
             showdown_players=list(self.players),
             allin_user_ids={p.user_id for p in alive if p.all_in},
-            tax=total_tax# snapshot before _end_hand clears state
+            tax=total_tax,# snapshot before _end_hand clears state
+            action_history = list(self.action_history)
         )
 
         self._hand_result.folded_ids = {p.user_id for p in self.players if p.folded}
@@ -672,7 +744,8 @@ class PokerGame:
                           summary="\n".join(lines), chip_deltas=deltas,
                           community=list(self.community),
                           showdown_players=list(self.players), tax=tax,
-                          allin_user_ids={winner.user_id} if winner.all_in else set())
+                          allin_user_ids={winner.user_id} if winner.all_in else set(),
+                          action_history=list(self.action_history))
 
         res.folded_ids = {p.user_id for p in self.players if p.folded}
 

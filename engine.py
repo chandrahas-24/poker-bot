@@ -53,6 +53,7 @@ class PokerPlayer:
         self.acted       = False
         self.sitting_out = False
         self.egirl_saro  = False
+        self.premove     = None
 
     def reset_for_street(self):
         self.bet   = 0

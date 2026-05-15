@@ -988,8 +988,9 @@ async def _process_result(guild, channel, t: TableState):
             achievement_announces.append("\n".join(lines))
 
         # ── Jackpot split payout ──────────────────────────────────────────────
-        eligible_for_jackpot = [p for p in (result.showdown_players or []) if not p.folded]
-        jackpot_hits = await jackpot.process_jackpot_hits(eligible_for_jackpot, result.community)
+        folded_ids = getattr(result, "folded_ids", set())
+        jackpot_hits = await jackpot.process_jackpot_hits(result.showdown_players or [], result.community,
+                                                          folded_ids)
 
     except Exception as e:
         print(f"[poker] stats/achievement error: {e}")

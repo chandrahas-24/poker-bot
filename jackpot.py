@@ -44,7 +44,7 @@ def evaluate_jackpot_tiers(player, community: list) -> tuple[bool, bool, bool]:
 
     return is_quads, is_sf, is_rf
 
-async def process_jackpot_hits(players: list, community: list) -> list[tuple]:
+async def process_jackpot_hits(players: list, community: list, folded_ids: set) -> list[tuple]:
     """
     Takes all eligible players (who didn't fold), checks for triggers, pays them, and returns receipts.
     Returns: list of (user_id, jp_tier, actual_paid_amount, new_jackpot_total)
@@ -62,6 +62,10 @@ async def process_jackpot_hits(players: list, community: list) -> list[tuple]:
 
         # Evaluate all eligible players sent from the engine
         for p in players:
+
+            if p.user_id in folded_ids:
+                continue
+
             if p.egirl_saro:
                 egirl_players.append(p)
             else:

@@ -646,10 +646,6 @@ class PokerGame:
                     total_tax += profit_tax
 
         lines = ["🃏 **Showdown!**", f"Board: {hand_str(self.community)}"]
-        for p in alive:
-            rank_str = evaluator.class_to_string(evaluator.get_rank_class(scores[p.user_id]))
-            lines.append(f"  **{p.display_name}**: {hand_str(p.hole_cards)} → *{rank_str}*")
-        lines.append("")
 
         if len(pots) == 1:
             amt, winners = pot_results[0]

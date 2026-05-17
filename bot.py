@@ -88,7 +88,7 @@ async def on_command_error(ctx, error):
 # Your specific Discord User ID
 AUTHORIZED_ADMINS = config.DEV_USER_IDS
 
-@bot.command(aliases=["deploy, kiloyeeters"])
+@bot.command(aliases=["deploy","kiloyeeters"])
 async def restart(ctx):
     if ctx.author.id not in AUTHORIZED_ADMINS:
         await ctx.send("**Access Denied.** This command is restricted.")

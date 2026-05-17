@@ -3022,6 +3022,44 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=False)
 
+    @pokerset.command(name="table", description="[Manager] Apply a global Stakes & Buy-in preset")
+    @app_commands.describe(size="Choose the table size preset")
+    @app_commands.choices(size=[
+        app_commands.Choice(name="Small Table (5/10 Blinds, 50 to 1b Buy-in)", value="small"),
+        app_commands.Choice(name="Medium Table (15/30 Blinds, 150 to 3k Buy-in)", value="medium"),
+        app_commands.Choice(name="High Table (25/50 Blinds, 250 to 5k Buy-in)", value="high"),
+    ])
+    async def set_preset(self, interaction: discord.Interaction, size: app_commands.Choice[str]):
+        # 1. Manager Check
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=False)
+
+        # 2. Assign values based on selection
+        if size.value == "small":
+            sb, bb, min_b, max_b = 5, 10, 50, 1000
+        elif size.value == "medium":
+            sb, bb, min_b, max_b = 15, 30, 150, 3000
+        elif size.value == "high":
+            sb, bb, min_b, max_b = 25, 50, 250, 5000
+
+        await db.set_settings(
+            interaction.guild_id,
+            small_blind=sb,
+            big_blind=bb,
+            min_wallet=min_b,
+            max_wallet=max_b
+        )
+
+        # 4. Confirmation
+        preset_name = size.name.split(" (")[0]  # Cleans up the string to just "Small Table"
+        await interaction.followup.send(
+            f"✅Applied: **{preset_name}**\n"
+            f"Blinds: {sb}/{bb} | Buy-in: {min_b} to {max_b}"
+        )
+
     @pokerset.command(name="blinds", description="[Manager] Set small and big blind amounts")
     @app_commands.describe(small="Small blind", big="Big blind")
     async def set_blinds(self, interaction: discord.Interaction, small: int, big: int):

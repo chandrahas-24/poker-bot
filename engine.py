@@ -452,10 +452,8 @@ class PokerGame:
             self._hand_result = self._build_fold_result(winner, tax)
 
             # Capture the pot value BEFORE the hand is cleared
-            pot_won = self.pot
-
             self._end_hand()
-            return f"🏆 **{winner.display_name}** wins **{pot_won}** chips (all others folded)!"
+            return "🏳️ All other players folded."
 
         if self._betting_closed():
             return self._next_street()
@@ -695,7 +693,7 @@ class PokerGame:
 
         self._hand_result.folded_ids = {p.user_id for p in self.players if p.folded}
         self._end_hand()
-        return "\n".join(lines)
+        return "🃏 **Showdown!**"
 
     def force_fold(self, user_id: int) -> tuple[bool, str]:
         """Force a player to fold regardless of turn (for kick/admin)."""

@@ -60,7 +60,6 @@ class TableState:
         self.session_allin_winners: set[int] = set()
         self.rejoin_cooldowns: dict[int, float] = {}
         self.leave_cooldown_pending: set[int] = set()
-        self.action_lock = asyncio.Lock()
 
 tables: dict[tuple, TableState] = {}
 
@@ -1774,25 +1773,22 @@ class GameView(discord.ui.View):
             b.disabled = not in_hand
 
     async def _do_action(self, interaction: discord.Interaction, fn, *args):
-        await interaction.response.defer()  # defer FIRST before lock
-        async with self.t.action_lock:
-            ok, msg = fn(*args)
-            if not ok:
-                await interaction.followup.send(msg, ephemeral=True);
-                return
-            parts = msg.split("\n")
-            street_markers = ["🌊", "↩️", "🏁"]
-            if any(m in msg for m in street_markers + ["Showdown"]):
-                slog_clear(self.t)
-
-            # Loop through everything and log every action in the chain!
-            for part in parts:
-                if part.strip():
-                    slog(self.t, part)
-            if self.t.game._hand_result:
-                await _process_result(interaction.guild, interaction.channel, self.t)
-            else:
-                await refresh(interaction.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+        await interaction.response.defer()
+        ok, msg = fn(*args)
+        if not ok:
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+        parts = msg.split("\n")
+        street_markers = ["🌊", "↩️", "🏁"]
+        if any(m in msg for m in street_markers + ["Showdown"]):
+            slog_clear(self.t)
+        for part in parts:
+            if part.strip():
+                slog(self.t, part)
+        if self.t.game._hand_result:
+            await _process_result(interaction.guild, interaction.channel, self.t)
+        else:
+            await refresh(interaction.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
 
     @discord.ui.button(label="Join", style=discord.ButtonStyle.green, row=0)
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):

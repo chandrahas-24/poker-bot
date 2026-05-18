@@ -94,7 +94,6 @@ class PokerGame:
         self.pot:            int               = 0
         self.community:      list[int]         = []
         self.deck:           Optional[Deck]    = None
-        self.dealer_seat:     int               = -1
         self.current_idx:    int               = 0
         self.current_bet:    int               = 0
         self.last_raiser:    Optional[int]     = None
@@ -135,14 +134,6 @@ class PokerGame:
             self.pending_joins.append(p)
             return f"✅ **{display_name}** will join next hand with **{chips}** chips."
 
-    def _next_occupied_player(self, starting_seat: int) -> tuple[int, PokerPlayer]:
-        """Scans clockwise from starting_seat to find the next active player."""
-        for offset in range(1, self.MAX_PLAYERS + 1):
-            check_seat = (starting_seat + offset) % self.MAX_PLAYERS
-            for i, p in enumerate(self.players):
-                if p.seat == check_seat and p.chips > 0:
-                    return i, p
-
         # Fallback if somehow no one is found (shouldn't happen if game logic holds)
         return 0, self.players[0]
 
@@ -173,19 +164,6 @@ class PokerGame:
                 return f"✅ **{pj.display_name}** added **{amount}** chips. Stack at join: **{pj.chips}**."
         return "❌ You're not at the table."
 
-    def _process_pending(self):
-        for uid in self.pending_leaves:
-            p = self.get_player(uid)
-            if p:
-                self.players.remove(p)
-        self.pending_leaves.clear()
-
-        for p in self.pending_joins:
-            p.sitting_out = False
-            self.players.append(p)
-
-        self.pending_joins.clear()
-
     # Hand lifecycle
 
     def start_hand(self) -> tuple[bool, str]:
@@ -194,15 +172,32 @@ class PokerGame:
                 p.chips += p.pending_rebuy
                 p.pending_rebuy = 0
 
-        self._process_pending()
+        # 1. Process pending leaves
+        for uid in self.pending_leaves:
+            p = self.get_player(uid)
+            if p:
+                self.players.remove(p)
+        self.pending_leaves.clear()
 
-        active = [p for p in self.players if p.chips > 0]
-        if len(active) < 2:
+        # 2. Append pending joins (they go to the back of the line)
+        for p in self.pending_joins:
+            p.sitting_out = False
+            self.players.append(p)
+        self.pending_joins.clear()
+
+        # 3. Rotate the array (Button moves to the next physical chair)
+        if self.hand_num > 1 and len(self.players) > 0:
+            self.players.append(self.players.pop(0))
+
+        # 4. Filter out broke or sitting out players
+        self.players = [p for p in self.players if p.chips > 0 and not p.sitting_out]
+
+        num_players = len(self.players)
+        if num_players < 2:
+            self.street = Street.WAITING
             return False, "❌ Need at least 2 players with chips to start."
-        self.players = active
-        self.side_pots = []
 
-        self.players.sort(key=lambda p: p.seat)
+        self.side_pots = []
 
         for p in self.players:
             p.reset_for_hand()
@@ -230,18 +225,16 @@ class PokerGame:
                 if c in self.deck.cards:
                     self.deck.cards.remove(c)
 
-        dealer_idx, dealer_p = self._next_occupied_player(self.dealer_seat)
-        self.dealer_seat = dealer_p.seat
+        # ── BLIND LOGIC (Index 0 is ALWAYS Dealer) ──
+        dealer_idx = 0
 
-        if len(self.players) == 2:
-            sb_idx = dealer_idx
-            sb_p = dealer_p
-            bb_idx, bb_p = self._next_occupied_player(dealer_p.seat)
-            start_idx = sb_idx
+        if num_players == 2:
+            sb_idx, bb_idx = 0, 1
+            start_idx = 0
         else:
-            sb_idx, sb_p = self._next_occupied_player(self.dealer_seat)
-            bb_idx, bb_p = self._next_occupied_player(sb_p.seat)
-            start_idx, _ = self._next_occupied_player(bb_p.seat)
+            sb_idx = 1
+            bb_idx = 2 % num_players
+            start_idx = 3 % num_players
 
         self._post_blind(sb_idx, self.SMALL_BLIND)
         self._post_blind(bb_idx, self.BIG_BLIND)
@@ -276,7 +269,7 @@ class PokerGame:
         bb_name = self.players[bb_idx].display_name
 
         return True, (
-            f"🃏 **Hand #{self.hand_num}** — Button: {dealer_name} | "
+            f"🃏 **Hand #{self.hand_num}** — Button: {self.players[0].display_name} | "
             f"SB: {sb_name} ({self.SMALL_BLIND}) | BB: {bb_name} ({self.BIG_BLIND})"
         )
 
@@ -532,8 +525,7 @@ class PokerGame:
         self.last_raiser = None
         self.last_raise_size = 0
 
-        start_idx, _ = self._next_occupied_player(self.dealer_seat)
-        self.current_idx = self._next_active_idx(start_idx)
+        self.current_idx = self._next_active_idx(1)
 
         # Fetch rigged community list
         rigged_comm = getattr(self, "_rigged_community", [])

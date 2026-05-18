@@ -531,7 +531,7 @@ STREET_LABEL = {
 }
 
 def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
-    tag = " 🔘" if p.seat == game.dealer_seat else ""
+    tag = " 🔘" if idx == 0 else ""
     title_str = f" `{title}`" if title else ""
     mention   = f"<@{p.user_id}>"
     if p.folded:

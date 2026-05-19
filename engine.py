@@ -186,7 +186,7 @@ class PokerGame:
         self.pending_joins.clear()
 
         # 3. Rotate the array (Button moves to the next physical chair)
-        if self.hand_num > 1 and len(self.players) > 0:
+        if self.hand_num > 0 and len(self.players) > 0:
             self.players.append(self.players.pop(0))
 
         # 4. Filter out broke or sitting out players

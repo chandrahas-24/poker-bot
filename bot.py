@@ -93,29 +93,28 @@ AUTHORIZED_ADMINS = config.DEV_USER_IDS
 
 @bot.command()
 async def fix_trigger(ctx):
-    # Security check (replace with your actual admin check if needed)
+    # Security check
     if ctx.author.id not in config.DEV_USER_IDS:
         return
 
     import database as db
     conn = await db._get_db()
 
-    # 1. Kill the old trigger
+    # 1. Drop the old trigger
     await conn.execute("DROP TRIGGER IF EXISTS keep_currency_log_200")
 
-    # 2. Install the strict Jackpot-only trigger
+    # 2. Install the exact database.py version matching only positive jackpot wins
     await conn.execute("""
         CREATE TRIGGER keep_currency_log_200
         AFTER INSERT ON currency_log
         BEGIN
             DELETE FROM currency_log 
             WHERE user_id = NEW.user_id 
-              -- 🚨 ONLY Exempt Jackpots
-              AND event_type != 'Jackpot'
+              AND NOT (event_type = 'Jackpot' AND amount > 0)
               AND id NOT IN (
                   SELECT id FROM currency_log 
                   WHERE user_id = NEW.user_id
-                    AND event_type != 'Jackpot'
+                    AND NOT (event_type = 'Jackpot' AND amount > 0)
                   ORDER BY id DESC 
                   LIMIT 200
               );
@@ -123,8 +122,7 @@ async def fix_trigger(ctx):
     """)
     await conn.commit()
 
-    await ctx.send("✅ **Trigger updated!** ONLY Jackpots are permanently immune to being wiped from the logs.")
-
+    await ctx.send("✅ **Trigger updated!** ONLY positive Jackpot wins are now permanently immune to cleanup.")
 @bot.command(aliases=["deploy","kiloyeeters"])
 async def restart(ctx):
     if ctx.author.id not in AUTHORIZED_ADMINS:

@@ -111,7 +111,7 @@ async def restart(ctx):
         await ctx.send(f"**Deployment Failed:**\n```python\n{e}\n```")
 
 
-@bot.command()
+@bot.command(aliases=["rem_json"])
 async def nuke_column(ctx):
     if ctx.author.id not in DEV_USER_IDS:
         return

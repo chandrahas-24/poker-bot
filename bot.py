@@ -111,25 +111,6 @@ async def restart(ctx):
         await ctx.send(f"**Deployment Failed:**\n```python\n{e}\n```")
 
 
-@bot.command(aliases=["rem_json"])
-async def nuke_column(ctx):
-    if ctx.author.id not in DEV_USER_IDS:
-        return
-
-    await ctx.send("☢️ **Nuking the JSON column and shrinking databases...**")
-    import database as db
-
-    conn = await db._get_db()
-    try:
-        # 1. Drop from Main Casino DB
-        await conn.execute("ALTER TABLE hand_log DROP COLUMN actions_json")
-        await conn.commit()
-        await conn.execute("VACUUM")
-        await ctx.send("✅ Dropped from `poker.db` and vacuumed.")
-    except Exception as e:
-        await ctx.send(f"⚠️ Main DB Note: {e}")
-
-
 if __name__ == "__main__":
     token = os.getenv("BOT_TOKEN")
     if not token:

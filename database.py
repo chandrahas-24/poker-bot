@@ -78,11 +78,6 @@ async def init_db():
         except Exception:
             pass
 
-        try:
-            await db.execute("ALTER TABLE hand_log ADD COLUMN actions_json TEXT")
-        except Exception:
-            pass
-
         await db.commit()
 
         await db.execute("""
@@ -544,13 +539,13 @@ async def get_player_stats(user_id: int) -> dict | None:
 # ── Hand log ──────────────────────────────────────────────────────────────────
 
 async def log_hand(guild_id: int, table_id: str, table_name: str, hand_num: int, summary: str, dealer_id: int, dealer_name: str, action_history: list):
-    """Saves the completed hand and its JSON replay in one single strike."""
+    """Saves the completed hand without tracking JSON replays."""
     conn = await _get_db()
     async with _write_lock:
         await conn.execute("""
-            INSERT INTO hand_log (guild_id, table_id, table_name, hand_num, summary, ts, dealer_id, dealer_name, state, actions_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)
-        """, (guild_id, table_id, table_name, hand_num, summary, datetime.utcnow().isoformat(), dealer_id, dealer_name, json.dumps(action_history)))
+            INSERT INTO hand_log (guild_id, table_id, table_name, hand_num, summary, ts, dealer_id, dealer_name, state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed')
+        """, (guild_id, table_id, table_name, hand_num, summary, datetime.utcnow().isoformat(), dealer_id, dealer_name))
         await conn.commit()
 
 

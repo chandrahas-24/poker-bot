@@ -2304,7 +2304,7 @@ class PokerCog(commands.Cog):
             if os.path.exists(zip_path):
                 os.remove(zip_path)
 
-    # ── THE AUTO TIMER (Every 2 Hours) ────────────────────────────────────
+    # ── THE AUTO TIMER (Every Hour) ────────────────────────────────────
     backup_times = [
         dt_time(hour=h, minute=30, tzinfo=_tz.utc)
         for h in range(0, 23)

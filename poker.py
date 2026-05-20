@@ -2312,7 +2312,9 @@ class PokerCog(commands.Cog):
     @tasks.loop(time=backup_times)
     async def daily_backup(self):
         try:
-            await self._send_backup(self.DEV_USER_IDS[0])
+            user_id = self.DEV_USER_IDS[0]
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            await self._send_backup(user)
         except Exception as e:
             print(f"[Backup Task Error] {e}")
 

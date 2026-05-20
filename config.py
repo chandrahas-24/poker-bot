@@ -44,7 +44,7 @@ DEFAULT_MIN_BUYIN = 50
 
 EGIRL_SARO_CHANCE = 0.0002
 
-DEV_USER_IDS = {
+DEV_USER_IDS = (
     1339935869598961728, # baymax for backups
     804762802451382283,  # real baymax
-}
+)

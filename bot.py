@@ -3,13 +3,14 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 
-from config import DEV_USER_IDS
 from database import init_db, recover_chips_in_play
+import database as db
 from tutorial_db import init_db as init_tutorial_db
 from discord.ext import tasks
 import datetime
 import subprocess
 import config
+import re
 
 load_dotenv()
 
@@ -86,6 +87,63 @@ async def on_message(message: discord.Message):
 async def on_command_error(ctx, error):
     if isinstance(error, discord.ext.commands.CommandNotFound):
         return
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # 0. Restrict to specific channel IDs
+    ALLOWED_CHANNEL_ID = config.ADD_CHIPS_CHANNELS
+    if after.channel.id not in ALLOWED_CHANNEL_ID:
+        return
+
+    # 1. Ignore if the author isn't Dank Memer
+    if after.author.id != 270904126974590976:
+        return
+
+    # 2. Ensure this message was spawned by a slash command interaction
+    if not after.interaction:
+        return
+
+    # 3. Check if the command used was a server event command
+    if "serverevents" not in after.interaction.name.lower():
+        return
+
+    # 4. Dank Memer uses embeds. Combine content and embed text to search.
+    text_to_search = after.content
+    for embed in after.embeds:
+        if embed.description:
+            text_to_search += " " + embed.description
+        if embed.title:
+            text_to_search += " " + embed.title
+
+    # 5. Look for the exact success trigger
+    if "Successfully donated" in text_to_search:
+        # 6. Extract the number (matches "100,000,000" and drops the commas)
+        match = re.search(r"Successfully donated.*?([\d,]+)", text_to_search)
+        if match:
+            amount_str = match.group(1).replace(",", "")
+            amount = int(amount_str) // 1000000
+
+            # Get the user who actually ran the /serverevents command
+            user = after.interaction.user
+
+            # 7. Credit their poker wallet
+            new_bal = await db.add_chips(
+                bot.user.id,
+                bot.user.display_name,
+                user.id,
+                user.name,
+                amount
+            )
+
+            await db.log_currency_event(user.id, "Cash In", amount, "Dono auto added.")
+
+            # Reply directly to Dank Memer's message with the exact UI format
+            await after.reply(
+                f"✅ **+{amount:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+            )
+
+            await after.add_reaction("✅")
 
 # Your specific Discord User ID
 AUTHORIZED_ADMINS = config.DEV_USER_IDS

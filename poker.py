@@ -7,7 +7,7 @@ from engine import PokerGame, Street, hand_str
 import database as db
 from treys import Evaluator, Card
 import card_images
-import os, asyncio, uuid, zipfile
+import os, asyncio, uuid, zipfile, traceback
 from datetime import datetime, timedelta, time as dt_time, timezone as _tz
 import time
 import math
@@ -162,7 +162,7 @@ async def _turn_timer(t: TableState, channel, user_id: int):
             if warn_msg:
                 try:
                     await warn_msg.delete()
-                except Exception:
+                except (discord.NotFound, discord.HTTPException):
                     pass
             return
 
@@ -170,7 +170,7 @@ async def _turn_timer(t: TableState, channel, user_id: int):
     if warn_msg:
         try:
             await warn_msg.delete()
-        except Exception:
+        except (discord.NotFound, discord.HTTPException):
             pass
 
     if not t.game.is_turn(user_id):
@@ -233,7 +233,7 @@ async def _auto_next_hand(t: TableState, channel):
     if t.between_msg:
         try:
             await t.between_msg.delete()
-        except Exception:
+        except (discord.NotFound, discord.HTTPException):
             pass
         t.between_msg = None
 
@@ -433,7 +433,9 @@ async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
         thread = await log_ch.create_thread(name="Poker Hand Log", type=discord.ChannelType.public_thread)
         _log_threads[channel.guild.id] = thread
         return thread
-    except Exception:
+    except Exception as e:
+        print(f"[poker] ensure_log_thread failed to create thread: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -510,7 +512,7 @@ async def post_hand_log(channel, t: TableState, result):
     body = "\n".join(lines)
     try:
         await thread.send(f"```\n{body}\n```")
-    except Exception:
+    except (discord.NotFound, discord.HTTPException):
         _log_threads.pop(channel.guild.id, None)
 
 
@@ -522,7 +524,7 @@ async def post_tip_log(channel, t: TableState, tipper_id: int, tipper_name: str,
         try:
             await thread.send(
                 f"💸 **Tip** [{ts}] — {amount} \n **{tipper_name}** ({tipper_id}) to **{recipient_name}** ({recipient_id}) at table `{t.name}`")
-        except Exception:
+        except (discord.NotFound, discord.HTTPException):
             _log_threads.pop(channel.guild.id, None)
 # ── Embed ─────────────────────────────────────────────────────────────────────
 
@@ -643,7 +645,7 @@ async def _delete_after(message: discord.Message, delay: float):
     await asyncio.sleep(delay)
     try:
         await message.delete()
-    except Exception:
+    except (discord.NotFound, discord.HTTPException):
         pass
 
 # ── Turn ping ─────────────────────────────────────────────────────────────────
@@ -673,7 +675,7 @@ async def send_turn_ping(channel, t: TableState):
         if t.ping_msg and t.ping_msg.content != expected_content:
             try:
                 await t.ping_msg.edit(content=expected_content)
-            except Exception:
+            except (discord.NotFound, discord.HTTPException):
                 pass
         return
 
@@ -1006,12 +1008,14 @@ async def _process_result(guild, channel, t: TableState):
 
     except Exception as e:
         print(f"[poker] stats/achievement error: {e}")
+        traceback.print_exc()
 
     try:
         chip_map = {p.user_id: p.chips + p.pending_rebuy for p in t.game.players}
         await db.sync_chips_in_play(chip_map)
     except Exception as e:
         print(f"[poker] chips_in_play error: {e}")
+        traceback.print_exc()
 
     # 🚨 LOG THE TAX TO REVENUE/JACKPOT
     try:
@@ -1019,6 +1023,7 @@ async def _process_result(guild, channel, t: TableState):
             await taxation.process_and_log_tax(result.tax)
     except Exception as e:
         print(f"[poker] log_tax error: {e}")
+        traceback.print_exc()
 
     try:
         log_task = asyncio.create_task(post_hand_log(channel, t, result))
@@ -1028,6 +1033,7 @@ async def _process_result(guild, channel, t: TableState):
         await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary, t.manager_id, t.manager_name, result.action_history)
     except Exception as e:
         print(f"[poker] complete_hand_log error: {e}")
+        traceback.print_exc()
 
     try:
         for uid in list(t.game.pending_leaves):
@@ -1052,6 +1058,7 @@ async def _process_result(guild, channel, t: TableState):
         t.leave_cooldown_pending.clear()
     except Exception as e:
         print(f"[poker] pending_leaves return error: {e}")
+        traceback.print_exc()
 
     all_cosmetics = {}
     try:
@@ -1060,6 +1067,7 @@ async def _process_result(guild, channel, t: TableState):
         await _announce_winner(channel, t, result, cosmetics_cache=all_cosmetics)
     except Exception as e:
         print(f"[poker] _announce_winner error: {e}")
+        traceback.print_exc()
 
     for (uid, jp_tier, actual, new_jp) in jackpot_hits:
         try:
@@ -1076,6 +1084,7 @@ async def _process_result(guild, channel, t: TableState):
             await channel.send(embed=embed)
         except Exception as e:
             print(f"[poker] jackpot announce error: {e}")
+            traceback.print_exc()
 
         try:
             settings = await db.get_settings(channel.guild.id)
@@ -1092,18 +1101,21 @@ async def _process_result(guild, channel, t: TableState):
                     )
         except Exception as e:
             print(f"[poker] jackpot log error: {e}")
+            traceback.print_exc()
 
     for msg_text in achievement_announces:
         try:
             await channel.send(msg_text)
         except Exception as e:
             print(f"[poker] achievement announce error: {e}")
+            traceback.print_exc()
 
     try:
         _slog_result(t, result)
         await refresh(channel, t, cosmetics_cache=all_cosmetics)
     except Exception as e:
         print(f"[poker] refresh error: {e}")
+        traceback.print_exc()
 
     # 1. ALWAYS run the reveal phase if there was a showdown, even if closing
     if result.showdown_players:
@@ -1111,6 +1123,7 @@ async def _process_result(guild, channel, t: TableState):
             await _reveal_phase(channel, t, result)
         except Exception as e:
             print(f"⚠️ Recovered from Discord API crash during reveal: {e}")
+            traceback.print_exc()
 
     t.game._hand_result = None
 
@@ -1204,7 +1217,7 @@ async def _reveal_phase(channel, t: TableState, result):
                 pass
             try:
                 await msg.delete()
-            except Exception:
+            except (discord.NotFound, discord.HTTPException):
                 pass
         return
 
@@ -1245,7 +1258,7 @@ async def _reveal_phase(channel, t: TableState, result):
         pass
     try:
         await msg.delete()
-    except Exception:
+    except (discord.NotFound, discord.HTTPException):
         pass
 
 # ── Between-hands view ────────────────────────────────────────────────────────
@@ -1800,9 +1813,9 @@ class GameView(discord.ui.View):
                 await interaction.channel.send(
                     f"⚠️ <@{interaction.user.id}> Discord lost your click due to lag! "
                     f"30s added to your clock. *Please click your action again.*",
-                    delete_after=20  # Auto-cleans up so chat doesn't get messy
+                    delete_after=20
                 )
-            except Exception:
+            except (discord.NotFound, discord.HTTPException):
                 pass
 
             # 3. Bail out cleanly so the bot doesn't crash (their turn is NOT skipped)
@@ -2209,7 +2222,7 @@ class CosmeticsView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(view=self)
-            except Exception:
+            except (discord.NotFound, discord.HTTPException):
                 pass
 
 
@@ -2354,6 +2367,7 @@ class PokerCog(commands.Cog):
             await self._send_backup(user)
         except Exception as e:
             print(f"[Backup Task Error] {e}")
+            traceback.print_exc()
 
     @daily_backup.before_loop
     async def before_daily_backup(self):
@@ -2435,7 +2449,7 @@ class PokerCog(commands.Cog):
             if t.between_msg:
                 try:
                     await t.between_msg.delete()
-                except Exception:
+                except (discord.NotFound, discord.HTTPException):
                     pass
                 t.between_msg = None
             await interaction.followup.send("✅ Table will close after this hand.", ephemeral=False)

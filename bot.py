@@ -100,12 +100,12 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if after.author.id != 270904126974590976:
         return
 
-    # 2. Ensure this message was spawned by a slash command interaction
-    if not after.interaction:
+    # 2. Use the new interaction_metadata
+    if not after.interaction_metadata:
         return
 
-    # 3. Check if the command used was a server event command
-    if "serverevents" not in after.interaction.name.lower():
+    # 3. Check the command name inside the metadata
+    if "serverevents" not in after.interaction_metadata.name.lower():
         return
 
     # 4. Dank Memer uses embeds. Combine content and embed text to search.
@@ -118,34 +118,34 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
     # 5. Look for the exact success trigger
     if "Successfully donated" in text_to_search:
-        # 6. Extract the number (matches "100,000,000" and drops the commas)
+        # 6. Extract the number
         match = re.search(r"Successfully donated.*?([\d,]+)", text_to_search)
         if match:
             amount_str = match.group(1).replace(",", "")
-            amount = int(amount_str) // 1000000
+            amount = int(amount_str)//1000000
 
-            # Get the user who actually ran the /serverevents command
-            user = after.interaction.user
+            # Pull the user from the new metadata object
+            user = after.interaction_metadata.user
 
-            # 7. Credit their poker wallet
+            # 7. Credit their poker wallet AND capture the new balance
             new_bal = await db.add_chips(
                 bot.user.id,
                 bot.user.display_name,
                 user.id,
                 user.name,
-                amount
+                amount,
+                "Dank Memer Donation Exchange"
             )
 
-            await db.log_currency_event(user.id, "Cash In", amount, "Dono auto added.")
+            await db.log_currency_event(user.id, "Cash In", amount, "Dank Memer Donation")
 
-            # Reply directly to Dank Memer's message with the exact UI format
+            # Reply directly to Dank Memer's message
             await after.reply(
                 f"✅ **+{amount:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
             )
 
             await after.add_reaction("✅")
 
-# Your specific Discord User ID
 AUTHORIZED_ADMINS = config.DEV_USER_IDS
 
 @bot.command(aliases=["deploy","kiloyeeters"])

@@ -36,7 +36,7 @@ def evaluate_jackpot_tiers(player, community: list) -> tuple[bool, bool, bool]:
     if rank_str == "Four of a Kind":
         if board_rank_str != "Four of a Kind":
             is_quads = True
-    elif rank_str == "Straight Flush":
+    elif rank_str in ["Straight Flush", "Royal Flush"]:
         played_board = (board_score is not None) and (score >= board_score)
         if not played_board:
             is_sf = True

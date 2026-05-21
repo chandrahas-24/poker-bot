@@ -3981,6 +3981,51 @@ class PokerCog(commands.Cog):
             # If they try to run an UPDATE or INSERT, this will catch the SQLite Read-Only error
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
+    @pokeradmin.command(name="setstat", description="[Admin] Modify a player's poker statistics")
+    @app_commands.describe(
+        user="The player whose stats you want to change",
+        stat="The specific statistic to modify",
+        value="The new integer value for this stat"
+    )
+    @app_commands.choices(stat=[
+        app_commands.Choice(name="Hands Played", value="hands_played"),
+        app_commands.Choice(name="Hands Won", value="hands_won"),
+        app_commands.Choice(name="Chips Won", value="chips_won"),
+        app_commands.Choice(name="Chips Lost", value="chips_lost"),
+        app_commands.Choice(name="Total Tipped", value="total_tipped"),
+        app_commands.Choice(name="Current Win Streak", value="win_streak"),
+        app_commands.Choice(name="Max Win Streak", value="max_win_streak"),
+        app_commands.Choice(name="Pocket Aces Wins", value="pocket_aces_wins"),
+        app_commands.Choice(name="All-In Wins", value="all_in_wins"),
+        app_commands.Choice(name="Quads Wins", value="quads_wins"),
+        app_commands.Choice(name="Straight Flush Wins", value="straight_flush_wins"),
+        app_commands.Choice(name="Royal Flush Wins", value="royal_flush_wins"),
+        app_commands.Choice(name="Times Wiped (Inactivity)", value="times_wiped"),
+    ])
+    async def setstat(self, interaction: discord.Interaction, user: discord.Member, stat: app_commands.Choice[str],
+                      value: int):
+        # 1. Security Check
+        if interaction.user.id not in config.DEV_USER_IDS:
+            await interaction.response.send_message("❌ **Access Denied.** You do not have permission.", ephemeral=True)
+            return
+
+        import database as db
+        conn = await db._get_db()
+
+        try:
+            # 2. Extract the safe column name
+            column_name = stat.value
+
+            # 3. Update the database
+            await conn.execute(f"UPDATE stats SET {column_name} = ? WHERE user_id = ?", (value, user.id))
+            await conn.commit()
+
+            await interaction.response.send_message(
+                f"✅ Successfully updated **{stat.name}** to `{value:,}` for **{user.display_name}**!")
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
+
 class StatsView(discord.ui.View):
     def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
         super().__init__(timeout=120)

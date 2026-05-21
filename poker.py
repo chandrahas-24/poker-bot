@@ -3417,7 +3417,7 @@ class PokerCog(commands.Cog):
     @pokeradmin.command(name="adjustjackpot", description="[Admin] Manually adjust the global jackpot")
     @app_commands.describe(amount="Amount to add (or negative to subtract)")
     async def adjustjackpot(self, interaction: discord.Interaction, amount: int):
-        if not interaction.user.guild_permissions.administrator:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=False)

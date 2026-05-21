@@ -104,10 +104,6 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if not after.interaction_metadata:
         return
 
-    # 3. Check the command name inside the metadata
-    if "serverevents" not in after.interaction_metadata.name.lower():
-        return
-
     # 4. Dank Memer uses embeds. Combine content and embed text to search.
     text_to_search = after.content
     for embed in after.embeds:

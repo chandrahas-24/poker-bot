@@ -54,6 +54,7 @@ class TableState:
         self.timer_task: asyncio.Task | None = None
         self.timer_user_id: int | None = None
         self.timer_street = None
+        self.turn_deadline: float = 0.0
         self.ping_user_id: int | None = None
         self.msg_count = 0
         self.resend_threshold = TABLE_RESEND_MSGS
@@ -108,6 +109,7 @@ def cancel_timer(t: TableState):
     t.timer_task = None
     t.timer_user_id = None
     t.timer_street = None
+    t.turn_deadline = 0.0
 
 def start_timer(t: TableState, channel):
     cp = t.game.current_player()
@@ -125,42 +127,51 @@ def start_timer(t: TableState, channel):
     t.timer_task = asyncio.create_task(_turn_timer(t, channel, cp.user_id))
     t.timer_task.add_done_callback(_task_catcher)
 
+
 async def _turn_timer(t: TableState, channel, user_id: int):
-    settings   = await db.get_settings(channel.guild.id)
-    timeout    = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
-    deadline   = int(time.time()) + timeout
-    warn_after = timeout - max(timeout // 5, 15)  # warn with ~1/5 remaining, floor of 15s notice
+    settings = await db.get_settings(channel.guild.id)
+    timeout = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
 
-    # ── Warning phase ──────────────────────────────────────────────────────
-    try:
-        await asyncio.sleep(warn_after)
-    except asyncio.CancelledError:
-        return
+    # Set the initial mutable deadline
+    t.turn_deadline = time.time() + timeout
+    warn_threshold = max(timeout // 5, 15)
 
-    if not t.game.is_turn(user_id):
-        return
-    p = t.game.get_player(user_id)
-    if not p:
-        return
+    warn_msg = None
+    warned = False
 
-    warn_msg = await channel.send(
-        f"⚠️ <@{user_id}> — act now! You'll be auto-folded <t:{deadline}:R>."
-    )
+    # ── The Breathing Timer Loop ───────────────────────────────────────────
+    while True:
+        now = time.time()
+        remaining = t.turn_deadline - now
+
+        if remaining <= 0:
+            break  # Time is up! Exit the loop to auto-fold.
+
+        # Check if we need to warn them
+        if remaining <= warn_threshold and not warned:
+            # int(t.turn_deadline) ensures the Discord <t:..> tag dynamically shifts if we add time
+            warn_msg = await channel.send(
+                f"⚠️ <@{user_id}> — act now! You'll be auto-folded <t:{int(t.turn_deadline)}:R>."
+            )
+            warned = True
+
+        # Sleep for just 1 second, then check the clock again
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            if warn_msg:
+                try:
+                    await warn_msg.delete()
+                except Exception:
+                    pass
+            return
 
     # ── Fold phase ─────────────────────────────────────────────────────────
-    try:
-        await asyncio.sleep(timeout - warn_after)
-    except asyncio.CancelledError:
+    if warn_msg:
         try:
             await warn_msg.delete()
         except Exception:
             pass
-        return
-
-    try:
-        await warn_msg.delete()
-    except Exception:
-        pass
 
     if not t.game.is_turn(user_id):
         return
@@ -174,6 +185,7 @@ async def _turn_timer(t: TableState, channel, user_id: int):
     if user_id not in t.game.pending_leaves:
         t.game.pending_leaves.append(user_id)
     t.leave_cooldown_pending.add(user_id)
+
     if not p.folded:
         ok, fold_msg = t.game.force_fold(user_id)
         if ok:
@@ -183,6 +195,7 @@ async def _turn_timer(t: TableState, channel, user_id: int):
             for part in parts:
                 if part.strip():
                     slog(t, part)
+
     await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
     if t.game._hand_result:
         await _process_result(channel.guild, channel, t)
@@ -1773,18 +1786,42 @@ class GameView(discord.ui.View):
             b.disabled = not in_hand
 
     async def _do_action(self, interaction: discord.Interaction, fn, *args):
-        await interaction.response.defer()
+        try:
+            await interaction.response.defer()
+        except discord.errors.NotFound:
+            # Discord API dropped the interaction token!
+            # 1. Inject 15 extra seconds onto the current player's clock
+            self.t.turn_deadline += 30
+            print(
+                f"[Lag Comp] Token Dropped! Player: {interaction.user.display_name} | Table: {self.t.name} | Added 30s.")
+
+            # 2. Tell the user exactly what happened so they know to try again
+            try:
+                await interaction.channel.send(
+                    f"⚠️ <@{interaction.user.id}> Discord lost your click due to lag! "
+                    f"30s added to your clock. *Please click your action again.*",
+                    delete_after=20  # Auto-cleans up so chat doesn't get messy
+                )
+            except Exception:
+                pass
+
+            # 3. Bail out cleanly so the bot doesn't crash (their turn is NOT skipped)
+            return
+
         ok, msg = fn(*args)
         if not ok:
             await interaction.followup.send(msg, ephemeral=True)
             return
+
         parts = msg.split("\n")
         street_markers = ["🌊", "↩️", "🏁"]
         if any(m in msg for m in street_markers + ["Showdown"]):
             slog_clear(self.t)
+
         for part in parts:
             if part.strip():
                 slog(self.t, part)
+
         if self.t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, self.t)
         else:

@@ -157,8 +157,22 @@ async def _handle_donation(message: discord.Message, before: discord.Message | N
     print(f"[Donation] ✅ {user} donated ⏣{donated:,} → +{chips} chip(s) (balance: {new_bal})")
 
 
+DEBUG_CHANNEL_ID = 1479667673804701707
+
 @bot.event
 async def on_message(message: discord.Message):
+    # Debug: log everything in the donations channel
+    if message.channel.id == DEBUG_CHANNEL_ID:
+        meta = getattr(message, "interaction_metadata", None)
+        print(f"[DEBUG on_message] author={message.author} (id={message.author.id}) bot={message.author.bot}")
+        print(f"[DEBUG on_message] content={message.content!r}")
+        print(f"[DEBUG on_message] embeds={len(message.embeds)}")
+        for i, e in enumerate(message.embeds):
+            print(f"[DEBUG on_message]   embed[{i}] title={e.title!r} desc={e.description!r}")
+        print(f"[DEBUG on_message] interaction_metadata={meta}")
+        if meta:
+            print(f"[DEBUG on_message]   meta.user={getattr(meta, 'user', None)}")
+
     if message.author.bot:
         return
     await bot.process_commands(message)
@@ -166,6 +180,19 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
+    # Debug: log everything in the donations channel
+    if after.channel.id == DEBUG_CHANNEL_ID:
+        before_meta = getattr(before, "interaction_metadata", None)
+        after_meta  = getattr(after,  "interaction_metadata", None)
+        print(f"[DEBUG on_message_edit] author={after.author} (id={after.author.id})")
+        print(f"[DEBUG on_message_edit] before embeds={len(before.embeds)}, after embeds={len(after.embeds)}")
+        for i, e in enumerate(after.embeds):
+            print(f"[DEBUG on_message_edit]   after embed[{i}] title={e.title!r} desc={e.description!r}")
+        print(f"[DEBUG on_message_edit] before.interaction_metadata={before_meta}")
+        print(f"[DEBUG on_message_edit] after.interaction_metadata={after_meta}")
+        if before_meta:
+            print(f"[DEBUG on_message_edit]   before meta.user={getattr(before_meta, 'user', None)}")
+
     # Dank Memer flow: pending confirmation embed → edited to "Successfully donated ____"
     # Pass `before` so _handle_donation can pull interaction_metadata from the
     # cached version (the MESSAGE_UPDATE payload omits unchanged fields).

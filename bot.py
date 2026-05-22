@@ -286,6 +286,75 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     )
     await message.add_reaction("✅")
 
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # 1. Ignore the bot's own reactions
+    if payload.user_id == bot.user.id:
+        return
+
+    # 2. Restrict to the Cashout channel
+    if payload.channel_id != getattr(config, "CASHOUT_CHANNEL_ID", 0):
+        return
+
+    # 3. Trigger on standard ✅ OR any custom emoji with "check" or "tick" in the name
+    emoji_name = str(payload.emoji.name).lower()
+    if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name != "✅":
+        return
+
+    # 4. Security Check: Must be Admin, Dev, or Payout Manager
+    settings = await db.get_settings(payload.guild_id)
+    payout_manager_role_id = config.PAYOUT_MANAGER_ROLE
+
+    is_admin = payload.member.guild_permissions.administrator
+    is_dev = payload.user_id in config.DEV_USER_IDS
+    is_payout_manager = False
+
+    if payout_manager_role_id:
+        role = payload.member.guild.get_role(int(payout_manager_role_id))
+        if role and role in payload.member.roles:
+            is_payout_manager = True
+
+    if not (is_admin or is_dev or is_payout_manager):
+        return  # Unauthorized person reacted, ignore silently
+
+    # 5. Fetch the actual message from Discord
+    channel = bot.get_channel(payload.channel_id)
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.NotFound:
+        return
+
+    # 6. Ensure we don't double-pay a ticket that's already processed
+    if "**PAID**" in message.content:
+        return
+
+    # 7. Extract the User ID and Amount from your exact ticket format
+    user_match = re.search(r"\*\*Username:\*\* <@!?(\d+)>", message.content)
+    amount_match = re.search(r"\*\*Amount:\*\* ([\d,]+)", message.content)
+
+    if not user_match or not amount_match:
+        return  # Message doesn't match the cashout ticket layout, ignore
+
+    target_user_id = int(user_match.group(1))
+    amount = int(amount_match.group(1).replace(",", ""))
+
+    # 8. Attempt to process the payment in the database
+    ok = await db.pay_cashout(target_user_id, amount)
+    if not ok:
+        await channel.send(
+            f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
+            f"They might not have **{amount:,}** chips in their pending queue anymore.",
+            delete_after=15
+        )
+        return
+
+    # 9. Update the ticket visually so staff know it's done
+    new_content = message.content + f"\n\n-# **PAID** by <@{payload.user_id}>"
+    await message.edit(content=new_content)
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:

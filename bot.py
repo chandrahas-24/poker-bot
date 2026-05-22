@@ -25,138 +25,31 @@ DONATION_BOT_ID  = 270904126974590976
 CHIPS_PER_COIN   = 1_000_000  # 1 chip per 1,000,000 donated coins
 
 
-# ── Helper: send a DM, silently ignore if the user has DMs closed ─────────────
-
-async def _try_dm(user_id: int, content: str = None, embed: discord.Embed = None) -> bool:
-    """
-    Attempt to DM a user by ID.  Returns True on success, False if blocked/closed.
-    """
-    try:
-        user = await bot.fetch_user(user_id)
-        await user.send(content=content, embed=embed)
-        return True
-    except (discord.Forbidden, discord.HTTPException):
-        return False
-    except Exception as e:
-        print(f"[DM] Unexpected error DMing {user_id}: {e}")
-        return False
-
-
-# ── Daily inactivity wipe (03:30 UTC) ─────────────────────────────────────────
-
 wipe_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
-
-
 @tasks.loop(time=wipe_time)
 async def daily_inactive_wipe():
-    """
-    1. DM players who are exactly 24 h away from a wipe (at-risk warning).
-    2. Wipe inactive players: 20% tax → house revenue, 80% auto-queued cashout.
-    3. DM every wiped player with their receipt.
-    4. Post a summary to the inactivity channel.
-    5. Send individual cashout tickets to the staff cashout channel.
-    """
-
-    # ── Step 1: 24-hour warning DMs ─────────────────────────────────────────
+    from database import wipe_inactive_players
     try:
-        at_risk = await db.get_players_at_risk()
-        dm_warned = 0
-        for player in at_risk:
-            embed = discord.Embed(
-                title="⚠️ Inactivity Warning — You're at risk of being wiped!",
-                color=0xf39c12,
-            )
-            embed.description = (
-                f"Hey **{player['username']}**! Your chips are scheduled to be wiped "
-                f"in approximately **24 hours** because you haven't met the activity requirements.\n\n"
-                f"**Your balance:** {player['balance']:,} chips\n"
-                f"**Hands played:** {player['recent_hands']} / {db.MIN_HANDS_PER_PERIOD} required\n"
-                f"**Chips wagered:** {player['recent_chips_wagered']:,} / {db.MIN_CHIPS_WAGERED:,} required\n\n"
-                f"**Log in and play {db.MIN_HANDS_PER_PERIOD - player['recent_hands']} more hand(s) "
-                f"before the wipe to keep your chips!**"
-            )
-            embed.set_footer(text="Wipe runs daily at 03:30 UTC • Use /poker myactivity to check your status")
-            if await _try_dm(player["user_id"], embed=embed):
-                dm_warned += 1
-        if at_risk:
-            print(f"[Daily Wipe] Sent 24h warning DMs to {dm_warned}/{len(at_risk)} at-risk player(s)")
-    except Exception as e:
-        print(f"[Daily Wipe] Warning DM phase error: {e}")
-
-    # ── Step 2 & 3: Wipe inactive players + DM receipts ─────────────────────
-    try:
-        wiped = await db.wipe_inactive_players()
-
-        dm_sent = 0
-        for w in wiped:
-            tax_pct = int(config.WIPE_TAX_RATE * 100)
-            embed = discord.Embed(
-                title="🧹 Your chips have been wiped due to inactivity",
-                color=0xe74c3c,
-            )
-            embed.description = (
-                f"Hey **{w['username']}**, you didn't meet the activity requirements "
-                f"and your chips have been wiped.\n\n"
-                f"**Chips wiped:** {w['amount_wiped']:,}\n"
-                f"**Inactivity tax ({tax_pct}%):** -{w['tax_amount']:,} chips\n"
-                f"**Auto-queued cashout (80%):** {w['cashout_amount']:,} chips\n\n"
-                f"The **{w['cashout_amount']:,} chips** have been moved to your pending "
-                f"cashout queue.\n\n"
-                f"**Hands played:** {w['recent_hands']} / {db.MIN_HANDS_PER_PERIOD} required\n"
-                f"**Chips wagered:** {w['recent_chips_wagered']:,} / {db.MIN_CHIPS_WAGERED:,} required"
-            )
-            embed.set_footer(
-                text="Use /poker myactivity to check requirements • /poker request_cashout to manage your funds")
-            if await _try_dm(w["user_id"], embed=embed):
-                dm_sent += 1
-
-        # ── Step 4: Channel summary ──────────────────────────────────────────
+        wiped = await wipe_inactive_players()
         if wiped:
-            channel_id = config.INACTIVITY_CHANNEL_ID
+            channel_id = int(os.getenv("INACTIVITY_CHANNEL_ID", "0"))
             if channel_id:
                 try:
                     channel = await bot.fetch_channel(channel_id)
-                    tax_total = sum(w["tax_amount"] for w in wiped)
-                    cashout_total = sum(w["cashout_amount"] for w in wiped)
-                    summary_lines = [
-                        f"• **{w['username']}**: {w['amount_wiped']:,} wiped "
-                        f"(tax: {w['tax_amount']:,} | cashout queued: {w['cashout_amount']:,}, "
-                        f"{w['recent_hands']} hands)"
+                    summary = "\n".join([
+                        f"• {w['username']}: {w['amount_wiped']} chips ({w['recent_hands']} hands)"
                         for w in wiped[:10]
-                    ]
-                    summary = "\n".join(summary_lines)
+                    ])
                     await channel.send(
-                        f"🧹 **Wiped {len(wiped)} inactive player(s):**\n{summary}\n\n"
-                        f"**Total tax collected:** {tax_total:,} chips\n"
-                        f"**Total cashouts queued:** {cashout_total:,} chips\n"
-                        f"*(DMs sent: {dm_sent}/{len(wiped)})*"
+                        f"🧹 **Wiped {len(wiped)} inactive player(s):**\n{summary}"
                     )
                 except Exception as e:
-                    print(f"[Daily Wipe] Failed to send channel summary: {e}")
+                    print(f"[Daily Wipe] Failed to send to Discord channel: {e}")
 
-            # ── Step 5: Staff Cashout Tickets ────────────────────────────────
-            if hasattr(config, "CASHOUT_CHANNEL_ID") and config.CASHOUT_CHANNEL_ID:
-                try:
-                    cashout_channel = await bot.fetch_channel(config.CASHOUT_CHANNEL_ID)
-                    for w in wiped:
-                        if w.get('cashout_amount', 0) > 0:
-                            ticket_msg = (
-                                f"**Username:** <@{w['user_id']}>\n"
-                                f"**Amount:** {w['cashout_amount']:,} <:poker_chip:1490458259855773707>\n"
-                                f"**Notes:** Auto-Cashout (Inactivity Wipe)"
-                            )
-                            await cashout_channel.send(ticket_msg)
-                except Exception as e:
-                    print(f"[Daily Wipe] Failed to send cashout tickets: {e}")
-
-            print(
-                f"[Daily Wipe] Wiped {len(wiped)} player(s) | "
-                f"tax: {sum(w['tax_amount'] for w in wiped):,} | "
-                f"cashouts queued: {sum(w['cashout_amount'] for w in wiped):,} | "
-                f"DMs sent: {dm_sent}/{len(wiped)}"
-            )
+            print(f"[Daily Wipe] Wiped {len(wiped)} inactive players")
     except Exception as e:
-        print(f"[Daily Wipe] Wipe phase error: {e}")
+        print(f"[Daily Wipe] Error: {e}")
+
 
 @bot.event
 async def on_ready():
@@ -184,6 +77,13 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     daily_inactive_wipe.start()
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
 
 
 @bot.event
@@ -285,12 +185,6 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
     )
     await message.add_reaction("✅")
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    await bot.process_commands(message)
 
 
 @bot.event

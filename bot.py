@@ -110,11 +110,18 @@ async def _handle_donation(message: discord.Message, before: discord.Message | N
         print(f"[Donation] Could not resolve user from interaction_metadata — skipping")
         return
 
-    # Build the text to search from content + all embed fields
+    # Build the text to search from all possible embed text locations
     text = message.content or ""
     for embed in message.embeds:
         text += " " + (embed.title or "")
         text += " " + (embed.description or "")
+        for field in embed.fields:
+            text += " " + (field.name or "")
+            text += " " + (field.value or "")
+        if embed.footer:
+            text += " " + (embed.footer.text or "")
+        if embed.author:
+            text += " " + (embed.author.name or "")
 
     print(f"[Donation] Text to search: {text!r}")
 
@@ -187,7 +194,11 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         print(f"[DEBUG on_message_edit] author={after.author} (id={after.author.id})")
         print(f"[DEBUG on_message_edit] before embeds={len(before.embeds)}, after embeds={len(after.embeds)}")
         for i, e in enumerate(after.embeds):
-            print(f"[DEBUG on_message_edit]   after embed[{i}] title={e.title!r} desc={e.description!r}")
+            print(f"[DEBUG on_message_edit]   embed[{i}] title={e.title!r} desc={e.description!r}")
+            for j, f in enumerate(e.fields):
+                print(f"[DEBUG on_message_edit]   embed[{i}].field[{j}] name={f.name!r} value={f.value!r}")
+            if e.footer: print(f"[DEBUG on_message_edit]   embed[{i}].footer={e.footer.text!r}")
+            if e.author:  print(f"[DEBUG on_message_edit]   embed[{i}].author={e.author.name!r}")
         print(f"[DEBUG on_message_edit] before.interaction_metadata={before_meta}")
         print(f"[DEBUG on_message_edit] after.interaction_metadata={after_meta}")
         if before_meta:

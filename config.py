@@ -6,6 +6,8 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "poker.db"
+TOURNAMENT_DB_PATH = "tournament.db"
+TOURNAMENT_STARTING_CHIPS = 10000
 
 # ── SERVER & CHANNELS ──
 GUILD_ID = 799685121582039141
@@ -52,3 +54,7 @@ DEV_USER_IDS = (
     1339935869598961728, # baymax for backups
     804762802451382283,  # real baymax
 )
+
+# ── CUSTOM EMOJIS ──
+POKER_CHIP_EMOJI = "<:poker_chip:1490458259855773707>"
+TOURNAMENT_CHIP_EMOJI = ":tournament_chip:"

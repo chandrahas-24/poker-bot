@@ -88,43 +88,65 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
-    # Use raw event so we catch ALL edits, not just ones where the
-    # before-state is in discord.py's cache.
     if payload.channel_id not in config.ADD_CHIPS_CHANNELS:
         return
 
-    data = payload.data
-    author_id = int(data.get("author", {}).get("id", 0))
-    if author_id != DONATION_BOT_ID:
+    # The MESSAGE_UPDATE payload only includes changed fields, so "Successfully
+    # donated" may not appear if it was set in an earlier edit. Fetch the full
+    # message from the API to get the complete current state.
+    channel = bot.get_channel(payload.channel_id)
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.NotFound:
         return
 
-    # Debug: dump every embed field so we can see exactly where the text lives
-    embeds_raw = data.get("embeds", [])
-    print(f"[DEBUG raw_edit] msg={payload.message_id} embeds={len(embeds_raw)}")
-    for i, e in enumerate(embeds_raw):
-        print(f"[DEBUG raw_edit]   embed[{i}] title={e.get('title')!r} desc={e.get('description')!r}")
-        for j, f in enumerate(e.get("fields", [])):
-            print(f"[DEBUG raw_edit]   embed[{i}].field[{j}] name={f.get('name')!r} value={f.get('value')!r}")
-        footer = e.get("footer", {})
-        if footer: print(f"[DEBUG raw_edit]   embed[{i}].footer={footer.get('text')!r}")
+    if message.author.id != DONATION_BOT_ID:
+        return
 
-    # Build searchable text from every embed text surface
-    text = data.get("content", "") or ""
-    for e in embeds_raw:
+    print(f"[DEBUG raw_edit] fetched msg={message.id} content={message.content!r} embeds={len(message.embeds)} components={len(message.components)}")
+
+    def _extract_component_text(components: list) -> str:
+        """Recursively extract text from all component types."""
+        out = ""
+        for c in components:
+            # type 10 = Text Display, content field holds the text
+            out += " " + (c.get("content") or "")
+            # type 9 = Section, has a description and optional components
+            out += " " + (c.get("description") or "")
+            # recurse into nested components (Container=17, Section=9, ActionRow=1, etc.)
+            out += _extract_component_text(c.get("components") or [])
+            # some types nest under "accessory"
+            if c.get("accessory"):
+                out += _extract_component_text([c["accessory"]])
+        return out
+
+    # Fetch the raw message dict so we can read Components v2 fields
+    # (Text Display type=10) which don't appear in message.embeds or content
+    try:
+        raw = await bot.http.get_message(channel.id, message.id)
+    except Exception as e:
+        print(f"[Donation] Failed to fetch raw message: {e}")
+        return
+
+    # Build searchable text from every possible surface
+    text = (raw.get("content") or "")
+    for e in raw.get("embeds") or []:
         text += " " + (e.get("title") or "")
         text += " " + (e.get("description") or "")
-        for f in e.get("fields", []):
+        for f in e.get("fields") or []:
             text += " " + (f.get("name") or "")
             text += " " + (f.get("value") or "")
-        text += " " + (e.get("footer", {}).get("text") or "")
-        text += " " + (e.get("author", {}).get("name") or "")
+        text += " " + ((e.get("footer") or {}).get("text") or "")
+        text += " " + ((e.get("author") or {}).get("name") or "")
+    text += _extract_component_text(raw.get("components") or [])
 
-    print(f"[DEBUG raw_edit] text={text!r}")
+    print(f"[DEBUG raw_edit] full text={text!r}")
 
     if "Successfully donated" not in text:
         return
 
-    # Get the amount
     match = re.search(r"Successfully donated.*?([\d,]+)", text)
     if not match:
         print("[Donation] Regex found no amount — skipping")
@@ -135,34 +157,22 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     print(f"[Donation] Parsed: donated={donated}, chips={chips}")
 
     if chips <= 0:
-        channel = bot.get_channel(payload.channel_id)
-        if channel:
-            await channel.send(
-                f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
-                f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
-            )
+        await channel.send(
+            f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
+            f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
+        )
         return
 
-    # Get the user from interaction_metadata — prefer the cached message
-    # since raw payload may omit unchanged fields
-    user = None
-    if payload.cached_message:
-        meta = getattr(payload.cached_message, "interaction_metadata", None)
-        user = getattr(meta, "user", None)
+    # Get the donor from interaction_metadata on the fetched message
+    meta = getattr(message, "interaction_metadata", None)
+    user = getattr(meta, "user", None)
     if user is None:
-        # Fall back to raw interaction data in the payload
-        interaction_data = data.get("interaction_metadata") or data.get("interaction")
-        if interaction_data:
-            user_data = interaction_data.get("user")
-            if user_data:
-                user_id   = int(user_data["id"])
-                user_name = user_data.get("username", "Unknown")
-                guild = bot.get_guild(int(data["guild_id"])) if "guild_id" in data else None
-                user  = (guild.get_member(user_id) if guild else None) or await bot.fetch_user(user_id)
-
-    if user is None:
-        print("[Donation] Could not resolve user — skipping")
+        print(f"[Donation] No interaction_metadata on fetched message — skipping")
         return
+
+    # Resolve to guild Member so mention works correctly
+    if message.guild:
+        user = message.guild.get_member(user.id) or user
 
     new_bal = await db.add_chips(
         bot.user.id,
@@ -175,11 +185,9 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
 
-    channel = bot.get_channel(payload.channel_id)
-    if channel:
-        await channel.send(
-            f"✅ **+{chips:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
-        )
+    await channel.send(
+        f"✅ **+{chips:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+    )
 
     print(f"[Donation] ✅ {user} donated ⏣{donated:,} → +{chips} chip(s) (balance: {new_bal})")
 

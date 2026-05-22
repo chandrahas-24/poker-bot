@@ -79,22 +79,30 @@ async def on_ready():
     daily_inactive_wipe.start()
 
 
-async def _handle_donation(message: discord.Message):
+async def _handle_donation(message: discord.Message, before: discord.Message | None = None):
     """
     Credit chips when Dank Memer confirms a /serverevents donate.
 
-    Dank Memer edits its initial blank response to add the embed, so this is
-    called from on_message_edit (and on_message as a fallback). The user who
-    ran the slash command is in message.interaction_metadata.user.
+    `before` is passed from on_message_edit so we can retrieve interaction_metadata
+    from the cached version — Discord's MESSAGE_UPDATE payload omits unchanged fields
+    like interaction_metadata, so after.interaction_metadata is often None.
     """
+    print(f"[Donation] _handle_donation called — channel={message.channel.id}, embeds={len(message.embeds)}")
+
     # Only act in the configured chip channels
     if message.channel.id not in config.ADD_CHIPS_CHANNELS:
+        print(f"[Donation] Wrong channel ({message.channel.id} not in {config.ADD_CHIPS_CHANNELS}) — skipping")
         return
 
-    # Resolve donor from slash command metadata
-    metadata = getattr(message, "interaction_metadata", None)
+    # Resolve donor from slash command metadata.
+    # Prefer `before` (fully cached) since the MESSAGE_UPDATE payload often
+    # omits interaction_metadata because it didn't change.
+    metadata = (
+        getattr(before, "interaction_metadata", None)
+        or getattr(message, "interaction_metadata", None)
+    )
     if not metadata:
-        print(f"[Donation] Message {message.id} has no interaction_metadata — skipping")
+        print(f"[Donation] No interaction_metadata on message {message.id} — skipping")
         return
 
     user = getattr(metadata, "user", None)
@@ -108,15 +116,21 @@ async def _handle_donation(message: discord.Message):
         text += " " + (embed.title or "")
         text += " " + (embed.description or "")
 
+    print(f"[Donation] Text to search: {text!r}")
+
     if "Successfully donated" not in text:
+        print(f"[Donation] 'Successfully donated' not found in text — skipping")
         return
 
     match = re.search(r"Successfully donated.*?([\d,]+)", text)
     if not match:
+        print(f"[Donation] Regex found no amount — skipping")
         return
 
     donated = int(match.group(1).replace(",", ""))
     chips   = donated // CHIPS_PER_COIN
+    print(f"[Donation] Parsed: donated={donated}, chips={chips}")
+
     if chips <= 0:
         await message.reply(
             f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
@@ -140,7 +154,7 @@ async def _handle_donation(message: discord.Message):
     )
     await message.add_reaction("✅")
 
-    print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) (balance: {new_bal})")
+    print(f"[Donation] ✅ {user} donated ⏣{donated:,} → +{chips} chip(s) (balance: {new_bal})")
 
 
 @bot.event
@@ -153,11 +167,11 @@ async def on_message(message: discord.Message):
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     # Dank Memer flow: pending confirmation embed → edited to "Successfully donated ____"
-    # Both states have embeds, so we can't gate on embed presence.
-    # _handle_donation checks for "Successfully donated" itself.
+    # Pass `before` so _handle_donation can pull interaction_metadata from the
+    # cached version (the MESSAGE_UPDATE payload omits unchanged fields).
     if after.author.id != DONATION_BOT_ID:
         return
-    await _handle_donation(after)
+    await _handle_donation(after, before=before)
 
 
 @bot.event

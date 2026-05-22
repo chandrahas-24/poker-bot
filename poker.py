@@ -3406,13 +3406,70 @@ class PokerCog(commands.Cog):
 
         db_conn = await db._get_db()
         async with db._write_lock:
-            await db_conn.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
-                                  (datetime.utcnow().isoformat(), amount))
+            # source='adjustment' keeps this out of daily/weekly/monthly windows
+            # so staff payouts don't drag down time-windowed revenue stats
+            await db_conn.execute(
+                "INSERT INTO house_revenue (ts, amount, source) VALUES (?, ?, 'adjustment')",
+                (datetime.utcnow().isoformat(), amount)
+            )
             await db_conn.commit()
 
         word = "Added" if amount >= 0 else "Deducted"
         await interaction.followup.send(
-            f"✅ {word} **{abs(amount)}** <:poker_chip:1490458259855773707> to the House Revenue tracker.")
+            f"✅ {word} **{abs(amount)}** <:poker_chip:1490458259855773707> to the House Revenue tracker."
+            f"*(This adjustment is reflected in all-time totals only — not daily/weekly/monthly.)*"
+        )
+
+    @pokeradmin.command(name="set_activity", description="[Dev] Change a player's last_activity timestamp")
+    @app_commands.describe(
+        user="The player to modify",
+        timestamp="Discord timestamp (e.g. <t:1716388800:R>) or raw Unix epoch"
+    )
+    async def set_activity(self, interaction: discord.Interaction, user: discord.Member, timestamp: str):
+        # 1. Dev Auth Check
+        if interaction.user.id not in self.DEV_USER_IDS:
+            await interaction.response.send_message("❌ **Access Denied.** Devs only.", ephemeral=True)
+            return
+
+        import re
+        from datetime import datetime
+
+        # 2. Parse the Discord timestamp format (<t:1234567890> or <t:1234567890:R>)
+        # Or accept a raw unix integer if you just type the numbers manually.
+        match = re.search(r"<t:(\d+)", timestamp)
+        if match:
+            unix_ts = int(match.group(1))
+        elif timestamp.isdigit():
+            unix_ts = int(timestamp)
+        else:
+            await interaction.response.send_message(
+                "❌ Invalid format. Please use a Discord timestamp like `<t:1716388800>` or `<t:1716388800:R>`.",
+                ephemeral=True)
+            return
+
+        # 3. Convert Unix Epoch -> UTC Datetime -> ISO 8601 string (what your database uses)
+        try:
+            # utcfromtimestamp perfectly matches your database's utcnow() formatting
+            new_iso = datetime.utcfromtimestamp(unix_ts).isoformat()
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to parse date: {e}", ephemeral=True)
+            return
+
+        # 4. Update the database directly
+        import database as db
+        conn = await db._get_db()
+        try:
+            await conn.execute("UPDATE wallets SET last_activity = ? WHERE user_id = ?", (new_iso, user.id))
+            await conn.commit()
+
+            # Show a success message with the dynamically formatted Discord timestamp
+            await interaction.response.send_message(
+                f"✅ Successfully backdated **{user.display_name}**'s last activity to <t:{unix_ts}:F>!\n"
+                f"*(Database saved exactly as:* `{new_iso}`*)*",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
 
     @pokeradmin.command(name="adjustjackpot", description="[Admin] Manually adjust the global jackpot")
     @app_commands.describe(amount="Amount to add (or negative to subtract)")

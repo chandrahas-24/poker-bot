@@ -151,9 +151,15 @@ async def init_db():
         await db.execute("""
                     CREATE TABLE IF NOT EXISTS house_revenue (
                         ts TEXT,
-                        amount INTEGER
+                        amount INTEGER,
+                        source TEXT DEFAULT 'game'
                     )
                 """)
+        # Migrate existing rows that have no source column
+        try:
+            await db.execute("ALTER TABLE house_revenue ADD COLUMN source TEXT DEFAULT 'game'")
+        except Exception:
+            pass
 
         await db.execute("""
                     CREATE TABLE IF NOT EXISTS jackpot (
@@ -766,12 +772,17 @@ async def pay_cashout(user_id: int, amount: int) -> bool:
 
 # --- REVENUE & ECONOMY FUNCTIONS ---
 
-async def log_house_revenue(amount: int):
-    """Safely adds chips to the house revenue tracker."""
+async def log_house_revenue(amount: int, source: str = 'game'):
+    """
+    Safely adds chips to the house revenue tracker.
+    source='game'       — normal rake/tax (counts in all time windows)
+    source='wipe_tax'   — tax collected on inactivity wipes (counts in all windows)
+    source='adjustment' — manual adjustments via /adjustrevenue (all-time only)
+    """
     db = await _get_db()
     async with _write_lock:
-        await db.execute("INSERT INTO house_revenue (ts, amount) VALUES (?, ?)",
-                         (datetime.utcnow().isoformat(), amount))
+        await db.execute("INSERT INTO house_revenue (ts, amount, source) VALUES (?, ?, ?)",
+                         (datetime.utcnow().isoformat(), amount, source))
         await db.commit()
 
 async def get_jackpot() -> int:
@@ -842,9 +853,9 @@ async def get_revenue_stats() -> dict:
     async with db.execute("""
         SELECT
             COALESCE(SUM(amount), 0),
-            COALESCE(SUM(CASE WHEN ts >= ? THEN amount ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN ts >= ? THEN amount ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN ts >= ? THEN amount ELSE 0 END), 0)
+            COALESCE(SUM(CASE WHEN ts >= ? AND source != 'adjustment' THEN amount ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN ts >= ? AND source != 'adjustment' THEN amount ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN ts >= ? AND source != 'adjustment' THEN amount ELSE 0 END), 0)
         FROM house_revenue
     """, (monthly_cut, weekly_cut, daily_cut)) as c:
         row = await c.fetchone()
@@ -1721,40 +1732,59 @@ async def get_inactive_players() -> list[dict]:
 
 
 async def wipe_inactive_players() -> list[dict]:
-    # Wipe chips from inactive players and return the list of affected users.
-    # Also logs the action
+    """
+    Wipe chips from inactive players.
+    • 20% of their balance is taken as a wipe tax (logged as house revenue).
+    • The remaining 80% is auto-queued as a pending cashout for them to collect.
+    Returns a list of dicts describing every affected player.
+    """
+    import math as _math
     now = datetime.utcnow().isoformat()
     inactive = await get_inactive_players()
     if not inactive:
         return []
 
+    wipe_tax_rate = config.WIPE_TAX_RATE  # e.g. 0.20
     db = await _get_db()
     wiped = []
 
     async with _write_lock:
         for player in inactive:
-            user_id = player["user_id"]
+            user_id  = player["user_id"]
             username = player["username"]
-            total_wiped = player["balance"]
+            balance  = player["balance"]
 
-            if total_wiped <= 0:
+            if balance <= 0:
                 continue
 
-            # Wipe their chips
+            # ── Tax + cashout split ────────────────────────────────────────
+            tax_amount     = _math.ceil(balance * wipe_tax_rate)
+            cashout_amount = balance - tax_amount
+
+            # ── Zero wallet balance; add cashout to pending ────────────────
             await db.execute("""
-                UPDATE wallets 
-                SET balance = 0,
-                    recent_hands = 0,
+                UPDATE wallets
+                SET balance              = 0,
+                    pending_cashout      = pending_cashout + ?,
+                    recent_hands         = 0,
                     recent_chips_wagered = 0,
-                    last_activity = ?        
+                    last_activity        = ?
                 WHERE user_id = ?
-            """, (now, user_id))
+            """, (cashout_amount, now, user_id))
 
+            # ── Increment wipe counter ─────────────────────────────────────
             await db.execute("""
-                            UPDATE stats SET times_wiped = COALESCE(times_wiped, 0) + 1 WHERE user_id = ?
-                        """, (user_id,))
+                UPDATE stats SET times_wiped = COALESCE(times_wiped, 0) + 1
+                WHERE user_id = ?
+            """, (user_id,))
 
-            # Log to audit
+            # ── Revenue: log the tax portion ───────────────────────────────
+            await db.execute(
+                "INSERT INTO house_revenue (ts, amount, source) VALUES (?, ?, 'wipe_tax')",
+                (now, tax_amount)
+            )
+
+            # ── Audit log ──────────────────────────────────────────────────
             await db.execute("""
                 INSERT INTO audit_log (ts, action, user_id, user_name, detail)
                 VALUES (?, 'INACTIVITY_WIPE', ?, ?, ?)
@@ -1762,18 +1792,32 @@ async def wipe_inactive_players() -> list[dict]:
                 datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
                 user_id,
                 username,
-                f"Wiped {total_wiped} chips after {INACTIVITY_DAYS}+ days inactive (hands: {player['recent_hands']}, wagered: {player['recent_chips_wagered']})"
+                (
+                    f"Wiped {balance} chips after {INACTIVITY_DAYS}+ days inactive "
+                    f"(hands: {player['recent_hands']}, wagered: {player['recent_chips_wagered']}) — "
+                    f"tax: {tax_amount}, queued cashout: {cashout_amount}"
+                )
             ))
 
+            # Log the exact tax taken to their personal transaction log
             await db.execute("""
                             INSERT INTO currency_log (user_id, event_type, amount, description, ts)
-                            VALUES (?, 'Wipe', ?, 'Inactivity Wipe', ?)
-                        """, (user_id, -total_wiped, now))
+                            VALUES (?, 'Wipe', ?, 'Inactivity Tax (20%)', ?)
+                        """, (user_id, -tax_amount, now))
+
+            # Log the 80% cashout exactly like the /request_cashout command does
+            if cashout_amount > 0:
+                await db.execute("""
+                                INSERT INTO currency_log (user_id, event_type, amount, description, ts)
+                                VALUES (?, 'Cash Out', ?, 'Auto-Cashout (Inactivity)', ?)
+                            """, (user_id, -cashout_amount, now))
 
             wiped.append({
                 "user_id": user_id,
                 "username": username,
-                "amount_wiped": total_wiped,
+                "amount_wiped": balance,
+                "tax_amount": tax_amount,
+                "cashout_amount": cashout_amount,
                 "last_activity": player["last_activity"],
                 "recent_hands": player["recent_hands"],
                 "recent_chips_wagered": player["recent_chips_wagered"]

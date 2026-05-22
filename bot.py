@@ -79,59 +79,55 @@ async def on_ready():
     daily_inactive_wipe.start()
 
 
-async def _handle_donation(message: discord.Message, before: discord.Message | None = None):
-    """
-    Credit chips when Dank Memer confirms a /serverevents donate.
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
 
-    `before` is passed from on_message_edit so we can retrieve interaction_metadata
-    from the cached version — Discord's MESSAGE_UPDATE payload omits unchanged fields
-    like interaction_metadata, so after.interaction_metadata is often None.
-    """
-    print(f"[Donation] _handle_donation called — channel={message.channel.id}, embeds={len(message.embeds)}")
 
-    # Only act in the configured chip channels
-    if message.channel.id not in config.ADD_CHIPS_CHANNELS:
-        print(f"[Donation] Wrong channel ({message.channel.id} not in {config.ADD_CHIPS_CHANNELS}) — skipping")
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    # Use raw event so we catch ALL edits, not just ones where the
+    # before-state is in discord.py's cache.
+    if payload.channel_id not in config.ADD_CHIPS_CHANNELS:
         return
 
-    # Resolve donor from slash command metadata.
-    # Prefer `before` (fully cached) since the MESSAGE_UPDATE payload often
-    # omits interaction_metadata because it didn't change.
-    metadata = (
-        getattr(before, "interaction_metadata", None)
-        or getattr(message, "interaction_metadata", None)
-    )
-    if not metadata:
-        print(f"[Donation] No interaction_metadata on message {message.id} — skipping")
+    data = payload.data
+    author_id = int(data.get("author", {}).get("id", 0))
+    if author_id != DONATION_BOT_ID:
         return
 
-    user = getattr(metadata, "user", None)
-    if not user:
-        print(f"[Donation] Could not resolve user from interaction_metadata — skipping")
-        return
+    # Debug: dump every embed field so we can see exactly where the text lives
+    embeds_raw = data.get("embeds", [])
+    print(f"[DEBUG raw_edit] msg={payload.message_id} embeds={len(embeds_raw)}")
+    for i, e in enumerate(embeds_raw):
+        print(f"[DEBUG raw_edit]   embed[{i}] title={e.get('title')!r} desc={e.get('description')!r}")
+        for j, f in enumerate(e.get("fields", [])):
+            print(f"[DEBUG raw_edit]   embed[{i}].field[{j}] name={f.get('name')!r} value={f.get('value')!r}")
+        footer = e.get("footer", {})
+        if footer: print(f"[DEBUG raw_edit]   embed[{i}].footer={footer.get('text')!r}")
 
-    # Build the text to search from all possible embed text locations
-    text = message.content or ""
-    for embed in message.embeds:
-        text += " " + (embed.title or "")
-        text += " " + (embed.description or "")
-        for field in embed.fields:
-            text += " " + (field.name or "")
-            text += " " + (field.value or "")
-        if embed.footer:
-            text += " " + (embed.footer.text or "")
-        if embed.author:
-            text += " " + (embed.author.name or "")
+    # Build searchable text from every embed text surface
+    text = data.get("content", "") or ""
+    for e in embeds_raw:
+        text += " " + (e.get("title") or "")
+        text += " " + (e.get("description") or "")
+        for f in e.get("fields", []):
+            text += " " + (f.get("name") or "")
+            text += " " + (f.get("value") or "")
+        text += " " + (e.get("footer", {}).get("text") or "")
+        text += " " + (e.get("author", {}).get("name") or "")
 
-    print(f"[Donation] Text to search: {text!r}")
+    print(f"[DEBUG raw_edit] text={text!r}")
 
     if "Successfully donated" not in text:
-        print(f"[Donation] 'Successfully donated' not found in text — skipping")
         return
 
+    # Get the amount
     match = re.search(r"Successfully donated.*?([\d,]+)", text)
     if not match:
-        print(f"[Donation] Regex found no amount — skipping")
+        print("[Donation] Regex found no amount — skipping")
         return
 
     donated = int(match.group(1).replace(",", ""))
@@ -139,10 +135,33 @@ async def _handle_donation(message: discord.Message, before: discord.Message | N
     print(f"[Donation] Parsed: donated={donated}, chips={chips}")
 
     if chips <= 0:
-        await message.reply(
-            f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
-            f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
-        )
+        channel = bot.get_channel(payload.channel_id)
+        if channel:
+            await channel.send(
+                f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
+                f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
+            )
+        return
+
+    # Get the user from interaction_metadata — prefer the cached message
+    # since raw payload may omit unchanged fields
+    user = None
+    if payload.cached_message:
+        meta = getattr(payload.cached_message, "interaction_metadata", None)
+        user = getattr(meta, "user", None)
+    if user is None:
+        # Fall back to raw interaction data in the payload
+        interaction_data = data.get("interaction_metadata") or data.get("interaction")
+        if interaction_data:
+            user_data = interaction_data.get("user")
+            if user_data:
+                user_id   = int(user_data["id"])
+                user_name = user_data.get("username", "Unknown")
+                guild = bot.get_guild(int(data["guild_id"])) if "guild_id" in data else None
+                user  = (guild.get_member(user_id) if guild else None) or await bot.fetch_user(user_id)
+
+    if user is None:
+        print("[Donation] Could not resolve user — skipping")
         return
 
     new_bal = await db.add_chips(
@@ -156,60 +175,13 @@ async def _handle_donation(message: discord.Message, before: discord.Message | N
 
     await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
 
-    await message.reply(
-        f"✅ **+{chips:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
-    )
-    await message.add_reaction("✅")
+    channel = bot.get_channel(payload.channel_id)
+    if channel:
+        await channel.send(
+            f"✅ **+{chips:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+        )
 
     print(f"[Donation] ✅ {user} donated ⏣{donated:,} → +{chips} chip(s) (balance: {new_bal})")
-
-
-DEBUG_CHANNEL_ID = 1479667673804701707
-
-@bot.event
-async def on_message(message: discord.Message):
-    # Debug: log everything in the donations channel
-    if message.channel.id == DEBUG_CHANNEL_ID:
-        meta = getattr(message, "interaction_metadata", None)
-        print(f"[DEBUG on_message] author={message.author} (id={message.author.id}) bot={message.author.bot}")
-        print(f"[DEBUG on_message] content={message.content!r}")
-        print(f"[DEBUG on_message] embeds={len(message.embeds)}")
-        for i, e in enumerate(message.embeds):
-            print(f"[DEBUG on_message]   embed[{i}] title={e.title!r} desc={e.description!r}")
-        print(f"[DEBUG on_message] interaction_metadata={meta}")
-        if meta:
-            print(f"[DEBUG on_message]   meta.user={getattr(meta, 'user', None)}")
-
-    if message.author.bot:
-        return
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    # Debug: log everything in the donations channel
-    if after.channel.id == DEBUG_CHANNEL_ID:
-        before_meta = getattr(before, "interaction_metadata", None)
-        after_meta  = getattr(after,  "interaction_metadata", None)
-        print(f"[DEBUG on_message_edit] author={after.author} (id={after.author.id})")
-        print(f"[DEBUG on_message_edit] before embeds={len(before.embeds)}, after embeds={len(after.embeds)}")
-        for i, e in enumerate(after.embeds):
-            print(f"[DEBUG on_message_edit]   embed[{i}] title={e.title!r} desc={e.description!r}")
-            for j, f in enumerate(e.fields):
-                print(f"[DEBUG on_message_edit]   embed[{i}].field[{j}] name={f.name!r} value={f.value!r}")
-            if e.footer: print(f"[DEBUG on_message_edit]   embed[{i}].footer={e.footer.text!r}")
-            if e.author:  print(f"[DEBUG on_message_edit]   embed[{i}].author={e.author.name!r}")
-        print(f"[DEBUG on_message_edit] before.interaction_metadata={before_meta}")
-        print(f"[DEBUG on_message_edit] after.interaction_metadata={after_meta}")
-        if before_meta:
-            print(f"[DEBUG on_message_edit]   before meta.user={getattr(before_meta, 'user', None)}")
-
-    # Dank Memer flow: pending confirmation embed → edited to "Successfully donated ____"
-    # Pass `before` so _handle_donation can pull interaction_metadata from the
-    # cached version (the MESSAGE_UPDATE payload omits unchanged fields).
-    if after.author.id != DONATION_BOT_ID:
-        return
-    await _handle_donation(after, before=before)
 
 
 @bot.event

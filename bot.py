@@ -20,6 +20,11 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, allowed_mentions=discord.AllowedMentions(users=True))
 
+# ── Donation listener config ──────────────────────────────────────────────────
+DONATION_BOT_ID  = 270904126974590976
+CHIPS_PER_COIN   = 1_000_000  # 1 chip per 1,000,000 donated coins
+
+
 wipe_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
 @tasks.loop(time=wipe_time)
 async def daily_inactive_wipe():
@@ -30,7 +35,6 @@ async def daily_inactive_wipe():
             channel_id = int(os.getenv("INACTIVITY_CHANNEL_ID", "0"))
             if channel_id:
                 try:
-                    # 🚨 FIXED: Use fetch_channel instead of get_channel
                     channel = await bot.fetch_channel(channel_id)
                     summary = "\n".join([
                         f"• {w['username']}: {w['amount_wiped']} chips ({w['recent_hands']} hands)"
@@ -72,15 +76,88 @@ async def on_ready():
         print("✅ Synced commands globally")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    daily_inactive_wipe.start()  # Start the daily task
+    daily_inactive_wipe.start()
+
+
+async def _handle_donation(message: discord.Message):
+    """
+    Credit chips when Dank Memer confirms a /serverevents donate.
+
+    Dank Memer edits its initial blank response to add the embed, so this is
+    called from on_message_edit (and on_message as a fallback). The user who
+    ran the slash command is in message.interaction_metadata.user.
+    """
+    # Only act in the configured chip channels
+    if message.channel.id not in config.ADD_CHIPS_CHANNELS:
+        return
+
+    # Resolve donor from slash command metadata
+    metadata = getattr(message, "interaction_metadata", None)
+    if not metadata:
+        print(f"[Donation] Message {message.id} has no interaction_metadata — skipping")
+        return
+
+    user = getattr(metadata, "user", None)
+    if not user:
+        print(f"[Donation] Could not resolve user from interaction_metadata — skipping")
+        return
+
+    # Build the text to search from content + all embed fields
+    text = message.content or ""
+    for embed in message.embeds:
+        text += " " + (embed.title or "")
+        text += " " + (embed.description or "")
+
+    if "Successfully donated" not in text:
+        return
+
+    match = re.search(r"Successfully donated.*?([\d,]+)", text)
+    if not match:
+        return
+
+    donated = int(match.group(1).replace(",", ""))
+    chips   = donated // CHIPS_PER_COIN
+    if chips <= 0:
+        await message.reply(
+            f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
+            f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
+        )
+        return
+
+    new_bal = await db.add_chips(
+        bot.user.id,
+        bot.user.display_name,
+        user.id,
+        user.name,
+        chips,
+        "Dank Memer Donation Exchange",
+    )
+
+    await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+
+    await message.reply(
+        f"✅ **+{chips:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+    )
+    await message.add_reaction("✅")
+
+    print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) (balance: {new_bal})")
 
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    # Hook into poker cog for embed resend counter
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # Dank Memer flow: pending confirmation embed → edited to "Successfully donated ____"
+    # Both states have embeds, so we can't gate on embed presence.
+    # _handle_donation checks for "Successfully donated" itself.
+    if after.author.id != DONATION_BOT_ID:
+        return
+    await _handle_donation(after)
 
 
 @bot.event
@@ -88,59 +165,6 @@ async def on_command_error(ctx, error):
     if isinstance(error, discord.ext.commands.CommandNotFound):
         return
 
-
-@bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    # 0. Restrict to specific channel IDs
-    ALLOWED_CHANNEL_ID = config.ADD_CHIPS_CHANNELS
-    if after.channel.id not in ALLOWED_CHANNEL_ID:
-        return
-
-    # 1. Ignore if the author isn't Dank Memer
-    if after.author.id != 270904126974590976:
-        return
-
-    # 2. Use the new interaction_metadata
-    if not after.interaction_metadata:
-        return
-
-    # 4. Dank Memer uses embeds. Combine content and embed text to search.
-    text_to_search = after.content
-    for embed in after.embeds:
-        if embed.description:
-            text_to_search += " " + embed.description
-        if embed.title:
-            text_to_search += " " + embed.title
-
-    # 5. Look for the exact success trigger
-    if "Successfully donated" in text_to_search:
-        # 6. Extract the number
-        match = re.search(r"Successfully donated.*?([\d,]+)", text_to_search)
-        if match:
-            amount_str = match.group(1).replace(",", "")
-            amount = int(amount_str)//1000000
-
-            # Pull the user from the new metadata object
-            user = after.interaction_metadata.user
-
-            # 7. Credit their poker wallet AND capture the new balance
-            new_bal = await db.add_chips(
-                bot.user.id,
-                bot.user.display_name,
-                user.id,
-                user.name,
-                amount,
-                "Dank Memer Donation Exchange"
-            )
-
-            await db.log_currency_event(user.id, "Cash In", amount, "Dank Memer Donation")
-
-            # Reply directly to Dank Memer's message
-            await after.reply(
-                f"✅ **+{amount:,}** chips → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
-            )
-
-            await after.add_reaction("✅")
 
 AUTHORIZED_ADMINS = config.DEV_USER_IDS
 
@@ -153,11 +177,8 @@ async def restart(ctx):
     await ctx.send("**Initiating Deployment...**")
 
     try:
-        # Pull latest changes from Git
         pull_output = subprocess.check_output(["git", "pull"]).decode("utf-8")
         await ctx.send(f"**Git Pull Success:**\n```\n{pull_output}\n```")
-
-        # Kill the bot. Systemd will restart it immediately.
         await ctx.send("**Restarting bot service...**")
         os._exit(0)
 
@@ -170,5 +191,3 @@ if __name__ == "__main__":
     if not token:
         raise ValueError("BOT_TOKEN not set in .env")
     bot.run(token)
-
-# comment to test

@@ -452,7 +452,7 @@ async def _close_table(channel, t: TableState):
         if total_to_return > 0:
             await _ret(p.user_id, total_to_return)
         await _clear(p.user_id)
-    await channel.send(f"🚪 **Table '{t.name}'** closed. All {get_chip_emoji(t)} returned.")
+    await channel.send(f"🚪 **Table '{t.name}'** closed. All chips returned.")
 
 
 # ── Log thread ────────────────────────────────────────────────────────────────

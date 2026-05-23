@@ -4325,6 +4325,107 @@ class PokerCog(commands.Cog):
         except Exception as e:
             await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
 
+    @poker.command(name="gamble", description="Spin the wheel! Set the weights for your mystery move.")
+    @app_commands.describe(
+        call="Weight/chance to Call (e.g., 50)",
+        fold="Weight/chance to Fold (e.g., 20)",
+        check="Weight/chance to Check",
+        allin="Weight/chance to go All-In"
+    )
+    async def gamble(
+            self,
+            interaction: discord.Interaction,
+            call: float = None,
+            fold: float = None,
+            check: float = None,
+            allin: float = None
+    ):
+        # 1. Standard table and player checks
+        key = (interaction.guild_id, interaction.channel_id)
+        t = tables.get(key)
+        if not t or t.game.street == Street.WAITING:
+            await interaction.response.send_message("❌ No active hand to gamble on.", ephemeral=True);
+            return
+
+        p = t.game.get_player(interaction.user.id)
+        if not p or p.folded or p.all_in:
+            await interaction.response.send_message("❌ You can't gamble right now.", ephemeral=True);
+            return
+
+        # 2. Safely collect the inputs
+        inputs = {"call": call, "fold": fold, "check": check, "allin": allin}
+        options, weights = [], []
+
+        for action, weight in inputs.items():
+            if weight is not None and weight > 0:
+                options.append(action)
+                weights.append(weight)
+
+        if not options:
+            await interaction.response.send_message(
+                "❌ You must provide a weight greater than 0 for at least one action!", ephemeral=True)
+            return
+
+        # 3. Check if it's their turn right now
+        is_active_turn = (t.game.current_idx >= 0 and t.game.players[t.game.current_idx].user_id == p.user_id)
+
+        # 4. Filter out illegal moves BEFORE rolling the dice
+        if is_active_turn:
+            call_amt = t.game.call_amount(p)
+            if "check" in options and call_amt > 0:
+                idx = options.index("check")
+                options.pop(idx)
+                weights.pop(idx)
+                if not options:
+                    await interaction.response.send_message(
+                        f"❌ You cannot Check (there is a bet of **{call_amt}** to call), and you didn't provide other options!",
+                        ephemeral=True)
+                    return
+
+        # 5. Roll the dice
+        import random
+        chosen_action = random.choices(options, weights=weights, k=1)[0]
+
+        if not is_active_turn:
+            # --- QUEUE THE PREMOVE ---
+            if chosen_action == "allin":
+                await interaction.response.send_message(
+                    "❌ You cannot queue an 'All-In' as a premove. You must wait for your turn!", ephemeral=True)
+                return
+            elif chosen_action == "fold":
+                p.premove = {"action": "fold_any"}  # Matches engine.py formatting
+            elif chosen_action == "check":
+                p.premove = {"action": "call_upto", "amount": 0}
+            elif chosen_action == "call":
+                p.premove = {"action": "call_upto", "amount": 9999999}
+
+            p.gamble_locked = True
+            await interaction.response.send_message("🎲 **Gamble locked in!** Your fate is sealed.", ephemeral=True)
+
+        else:
+            # --- EXECUTE INSTANTLY ---
+            await interaction.response.defer()
+            await interaction.followup.send(
+                f"🎲 **{p.display_name}** spun the wheel of fate and rolled... **{chosen_action.upper()}**!")
+
+            # 🛠️ FIXED: Use the actual methods from engine.py
+            if chosen_action == "fold":
+                t.game.fold(p.user_id)
+            elif chosen_action == "check" or chosen_action == "call":
+                t.game.check_or_call(p.user_id)
+            elif chosen_action == "allin":
+                # Raising by the player's total chip stack automatically triggers the engine's all-in logic
+                t.game.raise_bet(p.user_id, p.chips)
+
+            # Slog and advance
+            from poker import slog, _process_result, refresh
+            slog(t, f"{p.display_name} gambled and rolled {chosen_action.upper()}")
+
+            if t.game._hand_result:
+                await _process_result(interaction.guild, interaction.channel, t)
+            else:
+                await refresh(interaction.channel, t, cosmetics_cache=getattr(t, 'cosmetics_cache', {}))
+
 class StatsView(discord.ui.View):
     def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
         super().__init__(timeout=120)

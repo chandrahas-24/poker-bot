@@ -590,6 +590,14 @@ class TournamentCog(commands.Cog):
 
     @tourney.command(name="register", description="Register for the tournament")
     async def register(self, interaction: discord.Interaction):
+
+        if interaction.channel_id != config.TOURNAMENT_REGISTER_CHANNEL_ID:
+            await interaction.response.send_message(
+                f"❌ You can only register for the tournament in <#{config.TOURNAMENT_REGISTER_CHANNEL_ID}>.",
+                ephemeral=True
+            )
+            return
+
         success = await tdb.register_player(interaction.user.id, interaction.user.display_name)
         if success:
             await interaction.response.send_message(

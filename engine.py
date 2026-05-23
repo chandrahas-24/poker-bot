@@ -106,6 +106,14 @@ class PokerGame:
         self.egirl_saro_holders: set[int]      = set() # players dealt the ace variant
         self.action_history: list = []
         self.tax_rate, _ = taxation.get_tax_config()
+        self.is_tournament = False
+        self.tax_exempt = False
+
+    @property
+    def chip_emoji(self) -> str:
+        if getattr(self, "is_tournament", False):
+            return config.TOURNAMENT_CHIP_EMOJI
+        return config.POKER_CHIP_EMOJI
 
     # Lobby
 
@@ -118,7 +126,7 @@ class PokerGame:
         if any(p.user_id == user_id for p in self.pending_joins):
             return "❌ You're already waiting to join."
         if chips < self.MIN_BUYIN:
-            return f"❌ Minimum buy-in is {self.MIN_BUYIN} chips."
+            return f"❌ Minimum buy-in is {self.MIN_BUYIN} {self.chip_emoji}."
 
         occupied_seats = {p.seat for p in self.players + self.pending_joins}
         available_seats = [s for s in range(self.MAX_PLAYERS) if s not in occupied_seats]
@@ -128,11 +136,11 @@ class PokerGame:
 
         if self.street == Street.WAITING:
             self.players.append(p)
-            return f"✅ **{display_name}** joined with **{chips}** chips. ({len(self.players)} seated)"
+            return f"✅ **{display_name}** joined with **{chips}** {self.chip_emoji}. ({len(self.players)} seated)"
         else:
             p.sitting_out = True
             self.pending_joins.append(p)
-            return f"✅ **{display_name}** will join next hand with **{chips}** chips."
+            return f"✅ **{display_name}** will join next hand with **{chips}** {self.chip_emoji}."
 
         # Fallback if somehow no one is found (shouldn't happen if game logic holds)
         return 0, self.players[0]
@@ -151,17 +159,19 @@ class PokerGame:
             return 0, f"👋 **{p.display_name}** will leave after this hand."
         total = p.chips + p.pending_rebuy
         self.players.remove(p)
-        return total, f"👋 **{p.display_name}** cashed out **{total}** chips."
+        return total, f"👋 **{p.display_name}** cashed out **{total}** {self.chip_emoji}."
 
-    def queue_rebuy(self, user_id: int, amount: int) -> str:
+    def queue_rebuy(self, user_id: int, amount: int, emoji: str = None) -> str:
+        if emoji is None:
+            emoji = self.chip_emoji
         p = self.get_player(user_id)
         if p:
             p.pending_rebuy += amount
-            return f"✅ **{p.display_name}** queued **{amount}** chips for the next hand. (Pending: **{p.pending_rebuy}**)"
+            return f"✅ **{p.display_name}** queued **{amount}** {emoji} for the next hand. (Pending: **{p.pending_rebuy}**)"
         for pj in self.pending_joins:
             if pj.user_id == user_id:
                 pj.chips += amount
-                return f"✅ **{pj.display_name}** added **{amount}** chips. Stack at join: **{pj.chips}**."
+                return f"✅ **{pj.display_name}** added **{amount}** {emoji}. Stack at join: **{pj.chips}**."
         return "❌ You're not at the table."
 
     # Hand lifecycle
@@ -388,7 +398,7 @@ class PokerGame:
 
         # Only enforce min-raise if the player has enough chips to meet it.
         if not going_all_in and amount < min_raise:
-            return False, f"❌ Minimum raise is **{min_raise}** chips. (Use All-In to go all-in for less.)"
+            return False, f"❌ Minimum raise is **{min_raise}** {self.chip_emoji}. (Use All-In to go all-in for less.)"
 
         if total_needed > p.chips:
             total_needed = p.chips
@@ -437,8 +447,9 @@ class PokerGame:
             # 🚨 5% TAX ON NET WINNINGS ONLY
             profit = self.pot - winner.total_bet
             tax = 0
-            if profit > 0:
-                tax = ceil(profit * self.tax_rate)
+            if not getattr(self, 'tax_exempt', False):
+                if profit > 0:
+                    tax = ceil(profit * self.tax_rate)
 
             self.pot -= tax
             winner.chips += self.pot
@@ -627,13 +638,14 @@ class PokerGame:
 
         # 🚨 2. APPLY 5% TAX ONLY TO PLAYERS WITH NET PROFIT
         total_tax = 0
-        for p in self.players:
-            if chip_deltas[p.user_id] > 0:  # Only tax them if they actually made a profit!
-                profit_tax = ceil(chip_deltas[p.user_id] * self.tax_rate)
-                if profit_tax > 0:
-                    p.chips -= profit_tax
-                    chip_deltas[p.user_id] -= profit_tax
-                    total_tax += profit_tax
+        if not getattr(self, 'tax_exempt', False):
+            for p in self.players:
+                if chip_deltas[p.user_id] > 0:  # Only tax them if they actually made a profit!
+                    profit_tax = ceil(chip_deltas[p.user_id] * self.tax_rate)
+                    if profit_tax > 0:
+                        p.chips -= profit_tax
+                        chip_deltas[p.user_id] -= profit_tax
+                        total_tax += profit_tax
 
         lines = ["🃏 **Showdown!**", f"Board: {hand_str(self.community)}"]
 
@@ -650,10 +662,10 @@ class PokerGame:
                 label = "Main pot" if i == 0 else f"Side pot {i}"
                 each  = amt // len(winners)
                 if len(winners) == 1:
-                    lines.append(f"🏆 **{label}** ({amt}<:poker_chip:1490458259855773707> ): **{winners[0].display_name}**")
+                    lines.append(f"🏆 **{label}** ({amt}{self.chip_emoji} ): **{winners[0].display_name}**")
                 else:
                     names = ", ".join(w.display_name for w in winners)
-                    lines.append(f"🤝 **{label}** ({amt}<:poker_chip:1490458259855773707> ): **{names}** ({each}<:poker_chip:1490458259855773707>  each)")
+                    lines.append(f"🤝 **{label}** ({amt}{self.chip_emoji} ): **{names}** ({each}{self.chip_emoji}  each)")
 
         seen        = set()
         all_winners = []

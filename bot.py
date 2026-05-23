@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from database import init_db, recover_chips_in_play
 import database as db
 from tutorial_db import init_db as init_tutorial_db
+import tournament_db
 from discord.ext import tasks
 import datetime
 import subprocess
@@ -72,7 +73,7 @@ async def daily_inactive_wipe():
                 f"**Your balance:** {player['balance']:,} chips\n"
                 f"**Hands played:** {player['recent_hands']} / {db.MIN_HANDS_PER_PERIOD} required\n"
                 f"**Chips wagered:** {player['recent_chips_wagered']:,} / {db.MIN_CHIPS_WAGERED:,} required\n\n"
-                f"**Log in and play {db.MIN_HANDS_PER_PERIOD - player['recent_hands']} more hand(s) "
+                f"**Play {db.MIN_HANDS_PER_PERIOD - player['recent_hands']} more hand(s) "
                 f"before the wipe to keep your chips!**"
             )
             embed.set_footer(text="Wipe runs daily at 03:30 UTC • Use /poker myactivity to check your status")
@@ -162,6 +163,7 @@ async def daily_inactive_wipe():
 async def on_ready():
     await init_db()
     await init_tutorial_db()
+    await tournament_db.init_db()
 
     recovered = await recover_chips_in_play()
     if recovered:
@@ -169,10 +171,17 @@ async def on_ready():
         for r in recovered:
             print(f"   {r['username']}: +{r['amount']} chips returned to wallet")
 
+    tourney_recovered = await tournament_db.recover_chips_in_play()
+    if tourney_recovered:
+        print(f"⚠️  Recovered tournament chips for {len(tourney_recovered)} player(s) after restart:")
+        for r in tourney_recovered:
+            print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
+
     await bot.load_extension("poker")
     await bot.load_extension("tutorial_cog")
+    await bot.load_extension("tournament")
 
-    YOUR_GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+    YOUR_GUILD_ID = config.GUILD_ID
     if YOUR_GUILD_ID:
         guild = discord.Object(id=YOUR_GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
@@ -287,6 +296,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     await message.add_reaction("✅")
 
 
+_processing_cashouts = set()
+
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # 1. Ignore the bot's own reactions
@@ -318,47 +329,56 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not (is_admin or is_dev or is_payout_manager):
         return  # Unauthorized person reacted, ignore silently
 
-    # 5. Fetch the actual message from Discord
-    channel = bot.get_channel(payload.channel_id)
-    if not channel:
+    # ── Concurrency Check ─────────────────────────────────────────────────────
+    if payload.message_id in _processing_cashouts:
         return
+    _processing_cashouts.add(payload.message_id)
+
     try:
-        message = await channel.fetch_message(payload.message_id)
-    except discord.NotFound:
-        return
+        # 5. Fetch the actual message from Discord
+        channel = bot.get_channel(payload.channel_id)
+        if not channel:
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.NotFound:
+            return
 
-    # 6. Ensure we don't double-pay a ticket that's already processed
-    if "**PAID**" in message.content:
-        return
+        # 6. Ensure we don't double-pay a ticket that's already processed
+        if "**PAID**" in message.content:
+            return
 
-    # 7. Extract the User ID and Amount from your exact ticket format
-    user_match = re.search(r"\*\*Username:\*\* <@!?(\d+)>", message.content)
-    amount_match = re.search(r"\*\*Amount:\*\* ([\d,]+)", message.content)
+        # 7. Extract the User ID and Amount from your exact ticket format
+        user_match = re.search(r"\*\*Username:\*\* <@!?(\d+)>", message.content)
+        amount_match = re.search(r"\*\*Amount:\*\* ([\d,]+)", message.content)
 
-    if not user_match or not amount_match:
-        return  # Message doesn't match the cashout ticket layout, ignore
+        if not user_match or not amount_match:
+            return  # Message doesn't match the cashout ticket layout, ignore
 
-    target_user_id = int(user_match.group(1))
-    amount = int(amount_match.group(1).replace(",", ""))
+        target_user_id = int(user_match.group(1))
+        amount = int(amount_match.group(1).replace(",", ""))
 
-    # 8. Attempt to process the payment in the database
-    ok = await db.pay_cashout(target_user_id, amount)
-    if not ok:
-        await channel.send(
-            f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
-            f"They might not have **{amount:,}** chips in their pending queue anymore.",
-            delete_after=15
-        )
-        return
+        # 8. Attempt to process the payment in the database
+        ok = await db.pay_cashout(target_user_id, amount)
+        if not ok:
+            await channel.send(
+                f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
+                f"They might not have **{amount:,}** chips in their pending queue anymore.",
+                delete_after=15
+            )
+            return
 
-    # 9. Update the ticket visually so staff know it's done
-    new_content = message.content + f"\n\n-# **PAID** by <@{payload.user_id}>"
-    await message.edit(content=new_content)
+        # 9. Update the ticket visually so staff know it's done
+        new_content = message.content + f"\n\n-# **PAID** by <@{payload.user_id}>"
+        await message.edit(content=new_content)
+    finally:
+        _processing_cashouts.discard(payload.message_id)
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    # Hook into poker cog for embed resend counter
     await bot.process_commands(message)
 
 

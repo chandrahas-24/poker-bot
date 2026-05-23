@@ -8,3 +8,4 @@ __pycache__/
 *.pyc
 *.pyo
 config.py
+tournament.db*

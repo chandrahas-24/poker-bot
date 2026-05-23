@@ -392,31 +392,39 @@ class TournamentCog(commands.Cog):
 
     @tourneymgr.command(name="open", description="[Manager] Open a new tournament table")
     async def open_table(self, interaction: discord.Interaction, name: str):
+        # 1. Defer the response first
         await interaction.response.defer()
 
+        # 2. Use followup.send for everything after a defer
         if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True); return
+            await interaction.followup.send("Managers only.", ephemeral=True);
+            return
 
         key = (interaction.guild_id, interaction.channel_id)
         if key in tables:
-            await interaction.response.send_message("A table is already open in this channel.", ephemeral=True); return
+            await interaction.followup.send("A table is already open in this channel.", ephemeral=True);
+            return
 
         t = TableState(name, interaction.user.id, interaction.user.display_name)
-        t.is_tournament    = True
-        t.game.SMALL_BLIND = 25
-        t.game.BIG_BLIND   = 50
-        t.game.MIN_BUYIN   = 250
-        t.game.MAX_BUYIN   = 5000
-        t.game.tax_rate    = 0
-        t.game.tax_exempt  = True
-        # Load and apply guild settings (like resend threshold) from the regular poker settings database
+        t.is_tournament = True
+
+        # 3. Deep-Stack Tournament Limits
+        t.game.SMALL_BLIND = 50
+        t.game.BIG_BLIND = 100
+        t.game.MIN_BUYIN = 10000
+        t.game.MAX_BUYIN = 10000
+        t.game.tax_rate = 0
+        t.game.tax_exempt = True
+
+        # Load and apply guild settings
         settings = await db.get_settings(interaction.guild_id)
         from poker import TABLE_RESEND_MSGS
         t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
         tables[key] = t
 
-        await interaction.response.send_message(
-            f"Tournament Table Open!\nBlind: {small_blind}/{big_blind} | Min: {min_buyin} | Max: {max_buyin or 'None'}")
+        # 4. Use followup.send for the final confirmation!
+        await interaction.followup.send(
+            f"Tournament Table Open!\nBlind: {t.game.SMALL_BLIND}/{t.game.BIG_BLIND} | Min: {t.game.MIN_BUYIN} | Max: {t.game.MAX_BUYIN or 'None'}")
         await refresh(interaction.channel, t)
 
     @tourneymgr.command(name="blinds", description="Set blinds for this table")

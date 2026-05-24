@@ -2142,7 +2142,7 @@ class GameView(discord.ui.View):
             return
 
         strength = ""
-        if self.t.game.community and not p.folded:
+        if self.t.game.community:
             score = evaluator.evaluate(p.hole_cards, self.t.game.community)
             rank = evaluator.class_to_string(evaluator.get_rank_class(score))
             pct = round((1 - score / 7462) * 100, 1)
@@ -2156,7 +2156,6 @@ class GameView(discord.ui.View):
         # 2. Generate the heavy image and patch it in a second later
         if USE_IMAGES:
             try:
-                # Add '0' for backs, and 'True' for is_hole
                 file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, True, p.egirl_saro)
                 await interaction.edit_original_response(attachments=[file])
             except Exception as e:
@@ -4393,34 +4392,47 @@ class PokerCog(commands.Cog):
                     "❌ You cannot queue an 'All-In' as a premove. You must wait for your turn!", ephemeral=True)
                 return
             elif chosen_action == "fold":
-                p.premove = {"action": "fold_any"}  # Matches engine.py formatting
+                p.premove = {"action": "fold_any"}
             elif chosen_action == "check":
                 p.premove = {"action": "call_upto", "amount": 0}
             elif chosen_action == "call":
                 p.premove = {"action": "call_upto", "amount": 9999999}
 
             p.gamble_locked = True
-            await interaction.response.send_message("🎲 **Gamble locked in!** Your fate is sealed.", ephemeral=True)
+            await interaction.response.send_message(f"🎲 **Gamble locked in!** (Rolled: {chosen_action.upper()})",
+                                                    ephemeral=True)
 
         else:
             # --- EXECUTE INSTANTLY ---
+            # 🛠️ FIX 1: Use followup.send to properly clear the "thinking..." state
             await interaction.response.defer()
             await interaction.followup.send(
                 f"🎲 **{p.display_name}** spun the wheel of fate and rolled... **{chosen_action.upper()}**!")
 
-            # 🛠️ FIXED: Use the actual methods from engine.py
+            # 🛠️ FIX 2: Capture the engine's natively formatted message
+            success, msg = False, ""
             if chosen_action == "fold":
-                t.game.fold(p.user_id)
+                success, msg = t.game.fold(p.user_id)
             elif chosen_action == "check" or chosen_action == "call":
-                t.game.check_or_call(p.user_id)
+                success, msg = t.game.check_or_call(p.user_id)
             elif chosen_action == "allin":
-                # Raising by the player's total chip stack automatically triggers the engine's all-in logic
-                t.game.raise_bet(p.user_id, p.chips)
+                success, msg = t.game.raise_bet(p.user_id, p.chips)
 
-            # Slog and advance
-            from poker import slog, _process_result, refresh
-            slog(t, f"{p.display_name} gambled and rolled {chosen_action.upper()}")
+            # 🛠️ FIX 3: Decorate the engine log with a dice emoji for the table embed
+            if success and msg:
+                parts = msg.split("\n")
+                if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                    slog_clear(t)
 
+                for part in parts:
+                    if part.strip():
+                        # If the text contains their name, slap a dice in front of the native formatting
+                        if p.display_name in part:
+                            slog(t, f"🎲 {part.strip()}")
+                        else:
+                            slog(t, part.strip())
+
+            # Advance the UI
             if t.game._hand_result:
                 await _process_result(interaction.guild, interaction.channel, t)
             else:

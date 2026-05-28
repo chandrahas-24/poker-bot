@@ -621,6 +621,11 @@ class TournamentCog(commands.Cog):
         if not await self.is_manager(interaction):
             await interaction.response.send_message("Managers only.", ephemeral=True); return
 
+        if config.ADD_CHIPS_CHANNELS and interaction.channel_id not in config.ADD_CHIPS_CHANNELS:
+            mentions = ", ".join(f"<#{cid}>" for cid in config.ADD_CHIPS_CHANNELS)
+            await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+            return
+
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
             return
@@ -636,6 +641,11 @@ class TournamentCog(commands.Cog):
     async def removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int):
         if not await self.is_manager(interaction):
             await interaction.response.send_message("Managers only.", ephemeral=True); return
+
+        if config.REMOVE_CHIPS_CHANNELS and interaction.channel_id not in config.REMOVE_CHIPS_CHANNELS:
+            mentions = ", ".join(f"<#{cid}>" for cid in config.REMOVE_CHIPS_CHANNELS)
+            await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+            return
 
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)

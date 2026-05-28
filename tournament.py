@@ -785,6 +785,12 @@ class TournamentCog(commands.Cog):
     async def leaderboard(self, interaction: discord.Interaction):
         await interaction.response.defer()
         indiv = await tdb.get_individual_leaderboard(10)
+
+        for r in indiv:
+            member = interaction.guild.get_member(r['user_id'])
+            if member:
+                r['username'] = member.name
+
         teams = await tdb.get_team_leaderboard(10)
         caller_id = interaction.user.id
         caller_row = await tdb.get_player_stats(caller_id)

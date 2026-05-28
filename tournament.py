@@ -397,7 +397,7 @@ class TournamentCog(commands.Cog):
     @tasks.loop(time=tourney_wipe_time)
     async def tourney_daily_enforcer(self):
 
-        if datetime.datetime.utcnow() < datetime.datetime(2026, 6, 6):
+        if datetime.datetime.utcnow() < datetime.datetime(2026, 5, 28):
             return
 
         channel = self.bot.get_channel(config.TOURNAMENT_REGISTER_CHANNEL_ID)
@@ -865,7 +865,7 @@ class TournamentCog(commands.Cog):
             next_wipe += datetime.timedelta(days=1)
 
         # --- ⏳ PRE-TOURNAMENT OVERRIDE ---
-        is_pre_tourney = now < datetime.datetime(2026, 6, 6)
+        is_pre_tourney = now < datetime.datetime(2026, 5, 28)
 
         if is_pre_tourney:
             embed.add_field(name="Deadline", value="⏳ Starts June 6th", inline=False)

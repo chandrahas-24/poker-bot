@@ -322,12 +322,13 @@ class TournamentLeaderboardView(discord.ui.View):
 # -- Stats View ---------------------------------------------------------------
 
 class TournamentStatsView(discord.ui.View):
-    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict, roster=None):
+    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict, roster=None, team_info=None):
         super().__init__(timeout=120)
         self.caller = caller
         self.target = target
         self.stats = stats
         self.roster = roster
+        self.team_info = team_info
         self.show_team = False
         if not roster:
             self.toggle.disabled = True

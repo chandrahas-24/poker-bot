@@ -269,25 +269,17 @@ class TournamentLeaderboardView(discord.ui.View):
             MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
             top_ids = {r['user_id'] for r in self.indiv}
 
-            table_lines = ["```"]
-            # Strict 34 character width to match regular poker
-            table_lines.append(f"{'':3}{'Player':<16} {'Total':>4}")
-            table_lines.append("─" * 25)
+            lines = []
             for i, r in enumerate(self.indiv):
                 rank = i + 1
                 total = r['total_chips']
+                uname = r['username']  # No need to truncate names anymore!
+                medal = MEDALS.get(rank, f"{rank}.")
+                you_tag = " ◀" if r['user_id'] == self.caller_id else ""
 
-                # Truncate to EXACTLY 16 so it doesn't overflow the :<16 column!
-                uname = r['username'][:16]
-                medal = MEDALS.get(rank, f"{rank}. ")
-                you_tag = "<" if r['user_id'] == self.caller_id else " "
-                total_str = f"{total:,}"
+                lines.append(f"{medal} **{uname}** - {total:,} {config.TOURNAMENT_CHIP_EMOJI}{you_tag}")
 
-                # Length: 3(medal) + 16(name) + 1(space) + 8(total) + 1(space) + 4(wins) + 1(you) = 34 chars
-                table_lines.append(f"{medal:<3}{uname:<14} {total_str:>5}{you_tag}")
-
-            table_lines.append("```")
-            embed.description = "\n".join(table_lines)
+            embed.description = "\n".join(lines) if lines else "No players."
 
             # Caller's stats - shown at the bottom whether or not they're in the top 10
             if self.caller_row:
@@ -297,7 +289,7 @@ class TournamentLeaderboardView(discord.ui.View):
                 embed.add_field(
                     name=label,
                     value=(
-                        f"Total **{self.caller_row['total_chips']:,}** {config.TOURNAMENT_CHIP_EMOJI}  ·  "
+                        f"Total **{self.caller_row['total_chips']:,}** {config.TOURNAMENT_CHIP_EMOJI}"
                     ),
                     inline=False
                 )

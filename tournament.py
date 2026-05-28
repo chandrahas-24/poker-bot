@@ -1,6 +1,8 @@
 import time
 import discord
 from discord.ext import commands
+from discord.ext import tasks
+import datetime
 from discord import app_commands
 
 import config
@@ -268,33 +270,34 @@ class TournamentLeaderboardView(discord.ui.View):
             top_ids = {r['user_id'] for r in self.indiv}
 
             table_lines = ["```"]
-            table_lines.append(f"{'':4}{'Player':<18} {'Win%':>5} {'Total':>9} {'Wins':>6}")
-            table_lines.append("─" * 45)
+            # Strict 34 character width to match regular poker
+            table_lines.append(f"{'':3}{'Player':<16} {'Total':>4}")
+            table_lines.append("─" * 25)
             for i, r in enumerate(self.indiv):
                 rank = i + 1
-                wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
                 total = r['total_chips']
-                uname = r['username'][:17]
+
+                # Truncate to EXACTLY 16 so it doesn't overflow the :<16 column!
+                uname = r['username'][:16]
                 medal = MEDALS.get(rank, f"{rank}. ")
-                you_tag = " ◀" if r['user_id'] == self.caller_id else ""
+                you_tag = "<" if r['user_id'] == self.caller_id else " "
                 total_str = f"{total:,}"
-                wins_str = f"{r['hands_won']:,}"
-                table_lines.append(f"{medal:<4}{uname:<18} {wp:>5} {total_str:>9} {wins_str:>6}{you_tag}")
+
+                # Length: 3(medal) + 16(name) + 1(space) + 8(total) + 1(space) + 4(wins) + 1(you) = 34 chars
+                table_lines.append(f"{medal:<3}{uname:<14} {total_str:>5}{you_tag}")
+
             table_lines.append("```")
             embed.description = "\n".join(table_lines)
 
             # Caller's stats - shown at the bottom whether or not they're in the top 10
             if self.caller_row:
-                caller_wp = f"{self.caller_row['hands_won'] / self.caller_row['hands_played'] * 100:.1f}%" if self.caller_row['hands_played'] else "—"
                 in_top = self.caller_id in top_ids
                 rank_str = f"#{self.caller_rank}" if self.caller_rank else "—"
                 label = f"📊 Your Tournament Stats  ·  {rank_str}" + (" *(in top 10)*" if in_top else "")
                 embed.add_field(
                     name=label,
                     value=(
-                        f"Win% **{caller_wp}**  ·  "
                         f"Total **{self.caller_row['total_chips']:,}** {config.TOURNAMENT_CHIP_EMOJI}  ·  "
-                        f"Wins **{self.caller_row['hands_won']:,}**"
                     ),
                     inline=False
                 )
@@ -302,7 +305,7 @@ class TournamentLeaderboardView(discord.ui.View):
                 embed.add_field(name="📊 Your Tournament Stats", value="No hands played yet.", inline=False)
         else:
             text = "\n".join(
-                f"{i+1}. **{tm['name']}** - {tm['total_wins']} hands won"
+                f"{i + 1}. **{tm['name']}** - {tm['total_wins']} hands won"
                 for i, tm in enumerate(self.teams)) or "No teams."
             embed.add_field(name="Team Top 10", value=text, inline=False)
         return embed
@@ -372,6 +375,106 @@ class TournamentStatsView(discord.ui.View):
 class TournamentCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.tourney_daily_enforcer.start()
+
+    def cog_unload(self):
+        self.tourney_daily_enforcer.cancel()
+
+    async def _try_dm(self, user_id: int, embed: discord.Embed) -> bool:
+        """Safely attempts to DM a user, catching closed DMs/blocks without crashing."""
+        try:
+            user = await self.bot.fetch_user(user_id)
+            await user.send(embed=embed)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+        except Exception as e:
+            print(f"[Tournament DM] Error DMing {user_id}: {e}")
+            return False
+
+    tourney_wipe_time = datetime.time(hour=2, minute=00, tzinfo=datetime.timezone.utc)
+
+    @tasks.loop(time=tourney_wipe_time)
+    async def tourney_daily_enforcer(self):
+
+        if datetime.datetime.utcnow() < datetime.datetime(2026, 5, 28):
+            return
+
+        channel = self.bot.get_channel(config.TOURNAMENT_REGISTER_CHANNEL_ID)
+        if not channel: return
+
+        import tournament_db as tdb
+        cycle_day, warnings, penalties = await tdb.process_daily_tourney_check()
+
+        if cycle_day == 1:
+            dm_warned = 0
+            if warnings:
+                for w in warnings:
+                    embed = discord.Embed(
+                        title="⚠️ Tournament Coasting Warning — You're at risk of penalty!",
+                        color=0xf39c12
+                    )
+                    embed.description = (
+                        f"Hey **{w['username']}**! You are currently in the **Top 10** of the tournament.\n"
+                        f"To prevent coasting, you must wager 25% of your stack every 2 days.\n\n"
+                        f"**Your total chips:** {w['total_chips']:,} {config.TOURNAMENT_CHIP_EMOJI}\n"
+                        f"**Target (25%):** {w['target']:,}\n"
+                        f"**Wagered so far:** {w['wagered']:,}\n\n"
+                        f"**Wager {w['shortfall']:,} more chip(s) in the next 24 hours to avoid a deduction penalty!**"
+                    )
+                    embed.set_footer(
+                        text="Penalty runs daily at 03:30 UTC • Use /tourney myactivity to check your status")
+
+                    # 🛠️ Uses safe DM helper and accurately tracks success
+                    if await self._try_dm(w['user_id'], embed):
+                        dm_warned += 1
+
+                await channel.send(
+                    f"⚠️ **24-Hour Coasting Warning:** {len(warnings)} players in the Top 10 are falling short of their 25% wager quota! (DMs sent: {dm_warned}/{len(warnings)})"
+                )
+        else:
+            dm_sent = 0
+            if not penalties:
+                await channel.send(
+                    "🕒 **48-Hour Tournament Checkpoint:** All Top 10 players met their 25% wager quota! The period tracker has been reset.")
+            else:
+                embed = discord.Embed(
+                    title="🚨 Tournament Coasting Penalties Applied!",
+                    description="The following Top 10 players failed to wager 25% of their stack in the last 48 hours and have been taxed their shortfall:",
+                    color=0xE74C3C
+                )
+                for p in penalties:
+                    embed.add_field(name=p['username'],
+                                    value=f"**Target:** {p['target']:,}\n**Wagered:** {p['actual']:,}\n**Penalty:** -{p['shortfall']:,} {config.TOURNAMENT_CHIP_EMOJI}",
+                                    inline=False)
+
+                    dm = discord.Embed(
+                        title="📉 Tournament Coasting Penalty Applied",
+                        color=0xe74c3c
+                    )
+                    dm.description = (
+                        f"Hey **{p['username']}**, you didn't meet the Top 10 activity requirements for the 48-hour period.\n\n"
+                        f"**Target (25%):** {p['target']:,}\n"
+                        f"**Wagered:** {p['actual']:,}\n"
+                        f"**Shortfall Penalty:** -{p['shortfall']:,} {config.TOURNAMENT_CHIP_EMOJI}\n\n"
+                        f"The shortfall amount has been deducted from your balance."
+                    )
+
+                    # 🛠️ Uses safe DM helper and accurately tracks success
+                    if await self._try_dm(p['user_id'], dm):
+                        dm_sent += 1
+
+                embed.set_footer(text="The 48-hour wager tracker has been reset for all players.")
+
+                # 🛠️ Standardized channel message tracking outside of the embed footer
+                await channel.send(
+                    content=f"🚨 **Coasting Penalties Applied!** (DMs sent: {dm_sent}/{len(penalties)})",
+                    embed=embed
+                )
+
+    @tourney_daily_enforcer.before_loop
+    async def before_enforcer(self):
+        await self.bot.wait_until_ready()
 
     tourney      = app_commands.Group(name="tourney",      description="Tournament player commands")
     tourneymgr   = app_commands.Group(name="tourneymgr",   description="Tournament manager commands")
@@ -560,22 +663,47 @@ class TournamentCog(commands.Cog):
     @tourneymgr.command(name="addplayer", description="Add player to a team")
     async def addplayer(self, interaction: discord.Interaction, team_name: str, user: discord.Member):
         if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True); return
+            await interaction.response.send_message("Managers only.", ephemeral=True);
+            return
+
+        import tournament_db as tdb
+        import datetime
 
         team = await tdb.get_team_by_name(team_name)
         if not team:
-            await interaction.response.send_message("Team not found.", ephemeral=True); return
+            await interaction.response.send_message("Team not found.", ephemeral=True);
+            return
 
-        if not await tdb.is_registered(user.id):
-            await interaction.response.send_message("Player not registered.", ephemeral=True); return
+        stats = await tdb.get_player_stats(user.id)
+        if not stats:
+            await interaction.response.send_message("Player not registered.", ephemeral=True);
+            return
 
-        roster = await tdb.get_team_roster(team['id'])
-        if len(roster) >= 4:
+        # 🛠️ FIXED: Prevent silent team swapping
+        if stats.get('team_id') is not None:
+            await interaction.response.send_message("❌ Player is already on a team. Remove them first.", ephemeral=True)
+            return
+
+        # --- ⏳ 24-HOUR DEADLINE CHECK ---
+        reg_dt = datetime.datetime.fromisoformat(stats['registered_at']).replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        deadline = reg_dt + datetime.timedelta(days=1)
+
+        if now > deadline:
+            await interaction.response.send_message(
+                f"❌ **{user.display_name}** registered more than 24 hours ago. Players can only be added to a team within 24 hours of registering!",
+                ephemeral=True
+            )
+            return
+        # --------------------------------------------
+
+        # 🛠️ FIXED: Rely on the DB's atomic lock to prevent TOCTOU overflow
+        success = await tdb.add_player_to_team(user.id, team['id'])
+        if not success:
             await interaction.response.send_message(f"❌ Team **{team_name}** is already full (Max 4 players).",
                                                     ephemeral=False)
             return
 
-        await tdb.add_player_to_team(user.id, team['id'])
         await interaction.response.send_message(f"Added {user.display_name} to team {team_name}.")
 
     @tourneymgr.command(name="removeplayer", description="Remove player from their team")
@@ -654,23 +782,143 @@ class TournamentCog(commands.Cog):
         view = TournamentLeaderboardView(caller_id, caller_row, caller_rank, indiv, teams)
         await interaction.followup.send(embed=view.get_embed(), view=view)
 
-    @tourney.command(name="status", description="View active tournament tables")
-    async def status(self, interaction: discord.Interaction):
-        active = [t for t in tables.values() if t.is_tournament]
+    @tourney.command(name="myactivity", description="Check your dynamic 25% wager quota and activity")
+    async def myactivity(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        import tournament_db as tdb
+        stats = await tdb.get_player_stats(interaction.user.id)
 
-        if not active:
-            await interaction.response.send_message("No active tournament tables.", ephemeral=True); return
+        if not stats:
+            await interaction.followup.send("❌ You are not registered for the tournament.", ephemeral=True)
+            return
 
-        embed = discord.Embed(title="Active Tournament Tables", color=0x2ECC71)
-        for t in active:
-            players = len(t.game.players) + len(t.game.pending_joins)
-            embed.add_field(
-                name=t.name,
-                value=f"Players: {players}/12 | Blinds: {t.game.SMALL_BLIND}/{t.game.BIG_BLIND}",
-                inline=False)
+        total_chips = stats['total_chips']
 
-        await interaction.response.send_message(embed=embed)
+        db = await tdb._get_db()
+        # 🛠️ FIXED: Now fetching registered_at to verify the grace period
+        async with db.execute(
+                "SELECT period_wagered, last_activity, target_wager, registered_at FROM players WHERE user_id=?",
+                (interaction.user.id,)) as c:
+            row = await c.fetchone()
+            wagered = row[0] if row and row[0] else 0
+            last_act = row[1] if row else None
+            target = row[2] if row and row[2] is not None else int(total_chips * 0.25)
+            reg_str = row[3] if row and len(row) > 3 else None
 
+        shortfall = max(0, target - wagered)
+        percent_complete = min(100.0, (wagered / target * 100)) if target > 0 else 100.0
+        is_top_10 = stats['rank'] is not None and stats['rank'] <= 10
+
+        import datetime
+        now = datetime.datetime.utcnow()
+
+        # --- 🛡️ NEW PLAYER GRACE PERIOD CHECK ---
+        is_grace = False
+        if reg_str:
+            try:
+                reg_dt = datetime.datetime.fromisoformat(reg_str).replace(tzinfo=None)
+                if now < reg_dt + datetime.timedelta(hours=48):
+                    is_grace = True
+            except Exception:
+                pass
+
+        if is_grace:
+            status_msg = "🛡️ **New Player Grace Period!** You are safe from the tax for your first 48 hours."
+        elif shortfall == 0:
+            status_msg = "✅ **You have met your 25% quota!** You are safe from the tax."
+        else:
+            status_msg = f"⚠️ **You are short!** You need to wager **{shortfall:,}** more chips."
+
+        warning = "\n🚨 *You are currently in the Top 10! You MUST meet this quota or the shortfall will be deducted from your balance.*" if is_top_10 and not is_grace else "\n*(Note: Penalties only apply to the Top 10 players, but it's good to stay active!)*"
+
+        embed = discord.Embed(title="📊 Your 48-Hour Activity Tracker", color=0x3498DB)
+        embed.add_field(name="Current Total Chips", value=f"{total_chips:,} {config.TOURNAMENT_CHIP_EMOJI}",
+                        inline=True)
+        embed.add_field(name="Target (25%)", value=f"{target:,}", inline=True)
+        embed.add_field(name="Wagered So Far", value=f"{wagered:,}", inline=True)
+
+        if last_act:
+            dt = datetime.datetime.fromisoformat(last_act).replace(tzinfo=datetime.timezone.utc)
+            embed.add_field(name="Last Active", value=f"<t:{int(dt.timestamp())}:R>", inline=False)
+        else:
+            embed.add_field(name="Last Active", value="Never", inline=False)
+
+        async with db.execute("SELECT cycle_day FROM tourney_state WHERE id=1") as c:
+            state_row = await c.fetchone()
+            cycle_day = state_row[0] if state_row else 1
+
+        # 🛠️ FIXED: Wipe time math now correctly snaps to exactly 02:30 UTC
+        next_wipe = now.replace(hour=2, minute=30, second=0, microsecond=0)
+        if now > next_wipe:
+            next_wipe += datetime.timedelta(days=1)
+        if cycle_day == 1:
+            next_wipe += datetime.timedelta(days=1)
+
+        # --- ⏳ PRE-TOURNAMENT OVERRIDE ---
+        is_pre_tourney = now < datetime.datetime(2026, 5, 28)
+
+        if is_pre_tourney:
+            embed.add_field(name="Deadline", value="⏳ Starts June 6th", inline=False)
+        else:
+            wipe_timestamp = int(next_wipe.replace(tzinfo=datetime.timezone.utc).timestamp())
+            embed.add_field(name="Deadline", value=f"<t:{wipe_timestamp}:R>", inline=False)
+
+        filled = int(percent_complete / 10)
+        bar = ("🟩" * filled) + ("⬛" * (10 - filled))
+
+        if is_pre_tourney:
+            embed.description = "⏳ **The tournament officially begins on June 6th!**\nTeam registration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
+        else:
+            embed.description = f"{status_msg}{warning}\n\n**Progress:** {percent_complete:.1f}%\n{bar}"
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @tourneymgr.command(name="force_daily_check", description="[Admin] Manually trigger the daily tourney cycle")
+    async def force_daily_check(self, interaction: discord.Interaction):
+        if not await self.is_manager(interaction):
+            await interaction.response.send_message("Managers only.", ephemeral=True);
+            return
+
+        await interaction.response.defer()
+
+        # Bypass the date guard just for this manual trigger so you can test it!
+        channel = self.bot.get_channel(config.TOURNAMENT_REGISTER_CHANNEL_ID)
+        if not channel:
+            await interaction.followup.send("❌ Error: Cannot find the tournament registration channel.")
+            return
+
+        import tournament_db as tdb
+        cycle_day, warnings, penalties = await tdb.process_daily_tourney_check()
+
+        await interaction.followup.send(
+            f"✅ Forced the daily check. (Cycle Day {cycle_day} processed). Check the tournament channel for output.")
+
+        # We manually call the logic here so we don't trip the June 6th block in the main task
+        if cycle_day == 1:
+            dm_warned = 0
+            if warnings:
+                for w in warnings:
+                    embed = discord.Embed(title="⚠️ Tournament Coasting Warning", color=0xf39c12)
+                    embed.description = f"Hey **{w['username']}**! You are falling behind on your 25% wager quota."
+                    if await self._try_dm(w['user_id'], embed): dm_warned += 1
+                await channel.send(
+                    f"⚠️ **24-Hour Coasting Warning:** {len(warnings)} players in the Top 10 are falling short of their quota! (DMs sent: {dm_warned}/{len(warnings)})")
+            else:
+                await channel.send("✅ **Day 1 Check:** All Top 10 players are on track for their wager quotas.")
+        else:
+            dm_sent = 0
+            if not penalties:
+                await channel.send(
+                    "🕒 **48-Hour Tournament Checkpoint:** All Top 10 players met their 25% wager quota! The period tracker has been reset.")
+            else:
+                embed = discord.Embed(title="🚨 Tournament Coasting Penalties Applied!", color=0xE74C3C)
+                for p in penalties:
+                    embed.add_field(name=p['username'], value=f"**Penalty:** -{p['shortfall']:,}", inline=False)
+                    dm = discord.Embed(title="📉 Tournament Coasting Penalty Applied",
+                                       description=f"You were penalized -{p['shortfall']:,} chips.", color=0xe74c3c)
+                    if await self._try_dm(p['user_id'], dm): dm_sent += 1
+                await channel.send(content=f"🚨 **Coasting Penalties Applied!** (DMs sent: {dm_sent}/{len(penalties)})",
+                                   embed=embed)
 
 async def setup(bot):
     await bot.add_cog(TournamentCog(bot))

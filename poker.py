@@ -379,6 +379,15 @@ async def _auto_next_hand(t: TableState, channel):
         await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
 
+    if getattr(t, 'is_tournament', False):
+        import tournament_db as tdb
+        active_uids = [p.user_id for p in active]
+        dominance_warning = await tdb.get_team_dominance_warning(active_uids)
+        if dominance_warning:
+            await channel.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}")
+            await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+            return
+
     if not getattr(t, 'is_tournament', False):
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
@@ -1018,6 +1027,9 @@ async def _process_result(guild, channel, t: TableState):
 
     if t.is_tournament:
         import tournament_db
+        wagers_this_hand = {p.user_id: p.total_bet for p in result.showdown_players if p.total_bet > 0}
+        if wagers_this_hand:
+            await tournament_db.log_period_wagers(wagers_this_hand)
         await tournament_db.process_hand_result(result, t.name)
         # Sync each player's current stack into chips_in_play so wallet reflects live totals
         chip_map = {p.user_id: p.chips + p.pending_rebuy for p in t.game.players}
@@ -2682,12 +2694,25 @@ class PokerCog(commands.Cog):
         t.game.pending_leaves.clear()
         t.game.kicked_users.clear()
 
+        if getattr(t, 'is_tournament', False):
+            import tournament_db as tdb
+            bb = t.game.BIG_BLIND
+            active = [p for p in t.game.players if
+                      (p.chips + p.pending_rebuy) >= bb and p.user_id not in t.game.pending_leaves]
+            active_uids = [p.user_id for p in active]
+            dominance_warning = await tdb.get_team_dominance_warning(active_uids)
+            if dominance_warning:
+                await interaction.followup.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}",
+                                                ephemeral=True)
+                return
+
         slog_clear(t)
         success, msg = t.game.start_hand()
         slog(t, msg)
         if not success:
             await interaction.followup.send(msg, ephemeral=True);
             return
+
         t.msg_count = 0
         await refresh(interaction.channel, t, new_hand=True)
         await interaction.followup.send("✅ Hand started!", ephemeral=True)
@@ -3056,17 +3081,18 @@ class PokerCog(commands.Cog):
         top_ids = {r['user_id'] for r in rows}
 
         table_lines = ["```"]
-        table_lines.append(f"{'':4}{'Player':<18} {'Win%':>5} {'Net':>9} {'Wallet':>8}")
-        table_lines.append("─" * 47)
+        # Reduced width to 30 chars to prevent mobile line-wrapping
+        table_lines.append(f"{'':3}{'Player':<18} {'Win%':>4} {'Net':>6}")
+        table_lines.append("─" * 34)
         for i, r in enumerate(rows):
             rank = i + 1
             wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
             net = r['net_chips']
             sign = "+" if net >= 0 else ""
-            uname = r['username'][:17]
+            uname = r['username'][:16]  # Truncate name heavily for mobile
             medal = MEDALS.get(rank, f"{rank}. ")
-            you_tag = " ◀" if r['user_id'] == caller_id else ""
-            table_lines.append(f"{medal:<4}{uname:<18} {wp:>5} {sign + str(net):>9} {r['wallet']:>8}{you_tag}")
+            you_tag = "<" if r['user_id'] == caller_id else ""
+            table_lines.append(f"{medal:<3}{uname:<16} {wp:>4} {sign + str(net):>8} {you_tag}")
         table_lines.append("```")
 
         embed = discord.Embed(
@@ -4099,15 +4125,15 @@ class PokerCog(commands.Cog):
         top_ids = {r['user_id'] for r in rows}
 
         table_lines = ["```"]
-        table_lines.append(f"{'':4}{'Player':<18} {'Tipped':>12}")
-        table_lines.append("─" * 36)
+        table_lines.append(f"{'':4}{'Player':<16} {'Tipped':>7}")
+        table_lines.append("─" * 34)
 
         for i, r in enumerate(rows):
             rank = i + 1
-            uname = r['username'][:17]
+            uname = r['username'][:16]
             medal = MEDALS.get(rank, f"{rank}. ")
             you_tag = " ◀" if r['user_id'] == caller_id else ""
-            table_lines.append(f"{medal:<4}{uname:<18} {r['total_tipped']:>12,}{you_tag}")
+            table_lines.append(f"{medal:<4}{uname:<16} {r['total_tipped']:>7,}{you_tag}")
         table_lines.append("```")
 
         embed = discord.Embed(

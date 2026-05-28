@@ -397,7 +397,7 @@ class TournamentCog(commands.Cog):
     @tasks.loop(time=tourney_wipe_time)
     async def tourney_daily_enforcer(self):
 
-        if datetime.datetime.utcnow() < datetime.datetime(2026, 5, 28):
+        if datetime.datetime.utcnow() < datetime.datetime(2026, 6, 7):
             return
 
         channel = self.bot.get_channel(config.TOURNAMENT_REGISTER_CHANNEL_ID)
@@ -865,10 +865,10 @@ class TournamentCog(commands.Cog):
             next_wipe += datetime.timedelta(days=1)
 
         # --- ⏳ PRE-TOURNAMENT OVERRIDE ---
-        is_pre_tourney = now < datetime.datetime(2026, 5, 28)
+        is_pre_tourney = now < datetime.datetime(2026, 6, 7)
 
         if is_pre_tourney:
-            embed.add_field(name="Deadline", value="⏳ Starts June 6th", inline=False)
+            embed.add_field(name="Deadline", value="⏳ Starts June 7th", inline=False)
         else:
             wipe_timestamp = int(next_wipe.replace(tzinfo=datetime.timezone.utc).timestamp())
             embed.add_field(name="Deadline", value=f"<t:{wipe_timestamp}:R>", inline=False)
@@ -877,7 +877,7 @@ class TournamentCog(commands.Cog):
         bar = ("🟩" * filled) + ("⬛" * (10 - filled))
 
         if is_pre_tourney:
-            embed.description = "⏳ **The tournament officially begins on June 6th!**\nTeam registration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
+            embed.description = "⏳ **The tournament officially begins on June 7th!**\nTeam registration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
         else:
             embed.description = f"{status_msg}{warning}\n\n**Progress:** {percent_complete:.1f}%\n{bar}"
 
@@ -903,7 +903,7 @@ class TournamentCog(commands.Cog):
         await interaction.followup.send(
             f"✅ Forced the daily check. (Cycle Day {cycle_day} processed). Check the tournament channel for output.")
 
-        # We manually call the logic here so we don't trip the June 6th block in the main task
+        # We manually call the logic here so we don't trip the June 7th block in the main task
         if cycle_day == 1:
             dm_warned = 0
             if warnings:

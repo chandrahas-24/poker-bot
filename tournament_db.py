@@ -28,6 +28,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
                 created_by INTEGER NOT NULL,
+                leader_id INTEGER DEFAULT NULL,
                 created_at TEXT NOT NULL
             )
         """)
@@ -76,6 +77,11 @@ async def init_db():
             await db.execute("ALTER TABLE players ADD COLUMN period_wagered INTEGER DEFAULT 0")
             await db.execute("ALTER TABLE players ADD COLUMN last_activity TEXT")
             await db.execute("ALTER TABLE players ADD COLUMN target_wager INTEGER DEFAULT 1250")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE teams ADD COLUMN leader_id INTEGER")
         except Exception:
             pass
 
@@ -252,14 +258,25 @@ async def create_team(name: str, created_by: int) -> bool:
     now = datetime.utcnow().isoformat()
     try:
         async with _write_lock:
+            # 🛠️ FIXED: Staff create teams, so leader_id defaults to NULL
             await db.execute(
-                "INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?)",
+                "INSERT INTO teams (name, created_by, leader_id, created_at) VALUES (?, ?, NULL, ?)",
                 (name, created_by, now)
             )
             await db.commit()
         return True
     except aiosqlite.IntegrityError:
         return False
+
+async def set_team_leader(team_id: int, user_id: int) -> bool:
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("UPDATE teams SET leader_id = ? WHERE id = ?", (user_id, team_id))
+        async with db.execute("SELECT changes()") as c:
+            row = await c.fetchone()
+            success = bool(row and row[0] > 0)
+        await db.commit()
+        return success
 
 async def get_team_by_name(name: str) -> dict | None:
     db = await _get_db()
@@ -276,6 +293,19 @@ async def get_team_by_id(team_id: int) -> dict | None:
 async def get_all_teams() -> list[dict]:
     db = await _get_db()
     async with db.execute("SELECT * FROM teams") as c:
+        return [dict(r) for r in await c.fetchall()]
+
+async def get_all_teams_info() -> list[dict]:
+    db = await _get_db()
+    async with db.execute("""
+        SELECT t.id, t.name, t.leader_id,
+               (SELECT username FROM players WHERE user_id = t.leader_id) as leader_name,
+               COUNT(p.user_id) as member_count
+        FROM teams t
+        LEFT JOIN players p ON t.id = p.team_id
+        GROUP BY t.id
+        ORDER BY t.name ASC
+    """) as c:
         return [dict(r) for r in await c.fetchall()]
 
 async def add_player_to_team(user_id: int, team_id: int) -> bool:

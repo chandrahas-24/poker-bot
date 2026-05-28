@@ -322,12 +322,13 @@ class TournamentLeaderboardView(discord.ui.View):
 # -- Stats View ---------------------------------------------------------------
 
 class TournamentStatsView(discord.ui.View):
-    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict, roster=None):
+    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict, roster=None, team_info=None):
         super().__init__(timeout=120)
         self.caller = caller
         self.target = target
         self.stats = stats
         self.roster = roster
+        self.team_info = team_info
         self.show_team = False
         if not roster:
             self.toggle.disabled = True
@@ -354,9 +355,17 @@ class TournamentStatsView(discord.ui.View):
 
     def build_team_embed(self) -> discord.Embed:
         embed = discord.Embed(title=f"Team Stats — {self.stats['team_name']}", color=0xE67E22)
-        text = "\n".join(
-            f"{i+1}. **{p['username']}** - {p['total_chips']:,} {config.TOURNAMENT_CHIP_EMOJI} ({p['hands_won']} wins)"
-            for i, p in enumerate(self.roster)) or "No players."
+
+        leader_id = self.team_info.get('leader_id') if self.team_info else None
+
+        lines = []
+        if self.roster:
+            for i, p in enumerate(self.roster):
+                is_leader = " 👑 *(Captain)*" if p['user_id'] == leader_id else ""
+                lines.append(
+                    f"{i + 1}. **{p['username']}**{is_leader} - {p['total_chips']:,} {config.TOURNAMENT_CHIP_EMOJI} ({p['hands_won']} wins)")
+
+        text = "\n".join(lines) or "No players."
         embed.add_field(name="Player Contributions", value=text, inline=False)
         return embed
 
@@ -368,6 +377,89 @@ class TournamentStatsView(discord.ui.View):
         button.label = "Switch to My Stats" if self.show_team else "Switch to Team Stats"
         embed = self.build_team_embed() if self.show_team else self.build_personal_embed()
         await interaction.response.edit_message(embed=embed, view=self)
+
+
+class TournamentTeamsView(discord.ui.View):
+    def __init__(self, caller: discord.User | discord.Member, teams: list[dict]):
+        super().__init__(timeout=120)
+        self.caller = caller
+        self.teams = teams
+        self.page = 0
+        self.update_buttons()
+
+    def update_buttons(self):
+        max_pages = len(self.teams)
+        self.btn_first.disabled = self.page == 0
+        self.btn_prev.disabled = self.page == 0
+        self.btn_next.disabled = self.page >= max_pages - 1
+        self.btn_last.disabled = self.page >= max_pages - 1
+
+    async def build_embed(self) -> discord.Embed:
+        team = self.teams[self.page]
+        embed = discord.Embed(title=f"🛡️ Team: {team['name']}", color=0x3498DB)
+
+        import tournament_db as tdb
+        import config
+
+        # Dynamically fetch the live roster for this specific team
+        roster = await tdb.get_team_roster(team['id'])
+
+        leader_id = team.get('leader_id')
+        leader_str = f"👑 {team['leader_name']}" if team.get('leader_name') else "No Captain Set"
+
+        embed.add_field(name="Captain", value=leader_str, inline=False)
+
+        lines = []
+        if roster:
+            for i, p in enumerate(roster):
+                is_leader = " 👑" if p['user_id'] == leader_id else ""
+                lines.append(
+                    f"{i + 1}. **{p['username']}**{is_leader} - {p['total_chips']:,} {config.TOURNAMENT_CHIP_EMOJI} ({p['hands_won']} wins)")
+
+        text = "\n".join(lines) or "No players yet."
+
+        # Dynamic status tag
+        status = " *(Looking for players!)*" if len(roster) < 4 else " *(Full)*"
+        embed.add_field(name=f"Roster ({len(roster)}/4){status}", value=text, inline=False)
+
+        embed.set_footer(text=f"Page {self.page + 1} of {len(self.teams)}")
+        return embed
+
+    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
+            return
+        self.page = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
+            return
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
+            return
+        self.page = min(len(self.teams) - 1, self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
+            return
+        self.page = len(self.teams) - 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
 
 # -- Cog ----------------------------------------------------------------------
@@ -775,16 +867,47 @@ class TournamentCog(commands.Cog):
             return
 
         roster = None
+        team_info = None
         if stats.get('team_id'):
             roster = await tdb.get_team_roster(stats['team_id'])
+            team_info = await tdb.get_team_by_id(stats['team_id'])
 
-        view = TournamentStatsView(interaction.user, target, stats, roster)
+        view = TournamentStatsView(interaction.user, target, stats, roster, team_info)
         await interaction.followup.send(embed=view.build_personal_embed(), view=view, ephemeral=hidden)
+
+    @tourneymgr.command(name="setleader", description="[Manager] Set the captain/leader of a team")
+    async def setleader(self, interaction: discord.Interaction, team_name: str, user: discord.Member):
+        if not await self.is_manager(interaction):
+            await interaction.response.send_message("Managers only.", ephemeral=True)
+            return
+
+        import tournament_db as tdb
+        team = await tdb.get_team_by_name(team_name)
+        if not team:
+            await interaction.response.send_message("❌ Team not found.", ephemeral=True)
+            return
+
+        stats = await tdb.get_player_stats(user.id)
+        if not stats or stats.get('team_id') != team['id']:
+            await interaction.response.send_message(
+                f"❌ **{user.display_name}** is not on team **{team_name}**. They must be on the team to be made captain.",
+                ephemeral=True)
+            return
+
+        await tdb.set_team_leader(team['id'], user.id)
+        await interaction.response.send_message(
+            f"👑 **{user.display_name}** has been officially set as the captain of team **{team_name}**.")
 
     @tourney.command(name="leaderboard", description="View tournament leaderboards")
     async def leaderboard(self, interaction: discord.Interaction):
         await interaction.response.defer()
         indiv = await tdb.get_individual_leaderboard(10)
+
+        for r in indiv:
+            member = interaction.guild.get_member(r['user_id'])
+            if member:
+                r['username'] = member.name
+
         teams = await tdb.get_team_leaderboard(10)
         caller_id = interaction.user.id
         caller_row = await tdb.get_player_stats(caller_id)
@@ -929,6 +1052,22 @@ class TournamentCog(commands.Cog):
                     if await self._try_dm(p['user_id'], dm): dm_sent += 1
                 await channel.send(content=f"🚨 **Coasting Penalties Applied!** (DMs sent: {dm_sent}/{len(penalties)})",
                                    embed=embed)
+
+    @tourney.command(name="teams", description="View all registered tournament teams")
+    async def list_teams(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        import tournament_db as tdb
+        teams = await tdb.get_all_teams_info()
+
+        if not teams:
+            await interaction.followup.send("No teams have been created yet.")
+            return
+
+        # Spawn the interactive paginated view
+        view = TournamentTeamsView(interaction.user, teams)
+        embed = await view.build_embed()
+
+        await interaction.followup.send(embed=embed, view=view)
 
 async def setup(bot):
     await bot.add_cog(TournamentCog(bot))

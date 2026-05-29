@@ -43,6 +43,7 @@ class PokerPlayer:
     pending_rebuy: int  = 0
     egirl_saro:    bool = False
     premove:       dict | None = None
+    vpip: bool = False
 
     def reset_for_hand(self):
         self.hole_cards  = []
@@ -54,6 +55,7 @@ class PokerPlayer:
         self.sitting_out = False
         self.egirl_saro  = False
         self.premove     = None
+        self.vpip        = False
 
     def reset_for_street(self):
         self.bet   = 0
@@ -79,6 +81,7 @@ class HandResult:
     tax: int = 0
     allin_user_ids: set = None
     action_history: list = None
+    vpip_ids: set = None
 
 class PokerGame:
     SMALL_BLIND = config.DEFAULT_SMALL_BLIND
@@ -108,6 +111,7 @@ class PokerGame:
         self.tax_rate, _ = taxation.get_tax_config()
         self.is_tournament = False
         self.tax_exempt = False
+        self.vpip = False
 
     @property
     def chip_emoji(self) -> str:
@@ -368,6 +372,8 @@ class PokerGame:
             if p.chips == 0:
                 p.all_in = True
             msg = f"📞 **{p.display_name}** calls {amount}. (Pot: {self.pot})"
+            if self.street == Street.PREFLOP and amount > 0:
+                p.vpip = True
         self.action_history.append({
             "type": "action", "player_id": user_id,
             "action": "check" if amount == 0 else "call",
@@ -408,6 +414,9 @@ class PokerGame:
         # Track raise size for future min-raise enforcement (only if a full raise)
         if actual_raise >= min_raise:
             self.last_raise_size = actual_raise
+
+        if self.street == Street.PREFLOP and amount > 0:
+            p.vpip = True
 
         self.action_history.append({
             "type": "action", "player_id": user_id,
@@ -696,6 +705,7 @@ class PokerGame:
         )
 
         self._hand_result.folded_ids = {p.user_id for p in self.players if p.folded}
+        self._hand_result.vpip_ids = {p.user_id for p in self.players if p.vpip}  # 🛠️ Exported
         self._end_hand()
         return "🃏 **Showdown!**"
 
@@ -747,7 +757,7 @@ class PokerGame:
                           action_history=list(self.action_history))
 
         res.folded_ids = {p.user_id for p in self.players if p.folded}
-
+        res.vpip_ids = {p.user_id for p in self.players if getattr(p, 'vpip', False)}  # 🛠️ Exported
         return res
 
     def _refund_uncalled_bet(self):

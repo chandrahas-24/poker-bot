@@ -1103,6 +1103,8 @@ async def _process_result(guild, channel, t: TableState):
             if won:
                 quads_win, sf_win, rf_win = jackpot.evaluate_jackpot_tiers(p, result.community)
 
+            did_vpip = bool(hasattr(result, "vpip_ids") and p.user_id in result.vpip_ids)
+
             # ────────────────────────────────────────────────────────────────
 
             await db.record_hand_full(
@@ -1112,6 +1114,7 @@ async def _process_result(guild, channel, t: TableState):
                 quads_win=quads_win,
                 straight_flush_win=sf_win,
                 royal_flush_win=rf_win,
+                vpip=did_vpip,
             )
 
             if net != 0:
@@ -4500,10 +4503,15 @@ class StatsView(discord.ui.View):
     def build_highlights_embed(self) -> discord.Embed:
         embed = discord.Embed(title=f"Career Highlights — {self.row['username']}", color=0x2b2d31)
 
+        vpip_c = self.row.get('vpip_count', 0)
+        vpip_h = self.row.get('vpip_hands', 0)
+        vpip_str = f"{vpip_c / vpip_h * 100:.1f}%" if vpip_h > 0 else "—"
+
         # 🚨 Clean text formatting with zero emoji spam
         highlights = (
             f"**Current Win Streak:** `{self.row['win_streak']}`\n"
             f"**Best Win Streak:** `{self.row['max_win_streak']}`\n"
+            f"**VPIP:** `{vpip_str}`\n"
             f"**Pocket Aces Wins:** `{self.row['pocket_aces_wins']}`\n"
             f"**All-In Wins:** `{self.row['all_in_wins']}`\n"
             f"**Four of a Kind:** `{self.row['quads_wins']}`\n"

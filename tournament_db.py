@@ -85,6 +85,12 @@ async def init_db():
         except Exception:
             pass
 
+        # 🛠️ VPIP Tracking Columns
+        try:
+            await db.execute("ALTER TABLE players ADD COLUMN vpip_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         await db.commit()
 
 async def checkpoint():
@@ -235,10 +241,17 @@ async def process_hand_result(result, table_name: str):
         # Update stats
         for user_id in (result.chip_deltas or {}):
             won = any(w.user_id == user_id for w in result.winners)
+
+            # Catch the VPIP flag from the engine (default to 0 if not present)
+            vpip_inc = 1 if (hasattr(result, 'vpip_ids') and user_id in result.vpip_ids) else 0
+
             await db.execute("""
-                UPDATE players SET hands_played = hands_played + 1,
-                hands_won = hands_won + ? WHERE user_id = ?
-            """, (1 if won else 0, user_id))
+                        UPDATE players SET 
+                        hands_played = hands_played + 1,
+                        hands_won = hands_won + ?,
+                        vpip_count = COALESCE(vpip_count, 0) + ?
+                        WHERE user_id = ?
+                    """, (1 if won else 0, vpip_inc, user_id))
         await db.commit()
 
 async def log_hand(table_name: str, winner_id: int, winner_name: str, pot: int, summary: str):
@@ -364,6 +377,11 @@ async def get_player_stats(user_id: int) -> dict | None:
         hands_played = stats['hands_played']
         hands_won = stats['hands_won']
         stats['win_rate'] = (hands_won / hands_played * 100) if hands_played > 0 else 0
+
+        # Calculate VPIP% using the dedicated denominator
+        vpip_count = stats.get('vpip_count', 0)
+        vpip_hands = stats.get('hands_played', 0)
+        stats['vpip_rate'] = (vpip_count / vpip_hands * 100) if vpip_hands > 0 else 0
         
         # Get rank
         stats['rank'] = await get_player_rank(user_id)

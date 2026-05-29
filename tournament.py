@@ -331,6 +331,7 @@ class TournamentStatsView(discord.ui.View):
 
         rank_str = f"#{self.stats['rank']}" if self.stats['rank'] else "Unranked"
         wp = f"{self.stats['win_rate']:.1f}%" if self.stats['hands_played'] > 0 else "—"
+        vpip_str = f"{self.stats['vpip_rate']:.1f}%" if self.stats.get('hands_played', 0) > 0 else "—"
 
         embed.add_field(name="Rank", value=rank_str, inline=True)
         embed.add_field(name="Hands Played", value=f"{self.stats['hands_played']:,}", inline=True)
@@ -339,7 +340,7 @@ class TournamentStatsView(discord.ui.View):
         # Career Net, Wallet Balance, and Chips in Play
         embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
         embed.add_field(name="Wallet Balance", value=f"{self.stats['balance']:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
-        embed.add_field(name="Chips in Play", value=f"{self.stats['chips_in_play']:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="VPIP %", value=vpip_str, inline=True)
 
         team_val = self.stats['team_name'] or "None"
         embed.add_field(name="Team", value=team_val, inline=False)
@@ -983,7 +984,7 @@ class TournamentCog(commands.Cog):
         is_pre_tourney = now < datetime.datetime(2026, 6, 7)
 
         if is_pre_tourney:
-            embed.add_field(name="Deadline", value="⏳ Starts June 7th", inline=False)
+            embed.add_field(name="Deadline", value="⏳ Starts June 6th", inline=False)
         else:
             wipe_timestamp = int(next_wipe.replace(tzinfo=datetime.timezone.utc).timestamp())
             embed.add_field(name="Deadline", value=f"<t:{wipe_timestamp}:R>", inline=False)
@@ -992,7 +993,7 @@ class TournamentCog(commands.Cog):
         bar = ("🟩" * filled) + ("⬛" * (10 - filled))
 
         if is_pre_tourney:
-            embed.description = "⏳ **The tournament officially begins on June 7th!**\nTeam registration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
+            embed.description = "⏳ **The tournament officially begins on June 6th!**\nTeam registration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
         else:
             embed.description = f"{status_msg}{warning}\n\n**Progress:** {percent_complete:.1f}%\n{bar}"
 
@@ -1018,7 +1019,7 @@ class TournamentCog(commands.Cog):
         await interaction.followup.send(
             f"✅ Forced the daily check. (Cycle Day {cycle_day} processed). Check the tournament channel for output.")
 
-        # We manually call the logic here so we don't trip the June 7th block in the main task
+        # We manually call the logic here so we don't trip the June 6th block in the main task
         if cycle_day == 1:
             dm_warned = 0
             if warnings:

@@ -4442,7 +4442,14 @@ class PokerCog(commands.Cog):
             elif chosen_action == "check" or chosen_action == "call":
                 success, msg = t.game.check_or_call(p.user_id)
             elif chosen_action == "allin":
-                success, msg = t.game.raise_bet(p.user_id, p.chips)
+                call_needed = t.game.call_amount(p)
+                raise_on_top = p.chips - call_needed
+
+                # If they only have enough to call (or less), process as a normal call
+                if raise_on_top <= 0:
+                    success, msg = t.game.check_or_call(p.user_id)
+                else:
+                    success, msg = t.game.raise_bet(p.user_id, raise_on_top)
 
             # 🛠️ FIX 3: Decorate the engine log with a dice emoji for the table embed
             if success and msg:

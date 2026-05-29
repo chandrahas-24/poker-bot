@@ -1066,7 +1066,7 @@ class TournamentCog(commands.Cog):
     @app_commands.describe(query="The SELECT query to run")
     async def run_sql(self, interaction: discord.Interaction, query: str):
         # 1. Ironclad Security Check
-        if interaction.user.id not in self.DEV_USER_IDS:
+        if interaction.user.id not in config.DEV_USER_IDS:
             await interaction.response.send_message("❌ This command is restricted to bot developers.", ephemeral=True)
             return
 

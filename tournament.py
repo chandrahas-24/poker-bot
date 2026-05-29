@@ -1062,5 +1062,54 @@ class TournamentCog(commands.Cog):
 
         await interaction.followup.send(embed=embed, view=view)
 
+    @tourneymgr.command(name="sql", description="[Dev] Run a read-only tournament database query")
+    @app_commands.describe(query="The SELECT query to run")
+    async def run_sql(self, interaction: discord.Interaction, query: str):
+        # 1. Ironclad Security Check
+        if interaction.user.id not in self.DEV_USER_IDS:
+            await interaction.response.send_message("❌ This command is restricted to bot developers.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=False)
+
+        try:
+            import aiosqlite
+            # 2. Force SQLite into strict Read-Only mode using URI parameters
+            # db.DB_PATH points to "poker.db" from your database.py file
+            db_uri = f"file:{config.TOURNAMENT_DB_PATH}?mode=ro"
+
+            async with aiosqlite.connect(db_uri, uri=True) as conn:
+                conn.row_factory = aiosqlite.Row
+                async with conn.execute(query) as cursor:
+                    rows = await cursor.fetchall()
+
+                    if not rows:
+                        await interaction.followup.send("✅ Query executed successfully. No rows returned.",
+                                                        ephemeral=False)
+                        return
+
+                    # 3. Auto-format the columns and rows for Discord
+                    columns = list(rows[0].keys())
+                    lines = [f"**`{' | '.join(columns)}`**"]  # Header row
+
+                    # Limit to 15 rows to prevent massive Discord spam
+                    for row in rows[:15]:
+                        lines.append(" | ".join(str(row[col]) for col in columns))
+
+                    result_str = "\n".join(lines)
+
+                    if len(rows) > 15:
+                        result_str += f"\n\n*...and {len(rows) - 15} more rows.*"
+
+                    # 4. Final safety clamp for Discord's 2000 character limit
+                    if len(result_str) > 1900:
+                        result_str = result_str[:1900] + "\n... [Output Truncated]"
+
+                    await interaction.followup.send(f"**Query Results:**\n{result_str}", ephemeral=False)
+
+        except Exception as e:
+            # If they try to run an UPDATE or INSERT, this will catch the SQLite Read-Only error
+            await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
+
 async def setup(bot):
     await bot.add_cog(TournamentCog(bot))

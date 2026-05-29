@@ -784,12 +784,12 @@ class TournamentCog(commands.Cog):
         now = datetime.datetime.now(datetime.timezone.utc)
         deadline = reg_dt + datetime.timedelta(days=1)
 
-        if now > deadline:
-            await interaction.response.send_message(
-                f"❌ **{user.display_name}** registered more than 24 hours ago. Players can only be added to a team within 24 hours of registering!",
-                ephemeral=True
-            )
-            return
+        #if now > deadline:
+        #    await interaction.response.send_message(
+        #        f"❌ **{user.display_name}** registered more than 24 hours ago. Players can only be added to a team within 24 hours of registering!",
+        #        ephemeral=True
+        #    )
+        #    return
         # --------------------------------------------
 
         # 🛠️ FIXED: Rely on the DB's atomic lock to prevent TOCTOU overflow

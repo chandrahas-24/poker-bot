@@ -255,6 +255,12 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
 
+        try:
+            await db.execute("ALTER TABLE stats ADD COLUMN vpip_count INTEGER DEFAULT 0")
+            await db.execute("ALTER TABLE stats ADD COLUMN vpip_hands INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
@@ -431,6 +437,7 @@ async def record_hand_full(
         straight_flush_win: bool = False,
         royal_flush_win: bool = False,
         chips_wagered: int = 0,
+        vpip:   bool = False
 ):
     """
     Single-commit replacement for the record_hand + update_win_streak +
@@ -465,7 +472,9 @@ async def record_hand_full(
                 all_in_wins         = all_in_wins         + ?,
                 quads_wins          = quads_wins          + ?,
                 straight_flush_wins = straight_flush_wins + ?,
-                royal_flush_wins    = royal_flush_wins    + ?
+                royal_flush_wins    = royal_flush_wins    + ?,
+                vpip_count = vpip_count + ?,
+                vpip_hands = vpip_hands + 1
         """, (
             # INSERT values
             user_id, username,
@@ -485,6 +494,7 @@ async def record_hand_full(
             1 if quads_win else 0,
             1 if straight_flush_win else 0,
             1 if royal_flush_win else 0,
+            1 if vpip else 0,
         ))
         await db.commit()
 
@@ -534,7 +544,9 @@ async def get_player_stats(user_id: int) -> dict | None:
                COALESCE(s.quads_wins, 0) AS quads_wins,
                COALESCE(s.straight_flush_wins, 0) AS straight_flush_wins,
                COALESCE(s.royal_flush_wins, 0) AS royal_flush_wins,
-               COALESCE(s.times_wiped, 0) AS times_wiped
+               COALESCE(s.times_wiped, 0) AS times_wiped,
+               COALESCE(s.vpip_count, 0) AS vpip_count,
+               COALESCE(s.vpip_hands, 0) AS vpip_hands
         FROM stats s LEFT JOIN wallets w ON s.user_id = w.user_id
         WHERE s.user_id = ?
     """, (user_id,)) as c:

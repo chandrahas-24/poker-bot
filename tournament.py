@@ -331,6 +331,7 @@ class TournamentStatsView(discord.ui.View):
 
         rank_str = f"#{self.stats['rank']}" if self.stats['rank'] else "Unranked"
         wp = f"{self.stats['win_rate']:.1f}%" if self.stats['hands_played'] > 0 else "—"
+        vpip_str = f"{self.stats['vpip_rate']:.1f}%" if self.stats.get('hands_played', 0) > 0 else "—"
 
         embed.add_field(name="Rank", value=rank_str, inline=True)
         embed.add_field(name="Hands Played", value=f"{self.stats['hands_played']:,}", inline=True)
@@ -339,7 +340,7 @@ class TournamentStatsView(discord.ui.View):
         # Career Net, Wallet Balance, and Chips in Play
         embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
         embed.add_field(name="Wallet Balance", value=f"{self.stats['balance']:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
-        embed.add_field(name="Chips in Play", value=f"{self.stats['chips_in_play']:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="VPIP %", value=vpip_str, inline=True)
 
         team_val = self.stats['team_name'] or "None"
         embed.add_field(name="Team", value=team_val, inline=False)

@@ -1120,7 +1120,7 @@ class TournamentCog(commands.Cog):
             await interaction.response.send_message("Managers only.", ephemeral=True)
             return
 
-        success = await db.delete_team(team_name)
+        success = await tdb.delete_team(team_name)
 
         if success:
             await interaction.followup.send(

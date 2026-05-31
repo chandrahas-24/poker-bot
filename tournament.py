@@ -1111,5 +1111,23 @@ class TournamentCog(commands.Cog):
             # If they try to run an UPDATE or INSERT, this will catch the SQLite Read-Only error
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
+    @tourneymgr.command(name="deleteteam", description="[Manager] Delete a team and unassign its players")
+    @app_commands.describe(team_name="The exact name of the team to delete")
+    async def delete_team_cmd(self, interaction: discord.Interaction, team_name: str):
+        await interaction.response.defer(ephemeral=False)
+
+        if not await self.is_manager(interaction):
+            await interaction.response.send_message("Managers only.", ephemeral=True)
+            return
+
+        success = await db.delete_team(team_name)
+
+        if success:
+            await interaction.followup.send(
+                f"✅ The team **{team_name}** has been deleted. Its players are still registered but are now unassigned.")
+        else:
+            await interaction.followup.send(
+                f"❌ Could not find a team named **{team_name}**. Please check the spelling.", ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(TournamentCog(bot))

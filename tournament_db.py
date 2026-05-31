@@ -571,16 +571,21 @@ async def get_team_dominance_warning(active_user_ids: list[int]) -> str | None:
 async def delete_team(team_name: str) -> bool:
     """Deletes a team and unassigns its players. Returns True if successful."""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Check if the team actually exists
-        cursor = await db.execute("SELECT 1 FROM teams WHERE name = ? COLLATE NOCASE", (team_name,))
-        if not await cursor.fetchone():
+        # 1. Look up the team's integer ID using the provided name
+        cursor = await db.execute("SELECT id FROM teams WHERE name = ? COLLATE NOCASE", (team_name,))
+        row = await cursor.fetchone()
+
+        # If the team doesn't exist, stop here
+        if not row:
             return False
 
-        # 1. Delete the team
-        await db.execute("DELETE FROM teams WHERE name = ? COLLATE NOCASE", (team_name,))
+        team_id = row[0]
 
-        # 2. Unassign the players (keep their stats, just remove the team tag)
-        await db.execute("UPDATE players SET team = NULL WHERE team = ? COLLATE NOCASE", (team_name,))
+        # 2. Unassign the players (Set their team_id to NULL)
+        await db.execute("UPDATE players SET team_id = NULL WHERE team_id = ?", (team_id,))
+
+        # 3. Delete the team itself
+        await db.execute("DELETE FROM teams WHERE id = ?", (team_id,))
 
         await db.commit()
         return True

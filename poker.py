@@ -1458,6 +1458,8 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
                 member = interaction.guild.get_member(manager_id)
                 if member:
                     manager_name = member.display_name
+            if manager_id == 851672284510158888:
+                manager_name = "not_baymax"
         except Exception as e:
             print(f"🚨 [ERROR] {e}")
             import traceback

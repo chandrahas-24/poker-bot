@@ -1425,14 +1425,14 @@ class TipModal(discord.ui.Modal, title="Tip Dealer"):
         table_chips = p.chips if p else 0
         wallet_bal  = await db.get_balance(interaction.user.id)
 
-        from_table  = min(tip, table_chips)
-        from_wallet = tip - from_table
+        from_wallet = min(tip, wallet_bal)
+        from_table = tip - from_wallet
 
         if from_table > 0 and self.t.game.street != Street.WAITING:
             await interaction.followup.send("❌ You cannot tip chips from the table while a hand is in progress. Wait for the hand to finish.", ephemeral=True)
             return
 
-        if from_wallet > wallet_bal:
+        if from_table > table_chips:
             await interaction.followup.send(
                 f"❌ Not enough chips. Table: **{table_chips}**, Wallet: **{wallet_bal}**.", ephemeral=True); return
 
@@ -3010,15 +3010,15 @@ class PokerCog(commands.Cog):
         table_chips = p.chips if p else 0
         wallet_bal = await db.get_balance(interaction.user.id)
 
-        # Pull from table first, then wallet
-        from_table = min(tip, table_chips)
-        from_wallet = tip - from_table
+        # Pull from wallet first then table
+        from_wallet = min(tip, wallet_bal)
+        from_table = tip - from_wallet
 
         if from_table > 0 and t.game.street != Street.WAITING:
             await interaction.followup.send("❌ You cannot tip chips from the table while a hand is in progress. Wait for the hand to finish.", ephemeral=True)
             return
 
-        if from_wallet > wallet_bal:
+        if from_table > table_chips:
             await interaction.followup.send(
                 f"❌ Not enough chips. Table: **{table_chips}**, Wallet: **{wallet_bal}**.", ephemeral=True)
             return

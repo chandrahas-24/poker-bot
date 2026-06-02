@@ -1513,6 +1513,11 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
             new_titles.append(tid)
             owned_titles.add(tid)  # prevent duplicates within this run
 
+    if "blown_away" in owned_msgs and net >= 0 and "wind_walker" not in owned_titles:
+        newly.append(("title", "wind_walker"))
+        new_titles.append("wind_walker")
+        owned_titles.add("wind_walker")
+
     if won:
         if "blessed" not in owned_titles and random.random() < 0.001:
             newly.append(("title", "blessed"))
@@ -1522,10 +1527,6 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
             newly.append(("title", "chosen_one"))
             new_titles.append("chosen_one")
             owned_titles.add("chosen_one")
-        if "blown_away" in owned_msgs and net >= 0 and "wind_walker" not in owned_titles:
-            newly.append(("title", "wind_walker"))
-            new_titles.append("wind_walker")
-            owned_titles.add("wind_walker")
 
     msg_checks = {
         "gg": True,

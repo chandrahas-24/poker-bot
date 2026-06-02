@@ -1045,6 +1045,13 @@ TITLES: dict[str, dict] = {
     },
 
     # ── Legendary rare drops ────────────────────────────────────────────────
+    "wind_walker": {
+        "display": "Wind Walker 🍃",
+        "description": "Recover from a net loss of 10,000 chips",
+        "rarity": "legendary",
+        "hidden": False,
+    },
+
     "sarosmommy": {
         "display": "👶 Saroshi's Mommy",
         "description": "super secret formula sauce, congrats pro user",
@@ -1515,6 +1522,9 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
             newly.append(("title", "chosen_one"))
             new_titles.append("chosen_one")
             owned_titles.add("chosen_one")
+        if "blown_away" in owned_titles and net >= 0:
+            newly.append(("title", "wind_walker"))
+            owned_titles.add("wind_walker")
 
     msg_checks = {
         "gg": True,

@@ -855,8 +855,10 @@ class TournamentCog(commands.Cog):
     async def stats(self, interaction: discord.Interaction, user: discord.Member = None, hidden: bool = False):
         await interaction.response.defer(ephemeral=hidden)
         target = user or interaction.user
+        await tdb.refresh_player_name(interaction.user.id, interaction.user.name)
+        if user:
+            await tdb.refresh_player_name(user.id, user.name)
         stats = await tdb.get_player_stats(target.id)
-
         if not stats:
             await interaction.followup.send("❌ Player not registered. Use `/tourney register` first.", ephemeral=True)
             return

@@ -589,3 +589,12 @@ async def delete_team(team_name: str) -> bool:
 
         await db.commit()
         return True
+
+async def refresh_player_name(user_id: int, username: str):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute(
+            "UPDATE players SET username = ? WHERE user_id = ?",
+            (username, user_id)
+        )
+        await db.commit()

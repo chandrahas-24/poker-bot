@@ -64,7 +64,9 @@ class TournamentJoinModal(discord.ui.Modal, title="Tournament Buy In"):
             await interaction.followup.send(f"Failed to deduct {config.TOURNAMENT_CHIP_EMOJI}. Try again.", ephemeral=True)
             return
 
-        name = interaction.user.display_name
+        await tdb.refresh_player_name(interaction.user.id, interaction.user.name)
+
+        name = interaction.user.name
         msg = self.t.game.add_player(uid, name, amt)
         if not msg.startswith("✅"):
             await tdb.return_chips(uid, amt)
@@ -135,7 +137,7 @@ class TournamentRebuyModal(discord.ui.Modal, title="Add Tournament Chips"):
             await interaction.followup.send(msg, ephemeral=True)
             return
 
-        await tdb.mark_chips_in_play(uid, interaction.user.display_name, amt)
+        await tdb.mark_chips_in_play(uid, interaction.user.name, amt)
 
         await interaction.channel.send(
             f"**{interaction.user.display_name}** added **{amt}** {config.TOURNAMENT_CHIP_EMOJI} to their tournament stack for the next hand!")
@@ -593,7 +595,7 @@ class TournamentCog(commands.Cog):
             await interaction.followup.send("A table is already open in this channel.", ephemeral=True);
             return
 
-        t = TableState(name, interaction.user.id, interaction.user.display_name)
+        t = TableState(name, interaction.user.id, interaction.user.name)
         t.is_tournament = True
 
         # 3. Deep-Stack Tournament Limits
@@ -718,7 +720,7 @@ class TournamentCog(commands.Cog):
         if not await tdb.is_registered(user.id):
             await interaction.response.send_message("Player not registered.", ephemeral=True); return
 
-        new_bal = await tdb.add_chips(user.id, user.display_name, amount)
+        new_bal = await tdb.add_chips(user.id, user.name, amount)
         await interaction.response.send_message(
             f"Added {amount} {config.TOURNAMENT_CHIP_EMOJI} to {user.display_name}. New balance: {new_bal} {config.TOURNAMENT_CHIP_EMOJI}")
 
@@ -821,7 +823,7 @@ class TournamentCog(commands.Cog):
             )
             return
 
-        success = await tdb.register_player(interaction.user.id, interaction.user.display_name)
+        success = await tdb.register_player(interaction.user.id, interaction.user.name)
         if success:
             await interaction.response.send_message(
                 f"You are registered! Starting balance: {config.TOURNAMENT_STARTING_CHIPS} {config.TOURNAMENT_CHIP_EMOJI}.")

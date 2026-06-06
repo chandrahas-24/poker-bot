@@ -340,10 +340,11 @@ async def remove_player_from_team(user_id: int) -> bool:
     db = await _get_db()
     async with _write_lock:
         await db.execute("UPDATE players SET team_id = NULL WHERE user_id = ?", (user_id,))
-        await db.commit()
         async with db.execute("SELECT changes()") as c:
             row = await c.fetchone()
-            return bool(row and row[0] > 0)
+            success = bool(row and row[0] > 0)
+        await db.commit()
+        return success
 
 async def get_team_roster(team_id: int) -> list[dict]:
     db = await _get_db()
@@ -570,23 +571,18 @@ async def get_team_dominance_warning(active_user_ids: list[int]) -> str | None:
 
 async def delete_team(team_name: str) -> bool:
     """Deletes a team and unassigns its players. Returns True if successful."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        # 1. Look up the team's integer ID using the provided name
-        cursor = await db.execute("SELECT id FROM teams WHERE name = ? COLLATE NOCASE", (team_name,))
-        row = await cursor.fetchone()
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT id FROM teams WHERE name = ? COLLATE NOCASE", (team_name,)) as c:
+            row = await c.fetchone()
 
-        # If the team doesn't exist, stop here
         if not row:
             return False
 
         team_id = row[0]
 
-        # 2. Unassign the players (Set their team_id to NULL)
         await db.execute("UPDATE players SET team_id = NULL WHERE team_id = ?", (team_id,))
-
-        # 3. Delete the team itself
         await db.execute("DELETE FROM teams WHERE id = ?", (team_id,))
-
         await db.commit()
         return True
 

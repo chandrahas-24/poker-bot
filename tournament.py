@@ -510,7 +510,7 @@ class TournamentCog(commands.Cog):
                         f"**Wager {w['shortfall']:,} more chip(s) in the next 24 hours to avoid a deduction penalty!**"
                     )
                     embed.set_footer(
-                        text="Penalty runs daily at 03:30 UTC • Use /tourney myactivity to check your status")
+                        text="Penalty runs daily at 02:00 UTC • Use /tourney myactivity to check your status")
 
                     # 🛠️ Uses safe DM helper and accurately tracks success
                     if await self._try_dm(w['user_id'], embed):
@@ -701,7 +701,24 @@ class TournamentCog(commands.Cog):
         if user.id not in t.game.pending_leaves:
             t.game.pending_leaves.append(user.id)
 
-        await interaction.response.send_message(f"🦵 **{user.display_name}** will be kicked after this hand.")
+        if not p.folded:
+            ok, fold_msg = t.game.force_fold(user.id)
+            if ok:
+                parts = fold_msg.split("\n")
+                if any(m in fold_msg for m in ["Showdown", "wins", "folded"]):
+                    slog_clear(t)
+                for part in parts:
+                    if part.strip():
+                        slog(t, part)
+
+        await interaction.response.send_message(
+            f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
+
+        from poker import _process_result
+        if t.game._hand_result:
+            await _process_result(interaction.guild, interaction.channel, t)
+        else:
+            await refresh(interaction.channel, t, cosmetics_cache=t.cosmetics_cache)
 
     @tourneymgr.command(name="addchips", description="Give tournament chips to a player")
     async def addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -710,7 +727,7 @@ class TournamentCog(commands.Cog):
 
         if config.ADD_CHIPS_CHANNELS and interaction.channel_id not in config.ADD_CHIPS_CHANNELS:
             mentions = ", ".join(f"<#{cid}>" for cid in config.ADD_CHIPS_CHANNELS)
-            await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+            await interaction.response.send_message(f"❌ This command is restricted to: {mentions}", ephemeral=True)
             return
 
         if amount <= 0:
@@ -731,7 +748,7 @@ class TournamentCog(commands.Cog):
 
         if config.REMOVE_CHIPS_CHANNELS and interaction.channel_id not in config.REMOVE_CHIPS_CHANNELS:
             mentions = ", ".join(f"<#{cid}>" for cid in config.REMOVE_CHIPS_CHANNELS)
-            await interaction.followup.send(f"❌ This command is restricted to: {mentions}", ephemeral=True)
+            await interaction.response.send_message(f"❌ This command is restricted to: {mentions}", ephemeral=True)
             return
 
         if amount <= 0:
@@ -977,8 +994,8 @@ class TournamentCog(commands.Cog):
             state_row = await c.fetchone()
             cycle_day = state_row[0] if state_row else 1
 
-        # 🛠️ FIXED: Wipe time math now correctly snaps to exactly 02:30 UTC
-        next_wipe = now.replace(hour=2, minute=30, second=0, microsecond=0)
+        # 🛠️ FIXED: Wipe time math now correctly snaps to exactly 02:00 UTC
+        next_wipe = now.replace(hour=2, minute=00, second=0, microsecond=0)
         if now > next_wipe:
             next_wipe += datetime.timedelta(days=1)
         if cycle_day == 1:
@@ -1121,7 +1138,7 @@ class TournamentCog(commands.Cog):
         await interaction.response.defer(ephemeral=False)
 
         if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True)
+            await interaction.followup.send("Managers only.", ephemeral=True)
             return
 
         success = await tdb.delete_team(team_name)

@@ -381,7 +381,8 @@ async def _auto_next_hand(t: TableState, channel):
 
     if getattr(t, 'is_tournament', False):
         import tournament_db as tdb
-        active_uids = [p.user_id for p in active]
+        # Include pending_with_chips in the UID list
+        active_uids = [p.user_id for p in active] + [p.user_id for p in pending_with_chips]
         dominance_warning = await tdb.get_team_dominance_warning(active_uids)
         if dominance_warning:
             await channel.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}")
@@ -2551,7 +2552,7 @@ class PokerCog(commands.Cog):
     # ── THE AUTO TIMER (Every Hour) ────────────────────────────────────
     backup_times = [
         dt_time(hour=h, minute=30, tzinfo=_tz.utc)
-        for h in range(0, 23)
+        for h in range(0, 24)
     ]
     @tasks.loop(time=backup_times)
     async def daily_backup(self):
@@ -2700,9 +2701,18 @@ class PokerCog(commands.Cog):
         if getattr(t, 'is_tournament', False):
             import tournament_db as tdb
             bb = t.game.BIG_BLIND
+
+            # 1. Grab seated players who can play
             active = [p for p in t.game.players if
                       (p.chips + p.pending_rebuy) >= bb and p.user_id not in t.game.pending_leaves]
-            active_uids = [p.user_id for p in active]
+
+            # 2. Grab joining players who can play
+            pending_with_chips = [p for p in t.game.pending_joins if
+                                  (p.chips + p.pending_rebuy) >= bb]
+
+            # 3. Combine their IDs for the strict dominance check
+            active_uids = [p.user_id for p in active] + [p.user_id for p in pending_with_chips]
+
             dominance_warning = await tdb.get_team_dominance_warning(active_uids)
             if dominance_warning:
                 await interaction.followup.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}",

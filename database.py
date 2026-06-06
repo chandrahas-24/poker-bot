@@ -398,21 +398,23 @@ async def deduct_chips(user_id: int, amount: int) -> bool:
             "UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
             (amount, user_id, amount)
         )
-        await db.commit()
+        # 🛠️ FIXED: Read changes before commit
         async with db.execute("SELECT changes()") as c:
             row = await c.fetchone()
-            return bool(row and row[0] > 0)
-
+            success = bool(row and row[0] > 0)
+        await db.commit()
+        return success
 
 async def return_chips(user_id: int, amount: int):
     db = await _get_db()
+    now = datetime.utcnow().isoformat()
     async with _write_lock:
         await db.execute("""
-                    INSERT INTO wallets (user_id, username, balance) VALUES (?, 'Unknown Player', ?)
+                    INSERT INTO wallets (user_id, username, balance, last_activity) 
+                    VALUES (?, 'Unknown Player', ?, ?)
                     ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
-                """, (user_id, amount, amount))
+                """, (user_id, amount, now, amount))
         await db.commit()
-
 
 async def upsert_wallet_name(user_id: int, username: str):
     db = await _get_db()
@@ -757,10 +759,12 @@ async def request_cashout(user_id: int, amount: int) -> bool:
             "UPDATE wallets SET balance = balance - ?, pending_cashout = pending_cashout + ? WHERE user_id = ? AND balance >= ?",
             (amount, amount, user_id, amount)
         )
-        await db.commit()
+        # 🛠️ FIXED: Read changes before commit
         async with db.execute("SELECT changes()") as c:
             row = await c.fetchone()
-            return bool(row and row[0] > 0)
+            success = bool(row and row[0] > 0)
+        await db.commit()
+        return success
 
 
 async def pay_cashout(user_id: int, amount: int) -> bool:
@@ -1658,18 +1662,23 @@ async def mark_player_active(user_id: int, chips_amount: int = 0):
                     THEN 0
                     ELSE recent_chips_wagered + ?
                 END,
-                last_activity        = CASE
+                last_activity = CASE
                     WHEN (recent_hands + 1) >= ? AND (recent_chips_wagered + ?) >= ?
-                    THEN MAX(last_activity, ?)
-                    ELSE last_activity
+                    THEN MAX(COALESCE(last_activity, ?), ?)
+                    ELSE COALESCE(last_activity, ?)
                 END
             WHERE user_id = ?
         """, (
+            # 1. recent_hands (3 placeholders)
             MIN_HANDS_PER_PERIOD, chips_amount, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0,
-            MIN_HANDS_PER_PERIOD, chips_amount, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0,
-            chips_amount,
-            MIN_HANDS_PER_PERIOD, chips_amount, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0,
-            now,
+
+            # 2. recent_chips_wagered (4 placeholders)
+            MIN_HANDS_PER_PERIOD, chips_amount, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0, chips_amount,
+
+            # 3. last_activity (6 placeholders)
+            MIN_HANDS_PER_PERIOD, chips_amount, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0, now, now, now,
+
+            # 4. WHERE clause (1 placeholder)
             user_id,
         ))
         await db.commit()

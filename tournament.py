@@ -599,8 +599,8 @@ class TournamentCog(commands.Cog):
         t.is_tournament = True
 
         # 3. Deep-Stack Tournament Limits
-        t.game.SMALL_BLIND = 50
-        t.game.BIG_BLIND = 100
+        t.game.SMALL_BLIND = 25
+        t.game.BIG_BLIND = 50
         t.game.MIN_BUYIN = 250
         t.game.MAX_BUYIN = 5000
         t.game.tax_rate = 0

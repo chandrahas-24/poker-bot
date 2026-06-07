@@ -806,7 +806,7 @@ class TournamentCog(commands.Cog):
         if now > deadline:
             await interaction.response.send_message(
                 f"❌ **{user.display_name}** registered more than 24 hours ago. Players can only be added to a team within 24 hours of registering!",
-                ephemeral=True
+                ephemeral=False
             )
             return
         # --------------------------------------------

@@ -1184,5 +1184,58 @@ class TournamentCog(commands.Cog):
 
         await interaction.followup.send(msg)
 
+    @tourneymgr.command(name="set_activity",
+                        description="[Manager] Change a tournament player's last_activity timestamp")
+    @app_commands.describe(
+        user="The player to modify",
+        timestamp="Discord timestamp (e.g. <t:1716388800:R>) or raw Unix epoch"
+    )
+    async def set_activity(self, interaction: discord.Interaction, user: discord.Member, timestamp: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if not await self.is_manager(interaction):
+            await interaction.followup.send("Managers only.", ephemeral=True)
+            return
+
+        import re
+        from datetime import datetime
+
+        # 1. Parse the Discord timestamp format (<t:1234567890> or <t:1234567890:R>)
+        # Or accept a raw unix integer if you just type the numbers manually.
+        match = re.search(r"<t:(\d+)", timestamp)
+        if match:
+            unix_ts = int(match.group(1))
+        elif timestamp.isdigit():
+            unix_ts = int(timestamp)
+        else:
+            await interaction.followup.send(
+                "❌ Invalid format. Please use a Discord timestamp like `<t:1716388800>` or `<t:1716388800:R>`.",
+                ephemeral=True
+            )
+            return
+
+        # 2. Convert Unix Epoch -> UTC Datetime -> ISO 8601 string
+        try:
+            new_iso = datetime.utcfromtimestamp(unix_ts).isoformat()
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to parse date: {e}", ephemeral=True)
+            return
+
+        # 3. Update the tournament database directly
+        import tournament_db as tdb
+        db_conn = await tdb._get_db()
+        try:
+            async with tdb._write_lock:
+                await db_conn.execute("UPDATE players SET last_activity = ? WHERE user_id = ?", (new_iso, user.id))
+                await db_conn.commit()
+
+            await interaction.followup.send(
+                f"✅ Successfully backdated **{user.display_name}**'s tournament last activity to <t:{unix_ts}:F>!\n"
+                f"*(Database saved exactly as:* `{new_iso}`*)*",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.followup.send(f"❌ Database error: {e}", ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(TournamentCog(bot))

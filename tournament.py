@@ -800,12 +800,13 @@ class TournamentCog(commands.Cog):
 
         # --- ⏳ 24-HOUR DEADLINE CHECK ---
         reg_dt = datetime.datetime.fromisoformat(stats['registered_at']).replace(tzinfo=datetime.timezone.utc)
+        reg_ts = int(reg_dt.timestamp())
         now = datetime.datetime.now(datetime.timezone.utc)
         deadline = reg_dt + datetime.timedelta(days=1)
 
         if now > deadline:
             await interaction.response.send_message(
-                f"❌ **{user.display_name}** registered more than 24 hours ago (f{reg_dt}). Players can only be added to a team within 24 hours of registering!",
+                f"❌ **{user.display_name}** registered more than 24 hours ago (<t:{reg_ts}:R>). Players can only be added to a team within 24 hours of registering!",
                 ephemeral=False
             )
             return

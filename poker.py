@@ -1028,7 +1028,7 @@ async def _process_result(guild, channel, t: TableState):
 
     if t.is_tournament:
         import tournament_db
-        wagers_this_hand = {p.user_id: p.total_bet for p in result.showdown_players if p.total_bet > 0}
+        wagers_this_hand = result.wagers or {}
         if wagers_this_hand:
             await tournament_db.log_period_wagers(wagers_this_hand)
         await tournament_db.process_hand_result(result, t.name)

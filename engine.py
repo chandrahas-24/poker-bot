@@ -82,6 +82,7 @@ class HandResult:
     allin_user_ids: set = None
     action_history: list = None
     vpip_ids: set = None
+    wagers: dict = None  # {user_id: total_bet} snapshot before _end_hand zeroes it
 
 class PokerGame:
     SMALL_BLIND = config.DEFAULT_SMALL_BLIND
@@ -701,7 +702,8 @@ class PokerGame:
             showdown_players=list(self.players),
             allin_user_ids={p.user_id for p in alive if p.all_in},
             tax=total_tax,# snapshot before _end_hand clears state
-            action_history = list(self.action_history)
+            action_history = list(self.action_history),
+            wagers = {p.user_id: p.total_bet for p in self.players if p.total_bet > 0},
         )
 
         self._hand_result.folded_ids = {p.user_id for p in self.players if p.folded}
@@ -754,7 +756,9 @@ class PokerGame:
                           community=list(self.community),
                           showdown_players=list(self.players), tax=tax,
                           allin_user_ids={winner.user_id} if winner.all_in else set(),
-                          action_history=list(self.action_history))
+                          action_history=list(self.action_history),
+                         wagers={p.user_id: p.total_bet for p in self.players if p.total_bet > 0})
+
 
         res.folded_ids = {p.user_id for p in self.players if p.folded}
         res.vpip_ids = {p.user_id for p in self.players if getattr(p, 'vpip', False)}  # 🛠️ Exported

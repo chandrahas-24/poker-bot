@@ -1150,5 +1150,39 @@ class TournamentCog(commands.Cog):
             await interaction.followup.send(
                 f"❌ Could not find a team named **{team_name}**. Please check the spelling.", ephemeral=True)
 
+    @tourneymgr.command(name="setcycle", description="[Manager] Force the tournament cycle to a specific day")
+    @app_commands.describe(day="1 = Start tracking (Warnings tmrw), 2 = Warnings active (Penalties tmrw)")
+    async def set_cycle_cmd(self, interaction: discord.Interaction, day: int):
+        await interaction.response.defer(ephemeral=True)
+
+        if not await self.is_manager(interaction):
+            await interaction.followup.send("Managers only.", ephemeral=True)
+            return
+
+        if day not in [1, 2]:
+            await interaction.followup.send("❌ Invalid day. Please choose 1 (Start) or 2 (Warnings).", ephemeral=True)
+            return
+
+        import tournament_db as tdb
+        db_conn = await tdb._get_db()
+        async with tdb._write_lock:
+            # 1. Update the cycle_day in tourney_state (always id=1)
+            await db_conn.execute("UPDATE tourney_state SET cycle_day = ? WHERE id = 1", (day,))
+
+            # 2. If setting to 1, clear the period_wagered so the 48-hour window is fresh
+            if day == 1:
+                await db_conn.execute("UPDATE players SET period_wagered = 0")
+
+            await db_conn.commit()
+
+        # Build a helpful confirmation message
+        msg = f"✅ **Tournament Cycle explicitly set to Day {day}.**\n"
+        if day == 1:
+            msg += "Wagers have been cleared. The bot will send **'At-Risk' warnings** tomorrow at 02:00 UTC."
+        elif day == 2:
+            msg += "The bot will apply **Coasting Penalties** tomorrow at 02:00 UTC."
+
+        await interaction.followup.send(msg)
+
 async def setup(bot):
     await bot.add_cog(TournamentCog(bot))

@@ -4193,9 +4193,8 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="testcards", description="[Dev] Generate a random 2-card hand to test image sizes")
     async def test_cards(self, interaction: discord.Interaction):
-        if interaction.user.id not in self.DEV_USER_IDS:
-            await interaction.response.send_message("❌ This command is restricted to the bot developers.",
-                                                    ephemeral=True)
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
 
         # 1. Defer so the bot has time to process the image

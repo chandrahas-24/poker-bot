@@ -582,6 +582,7 @@ async def post_hand_log(channel, t: TableState, result):
         await thread.send(f"```\n{body}\n```")
     except (discord.NotFound, discord.HTTPException):
         _log_threads.pop(channel.guild.id, None)
+    return body
 
 
 async def post_tip_log(channel, t: TableState, tipper_id: int, tipper_name: str, amount: int, recipient_id: int,
@@ -1161,11 +1162,10 @@ async def _process_result(guild, channel, t: TableState):
         traceback.print_exc()
 
     try:
-        log_task = asyncio.create_task(post_hand_log(channel, t, result))
-        log_task.add_done_callback(lambda task: print(f"[Log Error] {task.exception()}") if task.exception() else None)
+        log_body = await post_hand_log(channel, t, result)
 
         # Update the specific row we created when this hand started
-        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, result.summary, t.manager_id, t.manager_name, result.action_history)
+        await db.log_hand(guild.id, t.id, t.name, t.game.hand_num, log_body or result.summary, t.manager_id, t.manager_name, result.action_history)
     except Exception as e:
         print(f"[poker] complete_hand_log error: {e}")
         traceback.print_exc()

@@ -38,6 +38,14 @@ async def global_channel_restriction(interaction: discord.Interaction) -> bool:
     cmd_name = interaction.command.qualified_name
     channel_id = interaction.channel_id
 
+    allowed_guild = config.GUILD_ID
+    if allowed_guild and interaction.guild_id != allowed_guild:
+        await interaction.response.send_message(
+            "❌ This bot is exclusively configured for another server.",
+            ephemeral=True
+        )
+        return False
+
     # ─── ABSOLUTE LOCKDOWN CHANNEL ────────────────────────────────────
     if channel_id in LOCKDOWN_CHANNELS:
         await interaction.response.send_message(

@@ -2568,23 +2568,6 @@ class PokerCog(commands.Cog):
     async def before_daily_backup(self):
         await self.bot.wait_until_ready()
 
-    # ── THE BOUNCER ────────────────────────────────────────────────────────
-    # This automatically runs before EVERY slash command in this file.
-    # If it returns False, the command is instantly killed.
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        allowed_guild = int(os.getenv("GUILD_ID", "0"))
-
-        # If a GUILD_ID is set in .env, block DMs and other servers
-        if allowed_guild and interaction.guild_id != allowed_guild:
-            await interaction.response.send_message(
-                "❌ This bot is exclusively configured for another server.",
-                ephemeral=True
-            )
-            return False
-
-        return True
-
     poker = app_commands.Group(name="poker", description="Texas Hold'em poker")
     pokerset = app_commands.Group(name="pokerset", description="Configure poker settings")
     pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands")

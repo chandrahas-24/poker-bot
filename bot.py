@@ -26,6 +26,44 @@ DONATION_BOT_ID  = 270904126974590976
 CHIPS_PER_COIN   = 1_000_000  # 1 chip per 1,000,000 donated coins
 
 
+@bot.tree.interaction_check
+async def global_channel_restriction(interaction: discord.Interaction) -> bool:
+    if not interaction.command:
+        return True
+
+    LOCKDOWN_CHANNELS = config.LOCKDOWN_CHANNELS
+    RESTRICTED_CHANNELS = config.RESTRICTED_CHANNELS
+
+    # qualified_name captures the full path: e.g., "poker start" or "tourneymgr setcycle"
+    cmd_name = interaction.command.qualified_name
+    channel_id = interaction.channel_id
+
+    # ─── ABSOLUTE LOCKDOWN CHANNEL ────────────────────────────────────
+    if channel_id in LOCKDOWN_CHANNELS:
+        await interaction.response.send_message(
+            "❌ Nuh uh no commands here",
+            ephemeral=True
+        )
+        return False
+
+    # ─── WHITELIST CHANNELS (MGR + EXCEPTIONS ONLY) ───────────────────
+    if channel_id in RESTRICTED_CHANNELS:
+        # Automatically allow ANY command inside the tourneymgr slash group
+        is_manager_cmd = cmd_name.startswith("tourneymgr") or cmd_name.startswith("pokermgr")
+
+        # Check if the exact subcommand path is in your allowed exceptions
+        is_allowed_exception = cmd_name in RESTRICTED_CHANNELS[channel_id]
+
+        if not (is_manager_cmd or is_allowed_exception):
+            await interaction.response.send_message(
+                f"❌ The command `{cmd_name}` cannot be used in this channel.",
+                ephemeral=True
+            )
+            return False
+
+    return True
+
+
 # ── Helper: send a DM, silently ignore if the user has DMs closed ─────────────
 
 async def _try_dm(user_id: int, content: str = None, embed: discord.Embed = None) -> bool:

@@ -4255,9 +4255,8 @@ class PokerCog(commands.Cog):
     @app_commands.describe(query="The SELECT query to run")
     async def run_sql(self, interaction: discord.Interaction, query: str):
         # 1. Ironclad Security Check
-        if interaction.user.id not in self.DEV_USER_IDS:
-            await interaction.response.send_message("❌ This command is restricted to the bot developer.",
-                                                    ephemeral=True)
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=False)

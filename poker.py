@@ -4256,7 +4256,8 @@ class PokerCog(commands.Cog):
     async def run_sql(self, interaction: discord.Interaction, query: str):
         # 1. Ironclad Security Check
         if interaction.user.id not in self.DEV_USER_IDS:
-            await interaction.response.send_message("❌ This command is restricted to bot developers.", ephemeral=True)
+            await interaction.response.send_message("❌ This command is restricted to the bot developer.",
+                                                    ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=False)

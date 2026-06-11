@@ -4203,9 +4203,8 @@ class PokerCog(commands.Cog):
 
         # 🚨 Permission Check
         if target.id != interaction.user.id:
-            if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
-                await interaction.response.send_message("❌ Only Administrators or Devs can check other players' logs.",
-                                                        ephemeral=True)
+            if not await is_manager(interaction):
+                await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
                 return
 
         await interaction.response.defer(ephemeral=True)

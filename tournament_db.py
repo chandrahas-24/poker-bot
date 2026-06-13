@@ -77,19 +77,22 @@ async def init_db():
             await db.execute("ALTER TABLE players ADD COLUMN period_wagered INTEGER DEFAULT 0")
             await db.execute("ALTER TABLE players ADD COLUMN last_activity TEXT")
             await db.execute("ALTER TABLE players ADD COLUMN target_wager INTEGER DEFAULT 1250")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         try:
             await db.execute("ALTER TABLE teams ADD COLUMN leader_id INTEGER")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         # 🛠️ VPIP Tracking Columns
         try:
             await db.execute("ALTER TABLE players ADD COLUMN vpip_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.commit()
 

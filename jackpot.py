@@ -106,8 +106,9 @@ async def process_jackpot_hits(players: list, community: list, folded_ids: set) 
                     await db.log_currency_event(p.user_id, "Jackpot", actual, f"Won {jp_tier}!")
                     jackpot_hits.append((p.user_id, jp_tier, actual, new_jp))
 
-    except Exception as e:
-        print(f"[jackpot] processing error: {e}")
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
     return jackpot_hits
 

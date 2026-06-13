@@ -277,7 +277,7 @@ def _get_hand_name(s: TutorialSession) -> str:
     try:
         score = _evaluator.evaluate(p.hole_cards, g.community)
         return _evaluator.class_to_string(_evaluator.get_rank_class(score))
-    except Exception:
+    except (ValueError, TypeError, KeyError):
         return ""
 
 
@@ -919,7 +919,8 @@ class TutorialView(discord.ui.View):
                 file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, True, False)
                 await interaction.edit_original_response(attachments=[file])
             except Exception:
-                pass
+                import traceback
+                traceback.print_exc()
 
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=3)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1325,8 +1326,9 @@ async def _finish_hand(
                     f"Link this message and claim in {ch_mention}",
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
-            except Exception as e:
-                print(f"[tutorial] reward message error: {e}")
+            except Exception:
+                import traceback
+                traceback.print_exc()
 
     # ── Between hands ────────────────────────────────────────────────────
     else:

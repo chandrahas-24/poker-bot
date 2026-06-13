@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
+import traceback
 
 from database import init_db, recover_chips_in_play
 import database as db
@@ -37,9 +38,6 @@ async def _try_dm(user_id: int, content: str = None, embed: discord.Embed = None
         await user.send(content=content, embed=embed)
         return True
     except (discord.Forbidden, discord.HTTPException):
-        return False
-    except Exception as e:
-        print(f"[DM] Unexpected error DMing {user_id}: {e}")
         return False
 
 
@@ -81,8 +79,8 @@ async def daily_inactive_wipe():
                 dm_warned += 1
         if at_risk:
             print(f"[Daily Wipe] Sent 24h warning DMs to {dm_warned}/{len(at_risk)} at-risk player(s)")
-    except Exception as e:
-        print(f"[Daily Wipe] Warning DM phase error: {e}")
+    except Exception:
+        traceback.print_exc()
 
     # ── Step 2 & 3: Wipe inactive players + DM receipts ─────────────────────
     try:
@@ -132,8 +130,8 @@ async def daily_inactive_wipe():
                         f"**Total cashouts queued:** {cashout_total:,} chips\n"
                         f"*(DMs sent: {dm_sent}/{len(wiped)})*"
                     )
-                except Exception as e:
-                    print(f"[Daily Wipe] Failed to send channel summary: {e}")
+                except Exception:
+                    traceback.print_exc()
 
             # ── Step 5: Staff Cashout Tickets ────────────────────────────────
             if hasattr(config, "CASHOUT_CHANNEL_ID") and config.CASHOUT_CHANNEL_ID:
@@ -147,8 +145,8 @@ async def daily_inactive_wipe():
                                 f"**Notes:** Auto-Cashout (Inactivity Wipe)"
                             )
                             await cashout_channel.send(ticket_msg)
-                except Exception as e:
-                    print(f"[Daily Wipe] Failed to send cashout tickets: {e}")
+                except Exception:
+                    traceback.print_exc()
 
             print(
                 f"[Daily Wipe] Wiped {len(wiped)} player(s) | "
@@ -156,8 +154,8 @@ async def daily_inactive_wipe():
                 f"cashouts queued: {sum(w['cashout_amount'] for w in wiped):,} | "
                 f"DMs sent: {dm_sent}/{len(wiped)}"
             )
-    except Exception as e:
-        print(f"[Daily Wipe] Wipe phase error: {e}")
+    except Exception:
+        traceback.print_exc()
 
 @bot.event
 async def on_ready():
@@ -233,8 +231,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     try:
         raw = await bot.http.get_message(channel.id, message.id)
-    except Exception as e:
-        print(f"[Donation] Failed to fetch raw message: {e}")
+    except Exception:
+        traceback.print_exc()
         return
 
     text = raw.get("content") or ""
@@ -405,6 +403,7 @@ async def restart(ctx):
         os._exit(0)
 
     except Exception as e:
+        traceback.print_exc()
         await ctx.send(f"**Deployment Failed:**\n```python\n{e}\n```")
 
 

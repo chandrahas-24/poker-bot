@@ -3,6 +3,7 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 import config
+import traceback
 import json
 
 # 1. FORCE the bot to look inside the Railway Volume
@@ -65,18 +66,21 @@ async def init_db():
 
         try:
             await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_id INTEGER")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         try:
             await db.execute("ALTER TABLE hand_log ADD COLUMN dealer_name TEXT")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         try:
             await db.execute("ALTER TABLE hand_log ADD COLUMN state TEXT DEFAULT 'completed'")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.commit()
 
@@ -117,8 +121,9 @@ async def init_db():
                 await db.execute(
                     f"ALTER TABLE guild_settings ADD COLUMN {col} INTEGER DEFAULT {default}"
                 )
-            except Exception:
-                pass
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chips_in_play (
                 user_id  INTEGER PRIMARY KEY,
@@ -158,8 +163,9 @@ async def init_db():
         # Migrate existing rows that have no source column
         try:
             await db.execute("ALTER TABLE house_revenue ADD COLUMN source TEXT DEFAULT 'game'")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.execute("""
                     CREATE TABLE IF NOT EXISTS jackpot (
@@ -217,14 +223,16 @@ async def init_db():
         ]:
             try:
                 await db.execute(f"ALTER TABLE stats ADD COLUMN {col} INTEGER DEFAULT {default}")
-            except Exception:
-                pass
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
 
         # Safely upgrade existing wallets table without wiping data
         try:
             await db.execute("ALTER TABLE wallets ADD COLUMN pending_cashout INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS player_cosmetics (
@@ -249,8 +257,9 @@ async def init_db():
 
         try:
             await db.execute("ALTER TABLE wallets ADD COLUMN autorebuy_amount INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
@@ -258,8 +267,9 @@ async def init_db():
         try:
             await db.execute("ALTER TABLE stats ADD COLUMN vpip_count INTEGER DEFAULT 0")
             await db.execute("ALTER TABLE stats ADD COLUMN vpip_hands INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.commit()
         await init_inactivity_tracking(db)
@@ -673,23 +683,20 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
 
 
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
-    try:
-        db = await _get_db()
+    db = await _get_db()
+    async with db.execute(
+            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
+            (guild_id, user_id)
+    ) as c:
+        if await c.fetchone():
+            return True
+    if table_name:
         async with db.execute(
-                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
-                (guild_id, user_id)
+                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
+                (guild_id, user_id, table_name)
         ) as c:
             if await c.fetchone():
                 return True
-        if table_name:
-            async with db.execute(
-                    "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
-                    (guild_id, user_id, table_name)
-            ) as c:
-                if await c.fetchone():
-                    return True
-    except Exception as e:
-        print(f"[db] is_banned error: {e}")
     return False
 
 
@@ -1385,8 +1392,8 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
             """, (cosmetic_id, kind, display, description, rarity, 1 if hidden else 0))
             await db.commit()
             return True
-        except Exception as e:
-            print(f"[database] Error saving custom cosmetic: {e}")
+        except Exception:
+            traceback.print_exc()
             # Remove from in-memory catalog if database save failed
             del catalog[cosmetic_id]
             return False
@@ -1395,28 +1402,25 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
 async def load_custom_cosmetics():
     """Load all custom cosmetics from the database into memory on startup."""
     db = await _get_db()
-    try:
-        async with db.execute(
-                "SELECT cosmetic_id, kind, display, description, rarity, hidden FROM custom_cosmetics") as c:
-            rows = await c.fetchall()
+    async with db.execute(
+            "SELECT cosmetic_id, kind, display, description, rarity, hidden FROM custom_cosmetics") as c:
+        rows = await c.fetchall()
 
-        for row in rows:
-            cosmetic_id, kind, display, description, rarity, hidden = row
-            catalog = TITLES if kind == "title" else WIN_MESSAGES
+    for row in rows:
+        cosmetic_id, kind, display, description, rarity, hidden = row
+        catalog = TITLES if kind == "title" else WIN_MESSAGES
 
-            # Only load if not already defined (hardcoded cosmetics take precedence)
-            if cosmetic_id not in catalog:
-                catalog[cosmetic_id] = {
-                    "display": display,
-                    "description": description,
-                    "rarity": rarity,
-                    "hidden": bool(hidden),
-                }
+        # Only load if not already defined (hardcoded cosmetics take precedence)
+        if cosmetic_id not in catalog:
+            catalog[cosmetic_id] = {
+                "display": display,
+                "description": description,
+                "rarity": rarity,
+                "hidden": bool(hidden),
+            }
 
-        if rows:
-            print(f"✅ Loaded {len(rows)} custom cosmetic(s) from database")
-    except Exception as e:
-        print(f"[database] Error loading custom cosmetics: {e}")
+    if rows:
+        print(f"✅ Loaded {len(rows)} custom cosmetic(s) from database")
 
 
 def get_visible_cosmetics_for_user(user_id: int, owned_ids: set[str], catalog: dict) -> dict:
@@ -1727,7 +1731,7 @@ async def get_players_at_risk() -> list[dict]:
             if not (meets_hands and meets_wager) and days_inactive == (INACTIVITY_DAYS - 1):
                 r['days_inactive'] = days_inactive
                 at_risk.append(r)
-        except Exception:
+        except (ValueError, TypeError):
             continue
     return at_risk
 
@@ -1759,7 +1763,7 @@ async def get_inactive_players() -> list[dict]:
             if not (meets_hands and meets_wager) and days_inactive >= INACTIVITY_DAYS:
                 r['days_inactive'] = days_inactive
                 inactive.append(r)
-        except Exception:
+        except (ValueError, TypeError):
             continue
     return inactive
 

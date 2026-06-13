@@ -4,6 +4,7 @@ from discord.ext import commands
 from discord.ext import tasks
 import datetime
 from discord import app_commands
+import traceback
 
 import config
 import database as db
@@ -474,9 +475,6 @@ class TournamentCog(commands.Cog):
             await user.send(embed=embed)
             return True
         except (discord.Forbidden, discord.HTTPException):
-            return False
-        except Exception as e:
-            print(f"[Tournament DM] Error DMing {user_id}: {e}")
             return False
 
     tourney_wipe_time = datetime.time(hour=2, minute=00, tzinfo=datetime.timezone.utc)
@@ -967,7 +965,7 @@ class TournamentCog(commands.Cog):
                 reg_dt = datetime.datetime.fromisoformat(reg_str).replace(tzinfo=None)
                 if now < reg_dt + datetime.timedelta(hours=48):
                     is_grace = True
-            except Exception:
+            except (ValueError, TypeError):
                 pass
 
         if is_grace:
@@ -1122,6 +1120,7 @@ class TournamentCog(commands.Cog):
                     await interaction.followup.send(embed=view.format_page(), view=view, ephemeral=False)
 
         except Exception as e:
+            traceback.print_exc()
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
     @tourneymgr.command(name="deleteteam", description="[Manager] Delete a team and unassign its players")
@@ -1209,7 +1208,7 @@ class TournamentCog(commands.Cog):
         # 2. Convert Unix Epoch -> UTC Datetime -> ISO 8601 string
         try:
             new_iso = datetime.utcfromtimestamp(unix_ts).isoformat()
-        except Exception as e:
+        except (ValueError, OSError, OverflowError) as e:
             await interaction.followup.send(f"❌ Failed to parse date: {e}", ephemeral=True)
             return
 
@@ -1227,6 +1226,7 @@ class TournamentCog(commands.Cog):
                 ephemeral=True
             )
         except Exception as e:
+            traceback.print_exc()
             await interaction.followup.send(f"❌ Database error: {e}", ephemeral=True)
 
 async def setup(bot):

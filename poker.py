@@ -328,7 +328,7 @@ async def _auto_next_hand(t: TableState, channel):
                             try:
                                 await channel.send(
                                     f"♻️ **{p.display_name}** auto-topped up **{top_up_needed:,}** {get_chip_emoji(t)} to reach a stack of **{target_stack:,}** {get_chip_emoji(t)}.")
-                            except Exception as e:
+                            except (discord.HTTPException, discord.Forbidden) as e:
                                 # 1. Log it to the console so the developer sees it
                                 print(f"[Error] Channel send failed for auto-rebuy ({p.user_id}): {e}")
 
@@ -355,7 +355,7 @@ async def _auto_next_hand(t: TableState, channel):
                 try:
                     await channel.send(
                         f"🚪 **{p.display_name}** has been removed — stack (**{p.chips}** {get_chip_emoji(t)}) is below the big blind (**{bb}** {get_chip_emoji(t)}). Chips returned to wallet.")
-                except Exception as e:
+                except (discord.HTTPException, discord.Forbidden) as e:
                     print(f"[Error] Failed to send below-BB kick msg for {p.user_id}: {e}")
                     try:
                         settings_log = await db.get_settings(channel.guild.id)
@@ -471,40 +471,35 @@ _log_threads: dict[str, discord.Thread] = {}
 
 
 async def ensure_log_thread(channel, t: TableState) -> discord.Thread | None:
-    settings = await db.get_settings(channel.guild.id)
-    log_ch_id = settings.get("log_channel_id")
-    if not log_ch_id:
-        return None
-    log_ch = channel.guild.get_channel(int(log_ch_id))
-    if not log_ch:
-        return None
-    existing = _log_threads.get(t.id)
-    if existing:
-        # ZERO LAG: Trust the memory cache, do not ask Discord!
-        return existing
-
-    log_thread_name = f"Log {t.name}" if t.is_tournament else "Poker Hand Log"
-
-    if hasattr(log_ch, 'threads'):
-        # 🚨 1. Try Discord's fast memory cache first (O(1) lookup)
-        thread = discord.utils.get(log_ch.threads, name=log_thread_name)
-        if thread:
+    if t.is_tournament:
+        # tournaments create their own threads as before
+        settings = await db.get_settings(channel.guild.id)
+        log_ch_id = settings.get("log_channel_id")
+        if not log_ch_id:
+            return None
+        log_ch = channel.guild.get_channel(int(log_ch_id))
+        if not log_ch:
+            return None
+        existing = _log_threads.get(t.id)
+        if existing:
+            return existing
+        log_thread_name = f"Log {t.name}"
+        try:
+            thread = await log_ch.create_thread(name=log_thread_name, type=discord.ChannelType.public_thread)
             _log_threads[t.id] = thread
             return thread
+        except Exception:
+            traceback.print_exc()
+            return None
 
-        # 🚨 2. Only hit the API to search archived threads if it's completely missing
-        async for arch_thread in log_ch.archived_threads(limit=10):
-            if arch_thread.name == log_thread_name:
-                _log_threads[t.id] = arch_thread
-                return arch_thread
-    try:
-        thread = await log_ch.create_thread(name=log_thread_name, type=discord.ChannelType.public_thread)
+    # Regular tables — use hardcoded thread ID
+    existing = _log_threads.get(t.id)
+    if existing:
+        return existing
+    thread = channel.guild.get_channel_or_thread(1480284795199033344) # log thread id hardcoded for now.
+    if thread:
         _log_threads[t.id] = thread
-        return thread
-    except Exception as e:
-        print(f"[poker] ensure_log_thread failed to create thread: {e}")
-        traceback.print_exc()
-        return None
+    return thread
 
 
 async def post_hand_log(channel, t: TableState, result):
@@ -581,7 +576,7 @@ async def post_hand_log(channel, t: TableState, result):
     try:
         await thread.send(f"```\n{body}\n```")
     except (discord.NotFound, discord.HTTPException):
-        _log_threads.pop(channel.guild.id, None)
+        _log_threads.pop(t.id, None)
     return body
 
 
@@ -594,7 +589,7 @@ async def post_tip_log(channel, t: TableState, tipper_id: int, tipper_name: str,
             await thread.send(
                 f"💸 **Tip** [{ts}] — {amount} \n **{tipper_name}** ({tipper_id}) to **{recipient_name}** ({recipient_id}) at table `{t.name}`")
         except (discord.NotFound, discord.HTTPException):
-            _log_threads.pop(channel.guild.id, None)
+            _log_threads.pop(t.id, None)
 # ── Embed ─────────────────────────────────────────────────────────────────────
 
 STREET_COLOR = {
@@ -1016,7 +1011,7 @@ async def _handle_egirl_saro(channel, t: TableState):
                 await channel.send(
                     f"✨ **{name}** was dealt the shiny **e-girl Saroshi** again!"
                 )
-        except Exception as e:
+        except (discord.HTTPException, discord.Forbidden) as e:
             print(f"[Error] Failed to announce E-girl Saro drop for {uid}: {e}")
     t.game.egirl_saro_holders.clear()
 
@@ -1037,8 +1032,8 @@ async def _process_result(guild, channel, t: TableState):
         chip_map = {p.user_id: p.chips + p.pending_rebuy for p in t.game.players}
         try:
             await tournament_db.sync_chips_in_play(chip_map)
-        except Exception as e:
-            print(f"[tourney] chips_in_play sync error: {e}")
+        except Exception:
+            traceback.print_exc()
         # Return chips & set rejoin cooldown for pending leaves
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
@@ -2530,8 +2525,8 @@ class PokerCog(commands.Cog):
                 await tournament_db.checkpoint()
             except ImportError:
                 pass
-            except Exception as e:
-                print(f"Failed tournament db checkpoint: {e}")
+            except Exception:
+                traceback.print_exc()
 
             # 2. Write the zip file safely using absolute paths and arcname
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -3714,7 +3709,7 @@ class PokerCog(commands.Cog):
         try:
             # utcfromtimestamp perfectly matches your database's utcnow() formatting
             new_iso = datetime.utcfromtimestamp(unix_ts).isoformat()
-        except Exception as e:
+        except (ValueError, OSError, OverflowError) as e:
             await interaction.response.send_message(f"❌ Failed to parse date: {e}", ephemeral=True)
             return
 
@@ -3732,6 +3727,7 @@ class PokerCog(commands.Cog):
                 ephemeral=True
             )
         except Exception as e:
+            traceback.print_exc()
             await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
 
     @pokeradmin.command(name="adjustjackpot", description="[Admin] Manually adjust the global jackpot")
@@ -4172,6 +4168,7 @@ class PokerCog(commands.Cog):
                 "❌ Failed to send DM. Please check your Discord privacy settings to allow messages from server members.",
                 ephemeral=True)
         except Exception as e:
+            traceback.print_exc()
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
     @poker.command(name="testcards", description="[Dev] Generate a random 2-card hand to test image sizes")
@@ -4288,6 +4285,7 @@ class PokerCog(commands.Cog):
                     await interaction.followup.send(embed=view.format_page(), view=view, ephemeral=False)
 
         except Exception as e:
+            traceback.print_exc()
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
     @pokeradmin.command(name="setstat", description="[Admin] Modify a player's poker statistics")
@@ -4333,6 +4331,7 @@ class PokerCog(commands.Cog):
                 f"✅ Successfully updated **{stat.name}** to `{value:,}` for **{user.display_name}**!")
 
         except Exception as e:
+            traceback.print_exc()
             await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
 
     @poker.command(name="gamble", description="Spin the wheel! Set the weights for your mystery move.")

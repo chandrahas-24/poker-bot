@@ -4258,12 +4258,16 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
 
+        # 2. String Check: Reject anything that isn't a SELECT
+        if not query.strip().upper().startswith("SELECT"):
+            await interaction.response.send_message("❌ Only SELECT queries are allowed.", ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=False)
 
         try:
             import aiosqlite
-            # 2. Force SQLite into strict Read-Only mode using URI parameters
-            # db.DB_PATH points to "poker.db" from your database.py file
+            # Force SQLite into strict Read-Only mode using URI parameters
             db_uri = f"file:{db.DB_PATH}?mode=ro"
 
             async with aiosqlite.connect(db_uri, uri=True) as conn:
@@ -4276,27 +4280,14 @@ class PokerCog(commands.Cog):
                                                         ephemeral=False)
                         return
 
-                    # 3. Auto-format the columns and rows for Discord
                     columns = list(rows[0].keys())
-                    lines = [f"**`{' | '.join(columns)}`**"]  # Header row
 
-                    # Limit to 15 rows to prevent massive Discord spam
-                    for row in rows[:15]:
-                        lines.append(" | ".join(str(row[col]) for col in columns))
-
-                    result_str = "\n".join(lines)
-
-                    if len(rows) > 15:
-                        result_str += f"\n\n*...and {len(rows) - 15} more rows.*"
-
-                    # 4. Final safety clamp for Discord's 2000 character limit
-                    if len(result_str) > 1900:
-                        result_str = result_str[:1900] + "\n... [Output Truncated]"
-
-                    await interaction.followup.send(f"**Query Results:**\n{result_str}", ephemeral=False)
+                    # Pass to Paginator (15 rows per page, Max 20 pages)
+                    view = RawSQLPaginationView(columns=columns, rows=rows, title="Main DB Query", items_per_page=15,
+                                                max_pages_limit=20)
+                    await interaction.followup.send(embed=view.format_page(), view=view, ephemeral=False)
 
         except Exception as e:
-            # If they try to run an UPDATE or INSERT, this will catch the SQLite Read-Only error
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
     @pokeradmin.command(name="setstat", description="[Admin] Modify a player's poker statistics")
@@ -4705,6 +4696,82 @@ class PremoveAmountModal(discord.ui.Modal):
             p.premove = {"action": self.action, "amount": amt}
         action_label = f"Call up to **{amt}**" if self.action == "call_upto" else f"Fold if bet > **{amt}**"
         await interaction.response.send_message(f"⚡ Premove set: {action_label}", ephemeral=True)
+
+
+class RawSQLPaginationView(discord.ui.View):
+    def __init__(self, columns: list, rows: list, title: str, items_per_page: int = 15, max_pages_limit: int = 20):
+        super().__init__(timeout=300)
+        self.columns = columns
+        self.rows = rows
+        self.title = title
+        self.items_per_page = items_per_page
+        self.current_page = 0
+
+        # Calculate actual pages, but HARD CAP it at max_pages_limit (20)
+        calculated_pages = math.ceil(len(rows) / items_per_page) if rows else 1
+        self.max_pages = min(calculated_pages, max_pages_limit)
+
+        self.update_buttons()
+
+    def update_buttons(self):
+        """Enables/Disables navigation buttons based on current position."""
+        is_first_page = self.current_page == 0
+        is_last_page = self.current_page >= self.max_pages - 1
+
+        self.btn_first.disabled = is_first_page
+        self.btn_prev.disabled = is_first_page
+        self.btn_next.disabled = is_last_page
+        self.btn_last.disabled = is_last_page
+
+    def format_page(self):
+        start_idx = self.current_page * self.items_per_page
+        end_idx = start_idx + self.items_per_page
+        page_rows = self.rows[start_idx:end_idx]
+
+        embed = discord.Embed(title=self.title, color=discord.Color.dark_theme())
+
+        header = " | ".join(str(c) for c in self.columns)
+        separator = "-" * len(header)
+        lines = [header, separator]
+
+        for r in page_rows:
+            # Safely stringify columns and truncate long values to keep columns aligned
+            row_str = " | ".join(str(r[col])[:40] for col in self.columns)
+            lines.append(row_str)
+
+        description = "\n" + "\n".join(lines) + "\n"
+
+        # Failsafe against Discord's 4096 embed description limit
+        if len(description) > 4000:
+            description = description[:4000] + "\n...[Truncated]"
+
+        embed.description = description
+        embed.set_footer(text=f"Page {self.current_page + 1} of {self.max_pages} | Total Rows: {len(self.rows)}")
+        return embed
+
+    @discord.ui.button(label="⏪", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+    @discord.ui.button(label="⏩", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = self.max_pages - 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
 
 async def setup(bot):
     await bot.add_cog(PokerCog(bot))

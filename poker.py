@@ -3540,8 +3540,8 @@ class PokerCog(commands.Cog):
             await refresh(interaction.channel, t)
 
     @poker.command(name="request_cashout", description="Lock chips for withdrawal and notify staff")
-    @app_commands.describe(amount="Chips to cash out", note="Optional payment info")
-    async def request_cashout(self, interaction: discord.Interaction, amount: str, note: str = ""):
+    @app_commands.describe(amount="Chips to cash out", note="Additonal notes")
+    async def request_cashout(self, interaction: discord.Interaction, amount: str, note: app_commands.Range[str, 0, 50] = ""):
         # FIXED: Defer ephemerally to hide from chat
         await interaction.response.defer(ephemeral=True)
 

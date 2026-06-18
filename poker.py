@@ -4464,7 +4464,9 @@ class StatsView(discord.ui.View):
 
     def build_basic_embed(self) -> discord.Embed:
         net = self.row['net_chips']
-        embed = discord.Embed(title=f"Player Stats — {self.row['username']}", color=0x2ecc71 if net >= 0 else 0xe74c3c)
+        embed = discord.Embed(title=f"Player Stats — {self.row['username']}", color=0x2ecc71 if net > 0 else 0xe74c3c)
+        if net == 0:
+            embed.color =0xFFFFFF
 
         wp = f"{self.row['hands_won'] / self.row['hands_played'] * 100:.1f}%" if self.row['hands_played'] else "—"
 

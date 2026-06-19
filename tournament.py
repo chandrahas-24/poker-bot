@@ -579,7 +579,8 @@ class TournamentCog(commands.Cog):
     # -- Manager: Table -------------------------------------------------------
 
     @tourneymgr.command(name="open", description="[Manager] Open a new tournament table")
-    async def open_table(self, interaction: discord.Interaction, name: str):
+    @app_commands.describe(name="Table name", max_buyin="Max buy-in (0 for no limit)")
+    async def open_table(self, interaction: discord.Interaction, name: str, max_buyin: int = 5000):
         # 1. Defer the response first
         await interaction.response.defer()
 
@@ -600,7 +601,7 @@ class TournamentCog(commands.Cog):
         t.game.SMALL_BLIND = 25
         t.game.BIG_BLIND = 50
         t.game.MIN_BUYIN = 250
-        t.game.MAX_BUYIN = 5000
+        t.game.MAX_BUYIN = max_buyin
         t.game.tax_rate = 0
         t.game.tax_exempt = True
 
@@ -614,20 +615,6 @@ class TournamentCog(commands.Cog):
         await interaction.followup.send(
             f"Tournament Table Open!\nBlind: {t.game.SMALL_BLIND}/{t.game.BIG_BLIND} | Min: {t.game.MIN_BUYIN} | Max: {t.game.MAX_BUYIN or 'None'}")
         await refresh(interaction.channel, t)
-
-    @tourneymgr.command(name="blinds", description="Set blinds for this table")
-    async def blinds(self, interaction: discord.Interaction, small_blind: int, big_blind: int):
-        if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True); return
-
-        key = (interaction.guild_id, interaction.channel_id)
-        t   = tables.get(key)
-        if not t or not t.is_tournament:
-            await interaction.response.send_message("No tournament table open here.", ephemeral=True); return
-
-        t.game.SMALL_BLIND = small_blind
-        t.game.BIG_BLIND   = big_blind
-        await interaction.response.send_message(f"Blinds set to {small_blind}/{big_blind} for the next hand.")
 
     @tourneymgr.command(name="forcefold", description="Force fold a player")
     async def forcefold(self, interaction: discord.Interaction, user: discord.Member):
@@ -831,6 +818,9 @@ class TournamentCog(commands.Cog):
 
     @tourney.command(name="register", description="Register for the tournament")
     async def register(self, interaction: discord.Interaction):
+
+        await interaction.response.send_message("Registration is closed now.", ephemeral=True)
+        return
 
         if interaction.channel_id != config.TOURNAMENT_REGISTER_CHANNEL_ID:
             await interaction.response.send_message(

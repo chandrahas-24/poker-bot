@@ -2508,10 +2508,10 @@ class PokerCog(commands.Cog):
             "poker.db-shm",
             "tutorial.db",
             "tutorial.db-wal",
-            "tutorial.db-shm",
-            "tournament.db",
-            "tournament.db-wal",
-            "tournament.db-shm"
+            "tutorial.db-shm"
+            # "tournament.db",
+            # "tournament.db-wal",
+            # "tournament.db-shm"
         ]
 
         try:

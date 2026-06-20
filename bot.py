@@ -161,7 +161,7 @@ async def daily_inactive_wipe():
 async def on_ready():
     await init_db()
     await init_tutorial_db()
-    await tournament_db.init_db()
+    # await tournament_db.init_db()
 
     recovered = await recover_chips_in_play()
     if recovered:
@@ -169,15 +169,15 @@ async def on_ready():
         for r in recovered:
             print(f"   {r['username']}: +{r['amount']} chips returned to wallet")
 
-    tourney_recovered = await tournament_db.recover_chips_in_play()
-    if tourney_recovered:
-        print(f"⚠️  Recovered tournament chips for {len(tourney_recovered)} player(s) after restart:")
-        for r in tourney_recovered:
-            print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
+    # tourney_recovered = await tournament_db.recover_chips_in_play()
+    # if tourney_recovered:
+    #     print(f"⚠️  Recovered tournament chips for {len(tourney_recovered)} player(s) after restart:")
+    #     for r in tourney_recovered:
+    #         print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
 
     await bot.load_extension("poker")
     await bot.load_extension("tutorial_cog")
-    await bot.load_extension("tournament")
+    # await bot.load_extension("tournament")
 
     YOUR_GUILD_ID = config.GUILD_ID
     if YOUR_GUILD_ID:

@@ -41,7 +41,6 @@ async def _try_dm(user_id: int, content: str = None, embed: discord.Embed = None
 
 
 # ── Daily inactivity wipe (03:30 UTC) ─────────────────────────────────────────
-
 wipe_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
 
 @tasks.loop(time=wipe_time)
@@ -189,13 +188,19 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     daily_inactive_wipe.start()
+    clear_donation_cache.start()
 
 
 _processed_donations = set()
 
+@tasks.loop(hours=2)
+async def clear_donation_cache():
+    """Periodically clear the memory set to prevent slow memory leaks."""
+    _processed_donations.clear()
+
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
-    # ── 0. Prevent concurrent duplicate triggers (Fast Check) ──
+    # ── 0. Prevent concurrent duplicate triggers ──
     if payload.message_id in _processed_donations:
         return
 
@@ -221,7 +226,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if message.author.id != DONATION_BOT_ID:
         return
 
-    # ── 3.5. Ensure we haven't already processed this message (persistent visual check) ──
+    # ── 3.5. Ensure we haven't already processed this message (persistent check) ──
     for reaction in message.reactions:
         if reaction.me and str(reaction.emoji) == "✅":
             return
@@ -294,22 +299,25 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         user = message.guild.get_member(user.id) or user
 
     # ── 7. Credit chips ───────────────────────────────────────────────────────
-    new_bal = await db.add_chips(
-        bot.user.id,
-        bot.user.display_name,
-        user.id,
-        user.name,
-        chips,
-        "Dank Memer Donation Exchange",
-    )
-    await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+    try:
+        new_bal = await db.add_chips(
+            bot.user.id,
+            bot.user.display_name,
+            user.id,
+            user.name,
+            chips,
+            "Dank Memer Donation Exchange",
+        )
+        await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
 
-    print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
+        print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
 
-    await message.reply(
-        f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
-    )
-    await message.add_reaction("✅")
+        await message.reply(
+            f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+        )
+        await message.add_reaction("✅")
+    except Exception as e:
+        print(f"[Donation Error] Failed to process donation for {user.id}: {e}")
 
 
 _processing_cashouts = set()
@@ -390,13 +398,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     finally:
         _processing_cashouts.discard(payload.message_id)
 
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     # Hook into poker cog for embed resend counter
     await bot.process_commands(message)
-
 
 @bot.event
 async def on_command_error(ctx, error):

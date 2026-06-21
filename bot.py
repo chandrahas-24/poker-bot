@@ -28,7 +28,6 @@ CHIPS_PER_COIN   = 1_000_000  # 1 chip per 1,000,000 donated coins
 
 
 # ── Helper: send a DM, silently ignore if the user has DMs closed ─────────────
-
 async def _try_dm(user_id: int, content: str = None, embed: discord.Embed = None) -> bool:
     """
     Attempt to DM a user by ID.  Returns True on success, False if blocked/closed.
@@ -44,7 +43,6 @@ async def _try_dm(user_id: int, content: str = None, embed: discord.Embed = None
 # ── Daily inactivity wipe (03:30 UTC) ─────────────────────────────────────────
 
 wipe_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
-
 
 @tasks.loop(time=wipe_time)
 async def daily_inactive_wipe():
@@ -193,8 +191,14 @@ async def on_ready():
     daily_inactive_wipe.start()
 
 
+_processed_donations = set()
+
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    # ── 0. Prevent concurrent duplicate triggers (Fast Check) ──
+    if payload.message_id in _processed_donations:
+        return
+
     # ── 1. Channel filter — cheapest check, drop everything else immediately ──
     if payload.channel_id not in config.ADD_CHIPS_CHANNELS:
         return
@@ -216,6 +220,11 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     # Double-check author on the fetched message (author may have been absent in delta)
     if message.author.id != DONATION_BOT_ID:
         return
+
+    # ── 3.5. Ensure we haven't already processed this message (persistent visual check) ──
+    for reaction in message.reactions:
+        if reaction.me and str(reaction.emoji) == "✅":
+            return
 
     # ── 4. Content filter — extract all text, look for the success phrase ──
     def _extract_component_text(components: list) -> str:
@@ -249,10 +258,17 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if "Successfully donated" not in text:
         return
 
+    # ── Lock the transaction IMMEDIATELY to prevent fast race conditions ──
+    if payload.message_id in _processed_donations:
+        return
+    _processed_donations.add(payload.message_id)
+
     # ── 5. Parse amount ───────────────────────────────────────────────────────
     match = re.search(r"Successfully donated[^0-9]*([\d,]+)", text)
     if not match:
         print("[Donation] Regex found no amount — skipping")
+        # Unlock if it was a false positive so it can try again
+        _processed_donations.discard(payload.message_id)
         return
 
     donated = int(match.group(1).replace(",", ""))
@@ -270,6 +286,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     user = getattr(meta, "user", None)
     if user is None:
         print(f"[Donation] No interaction_metadata on message {message.id} — skipping")
+        # Unlock if we couldn't resolve the user
+        _processed_donations.discard(payload.message_id)
         return
 
     if message.guild:

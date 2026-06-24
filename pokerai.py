@@ -355,11 +355,17 @@ class AIGameView(discord.ui.View):
         self.update_buttons()
 
     async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        embed = discord.Embed(
+            title="🏁 Session Ended (Inactivity)",
+            description=f"This session expired due to inactivity.\n\n"
+                        f"**Hands played:** {self.session.hand_num}\n"
+                        f"**Net Winnings:** {self.session.total_session_winnings:,} {config.TOURNAMENT_CHIP_EMOJI}\n"
+                        f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
+            color=0x95a5a6
+        )
         try:
             if self.session.hand_msg:
-                await self.session.hand_msg.edit(view=self)
+                await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
         except Exception:
             pass
         if self.session.user_id in self.cog_sessions:
@@ -403,6 +409,7 @@ class AIGameView(discord.ui.View):
                 if self.session.user_id in self.cog_sessions:
                     del self.cog_sessions[self.session.user_id]
                 
+            self.stop()
             await self.session.hand_msg.edit(embed=embed, view=view, attachments=([file] if file else []))
             
         except Exception as e:
@@ -475,6 +482,7 @@ class AIGameView(discord.ui.View):
                         f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
             color=0x95a5a6
         )
+        self.stop()
         await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
 
 
@@ -572,11 +580,17 @@ class AIGameOverView(discord.ui.View):
         self.cog_sessions = cog_sessions
 
     async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        embed = discord.Embed(
+            title="🏁 Session Ended (Inactivity)",
+            description=f"This session expired due to inactivity.\n\n"
+                        f"**Hands played:** {self.session.hand_num}\n"
+                        f"**Net Winnings:** {self.session.total_session_winnings:,} {config.TOURNAMENT_CHIP_EMOJI}\n"
+                        f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
+            color=0x95a5a6
+        )
         try:
             if self.session.hand_msg:
-                await self.session.hand_msg.edit(view=self)
+                await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
         except Exception:
             pass
         if self.session.user_id in self.cog_sessions:
@@ -601,6 +615,7 @@ class AIGameOverView(discord.ui.View):
                 if self.session.user_id in self.cog_sessions:
                     del self.cog_sessions[self.session.user_id]
             
+            self.stop()
             await self.session.hand_msg.edit(embed=embed, view=view, attachments=([file] if file else []))
         except Exception as e:
             await interaction.followup.send(f"❌ Error starting next hand: {e}", ephemeral=True)
@@ -624,6 +639,7 @@ class AIGameOverView(discord.ui.View):
                         f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
             color=0x95a5a6
         )
+        self.stop()
         await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
 
 

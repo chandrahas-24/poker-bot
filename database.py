@@ -1057,19 +1057,18 @@ TITLES: dict[str, dict] = {
 
     # ── Legendary rare drops ────────────────────────────────────────────────
     "wind_walker": {
-        "display": "Wind Walker 🍃",
+        "display": "𝒲𝒾𝓃𝒹 𝒲𝒶𝓁𝓀𝑒𝓇 🍃",
         "description": "Recover from a net loss of 10,000 chips",
         "rarity": "legendary",
         "hidden": False,
     },
 
     "sarosmommy": {
-        "display": "👶 Saroshi's Mommy",
+        "display": "👶 𝑆𝑎𝑟𝑜𝑠ℎ𝑖'𝑠 𝑀𝑜𝑚𝑚𝑦",
         "description": "super secret formula sauce, congrats pro user",
         "rarity": "legendary",
         "hidden": False,
     },
-
     "blessed": {
         "display": "🌟 Blessed",
         "description": "Favored by the poker gods. Extremely rare.",

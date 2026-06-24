@@ -396,7 +396,12 @@ class AIGameView(discord.ui.View):
             self.btn_raise.disabled = False
 
     async def _act_and_update(self, interaction: discord.Interaction, action: str):
-        await interaction.response.defer()
+        is_main = (self.session.hand_msg and interaction.message and interaction.message.id == self.session.hand_msg.id)
+        
+        if is_main:
+            await interaction.response.defer()
+        else:
+            await interaction.response.defer(ephemeral=True)
         
         try:
             state = SlumbotClient.act(self.session.token, action)
@@ -410,7 +415,15 @@ class AIGameView(discord.ui.View):
                     del self.cog_sessions[self.session.user_id]
                 
             self.stop()
-            msg = await interaction.edit_original_response(embed=embed, view=view, attachments=([file] if file else []))
+            
+            if is_main:
+                msg = await interaction.edit_original_response(embed=embed, view=view, attachments=([file] if file else []))
+            else:
+                # Update the ephemeral picker to clear buttons
+                await interaction.edit_original_response(content="✅ Raise submitted!", view=None)
+                # Edit the main board message
+                msg = await self.session.hand_msg.edit(embed=embed, view=view, attachments=([file] if file else []))
+                
             try:
                 self.session.hand_msg = await interaction.channel.fetch_message(msg.id)
             except Exception:

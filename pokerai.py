@@ -410,7 +410,11 @@ class AIGameView(discord.ui.View):
                     del self.cog_sessions[self.session.user_id]
                 
             self.stop()
-            await self.session.hand_msg.edit(embed=embed, view=view, attachments=([file] if file else []))
+            msg = await interaction.edit_original_response(embed=embed, view=view, attachments=([file] if file else []))
+            try:
+                self.session.hand_msg = await interaction.channel.fetch_message(msg.id)
+            except Exception:
+                self.session.hand_msg = msg
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error playing action: {e}", ephemeral=True)
@@ -483,7 +487,7 @@ class AIGameView(discord.ui.View):
             color=0x95a5a6
         )
         self.stop()
-        await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
+        await interaction.edit_original_response(embed=embed, view=None, attachments=[])
 
 
 # ── RAISE PICKER VIEW ─────────────────────────────────────────────────────────
@@ -616,7 +620,11 @@ class AIGameOverView(discord.ui.View):
                     del self.cog_sessions[self.session.user_id]
             
             self.stop()
-            await self.session.hand_msg.edit(embed=embed, view=view, attachments=([file] if file else []))
+            msg = await interaction.edit_original_response(embed=embed, view=view, attachments=([file] if file else []))
+            try:
+                self.session.hand_msg = await interaction.channel.fetch_message(msg.id)
+            except Exception:
+                self.session.hand_msg = msg
         except Exception as e:
             await interaction.followup.send(f"❌ Error starting next hand: {e}", ephemeral=True)
 
@@ -640,7 +648,7 @@ class AIGameOverView(discord.ui.View):
             color=0x95a5a6
         )
         self.stop()
-        await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
+        await interaction.edit_original_response(embed=embed, view=None, attachments=[])
 
 
 def get_session_view(session: AISession, cog_sessions: dict) -> discord.ui.View | None:
@@ -697,7 +705,10 @@ class PokerAICog(commands.Cog):
             if file:
                 kwargs["file"] = file
             msg = await interaction.followup.send(**kwargs)
-            session.hand_msg = msg
+            try:
+                session.hand_msg = await interaction.channel.fetch_message(msg.id)
+            except Exception:
+                session.hand_msg = msg
             
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to start game: {e}")

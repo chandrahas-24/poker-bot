@@ -175,6 +175,7 @@ async def on_ready():
     await bot.load_extension("poker")
     await bot.load_extension("tutorial_cog")
     # await bot.load_extension("tournament")
+    await bot.load_extension("pokerai")
 
     YOUR_GUILD_ID = config.GUILD_ID
     if YOUR_GUILD_ID:

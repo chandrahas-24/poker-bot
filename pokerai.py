@@ -107,9 +107,13 @@ class AISession:
         self.hand_msg = None
         self.last_activity = time.time()
         self.winnings = None
+        self.eff_stack = 20000
         self.update_state(state)
 
     def update_state(self, state: dict):
+        if self.winnings is None:
+            self.eff_stack = min(self.session_balance, 40000 - self.session_balance)
+
         self.action_history = state.get("action", "")
         self.board = state.get("board", [])
         self.hole_cards = state.get("hole_cards", [])
@@ -117,8 +121,9 @@ class AISession:
         
         new_winnings = state.get("winnings")
         if new_winnings is not None and self.winnings is None:
-            self.session_balance += new_winnings
-            self.total_session_winnings += new_winnings
+            capped_winnings = max(-self.eff_stack, min(self.eff_stack, new_winnings))
+            self.session_balance += capped_winnings
+            self.total_session_winnings += capped_winnings
             
         self.winnings = new_winnings
         self.won_pot = state.get("won_pot")
@@ -133,8 +138,10 @@ class AISession:
     def parse_state(self) -> dict:
         st = 0
         total_pots = 0
-        bets = {0: 100, 1: 50}  # Preflop starts with BB=100, SB=50
-        spent = {0: 100, 1: 50}
+        bb = min(100, self.eff_stack)
+        sb = min(50, self.eff_stack)
+        bets = {0: bb, 1: sb}
+        spent = {0: bb, 1: sb}
         pos = 1  # Player 1 (Dealer/SB) acts first preflop
         
         parts = self.action_history.split('/')
@@ -154,8 +161,9 @@ class AISession:
                 elif c == 'c':
                     max_bet = max(bets[0], bets[1])
                     diff = max_bet - bets[pos]
+                    diff = max(0, min(diff, self.eff_stack - spent[pos]))
                     spent[pos] += diff
-                    bets[pos] = max_bet
+                    bets[pos] += diff
                     pos = 1 - pos
                 elif c == 'f':
                     pos = -1
@@ -164,6 +172,8 @@ class AISession:
                     while i < len(street_actions) and street_actions[i].isdigit():
                         i += 1
                     val = int(street_actions[j:i])
+                    max_allowed = self.eff_stack - (spent[pos] - bets[pos])
+                    val = max(0, min(val, max_allowed))
                     diff = val - bets[pos]
                     spent[pos] += diff
                     bets[pos] = val
@@ -180,15 +190,19 @@ class AISession:
     def get_readable_log(self) -> list[str]:
         log_lines = []
         
+        bb = min(100, self.eff_stack)
+        sb = min(50, self.eff_stack)
+        
         if self.client_pos == 0:
-            log_lines.append(f"👤 You posted big blind (100)")
-            log_lines.append(f"🤖 Skymax posted small blind (50)")
+            log_lines.append(f"👤 You posted big blind ({bb})")
+            log_lines.append(f"🤖 Skymax posted small blind ({sb})")
         else:
-            log_lines.append(f"🤖 Skymax posted big blind (100)")
-            log_lines.append(f"👤 You posted small blind (50)")
+            log_lines.append(f"🤖 Skymax posted big blind ({bb})")
+            log_lines.append(f"👤 You posted small blind ({sb})")
 
         st = 0
-        bets = {0: 100, 1: 50}
+        bets = {0: bb, 1: sb}
+        spent = {0: bb, 1: sb}
         pos = 1
         
         street_names = {1: "FLOP", 2: "TURN", 3: "RIVER"}
@@ -213,8 +227,11 @@ class AISession:
                     pos = 1 - pos
                 elif c == 'c':
                     max_bet = max(bets[0], bets[1])
-                    log_lines.append(f"{actor_emoji} {actor} called ({max_bet})")
-                    bets[pos] = max_bet
+                    diff = max_bet - bets[pos]
+                    diff = max(0, min(diff, self.eff_stack - spent[pos]))
+                    spent[pos] += diff
+                    bets[pos] += diff
+                    log_lines.append(f"{actor_emoji} {actor} called ({bets[pos]})")
                     pos = 1 - pos
                 elif c == 'f':
                     log_lines.append(f"{actor_emoji} {actor} folded ❌")
@@ -224,15 +241,34 @@ class AISession:
                     while i < len(street_actions) and street_actions[i].isdigit():
                         i += 1
                     val = int(street_actions[j:i])
+                    max_allowed = self.eff_stack - (spent[pos] - bets[pos])
+                    val = max(0, min(val, max_allowed))
+                    
                     other_bet = bets[1 - pos]
                     if other_bet == 0:
                         log_lines.append(f"{actor_emoji} {actor} bet {val}")
                     else:
                         log_lines.append(f"{actor_emoji} {actor} raised to {val}")
+                    
+                    diff = val - bets[pos]
+                    spent[pos] += diff
                     bets[pos] = val
                     pos = 1 - pos
                     
         return log_lines
+
+    def check_down_if_needed(self):
+        p = self.parse_state()
+        loop_count = 0
+        while self.winnings is None and p["spent"][0] >= self.eff_stack and p["spent"][1] >= self.eff_stack:
+            loop_count += 1
+            if loop_count > 15:
+                break
+            call_amt = p["bets"][1 - self.client_pos] - p["bets"][self.client_pos]
+            auto_action = "c" if call_amt > 0 else "k"
+            state = SlumbotClient.act(self.token, auto_action)
+            self.update_state(state)
+            p = self.parse_state()
 
 
 # ── DISCORD EMBED BUILDER ─────────────────────────────────────────────────────
@@ -290,6 +326,7 @@ async def build_ai_embed(session: AISession) -> tuple[discord.Embed, discord.Fil
         embed.add_field(name="🃏 Cards Revealed", value=card_text, inline=False)
         
         pot = session.won_pot if session.won_pot is not None else (spent[0] + spent[1])
+        pot = min(pot, 2 * session.eff_stack)
         winnings = session.winnings
         
         result_text = f"**Pot size:** {pot:,} {emoji}\n"
@@ -406,6 +443,7 @@ class AIGameView(discord.ui.View):
         try:
             state = SlumbotClient.act(self.session.token, action)
             self.session.update_state(state)
+            self.session.check_down_if_needed()
             
             embed, file = await build_ai_embed(self.session)
             view = get_session_view(self.session, self.cog_sessions)
@@ -526,12 +564,16 @@ class AIRaisePickerView(discord.ui.View):
         ai_remaining = (40000 - self.session.session_balance) - (spent[1 - c_pos] - bets[1 - c_pos])
         self.max_raise_to = min(player_remaining, ai_remaining)
         
-        self.third_pot = bets[1 - c_pos] + call_pot // 3
-        self.half_pot = bets[1 - c_pos] + call_pot // 2
-        self.pot_size = bets[1 - c_pos] + call_pot
+        self.min_raise_to = min(self.min_raise_to, self.max_raise_to)
+        self.third_pot = max(self.min_raise_to, min(bets[1 - c_pos] + call_pot // 3, self.max_raise_to))
+        self.half_pot = max(self.min_raise_to, min(bets[1 - c_pos] + call_pot // 2, self.max_raise_to))
+        self.pot_size = max(self.min_raise_to, min(bets[1 - c_pos] + call_pot, self.max_raise_to))
 
     async def _do_raise(self, interaction: discord.Interaction, raise_to: int):
-        raise_to = max(self.min_raise_to, min(self.max_raise_to, raise_to))
+        if raise_to >= self.max_raise_to:
+            raise_to = self.max_raise_to
+        else:
+            raise_to = max(self.min_raise_to, raise_to)
         action = f"b{raise_to}"
         await self.game_view._act_and_update(interaction, action)
         self.stop()
@@ -579,12 +621,17 @@ class AICustomRaiseModal(discord.ui.Modal, title="Custom Raise"):
         min_to = self.picker_view.min_raise_to
         max_to = self.picker_view.max_raise_to
         
-        if val < min_to:
-            await interaction.response.send_message(f"❌ Minimum raise-to amount is {min_to:,} chips.", ephemeral=True)
-            return
-        if val > max_to:
-            await interaction.response.send_message(f"❌ Maximum raise-to amount is {max_to:,} chips (your stack).", ephemeral=True)
-            return
+        if min_to > max_to:
+            if val != max_to:
+                await interaction.response.send_message(f"❌ You are short-stacked and can only raise to {max_to:,} chips (All-In).", ephemeral=True)
+                return
+        else:
+            if val < min_to:
+                await interaction.response.send_message(f"❌ Minimum raise-to amount is {min_to:,} chips.", ephemeral=True)
+                return
+            if val > max_to:
+                await interaction.response.send_message(f"❌ Maximum raise-to amount is {max_to:,} chips (your stack).", ephemeral=True)
+                return
             
         await self.picker_view._do_raise(interaction, val)
 
@@ -623,7 +670,9 @@ class AIGameOverView(discord.ui.View):
         try:
             state = SlumbotClient.new_hand(self.session.token)
             self.session.hand_num += 1
+            self.session.winnings = None
             self.session.update_state(state)
+            self.session.check_down_if_needed()
             
             embed, file = await build_ai_embed(self.session)
             view = get_session_view(self.session, self.cog_sessions)
@@ -705,6 +754,7 @@ class PokerAICog(commands.Cog):
             state = SlumbotClient.new_hand(token)
             
             session = AISession(uid, token, state)
+            session.check_down_if_needed()
             self.sessions[uid] = session
             
             embed, file = await build_ai_embed(session)

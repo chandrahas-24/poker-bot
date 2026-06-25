@@ -384,6 +384,48 @@ async def build_ai_embed(session: AISession) -> tuple[discord.Embed, discord.Fil
 
 # ── DISCORD UI VIEWS ──────────────────────────────────────────────────────────
 
+class AIQuitConfirmView(discord.ui.View):
+    def __init__(self, session: AISession, cog_sessions: dict, main_view: discord.ui.View):
+        super().__init__(timeout=60)
+        self.session = session
+        self.cog_sessions = cog_sessions
+        self.main_view = main_view
+
+    @discord.ui.button(label="Yes, Quit", style=discord.ButtonStyle.red)
+    async def btn_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return
+            
+        await interaction.response.defer()
+        
+        if self.session.user_id in self.cog_sessions:
+            del self.cog_sessions[self.session.user_id]
+            
+        embed = discord.Embed(
+            title="🏁 Session Ended",
+            description=f"You retired from the match.\n\n"
+                        f"**Hands played:** {self.session.hand_num}\n"
+                        f"**Net Winnings:** {self.session.total_session_winnings:,} {config.TOURNAMENT_CHIP_EMOJI}\n"
+                        f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
+            color=0x95a5a6
+        )
+        self.main_view.stop()
+        self.stop()
+        
+        try:
+            await self.session.hand_msg.edit(embed=embed, view=None, attachments=[])
+        except Exception:
+            pass
+            
+        await interaction.edit_original_response(content="👋 Session quit successfully.", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def btn_no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_original_response(content="Quit cancelled.", view=None)
+        self.stop()
+
+
 class AIGameView(discord.ui.View):
     def __init__(self, session: AISession, cog_sessions: dict):
         super().__init__(timeout=300)
@@ -524,21 +566,12 @@ class AIGameView(discord.ui.View):
             await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
             return
             
-        await interaction.response.defer()
-        
-        if self.session.user_id in self.cog_sessions:
-            del self.cog_sessions[self.session.user_id]
-            
-        embed = discord.Embed(
-            title="🏁 Session Ended",
-            description=f"You retired from the match.\n\n"
-                        f"**Hands played:** {self.session.hand_num}\n"
-                        f"**Net Winnings:** {self.session.total_session_winnings:,} {config.TOURNAMENT_CHIP_EMOJI}\n"
-                        f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
-            color=0x95a5a6
+        confirm_view = AIQuitConfirmView(self.session, self.cog_sessions, self)
+        await interaction.response.send_message(
+            content="⚠️ **Are you sure you want to quit the poker session?** This will end the match immediately.",
+            view=confirm_view,
+            ephemeral=True
         )
-        self.stop()
-        await interaction.edit_original_response(embed=embed, view=None, attachments=[])
 
 
 # ── RAISE PICKER VIEW ─────────────────────────────────────────────────────────
@@ -696,21 +729,12 @@ class AIGameOverView(discord.ui.View):
             await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
             return
             
-        await interaction.response.defer()
-        
-        if self.session.user_id in self.cog_sessions:
-            del self.cog_sessions[self.session.user_id]
-            
-        embed = discord.Embed(
-            title="🏁 Session Ended",
-            description=f"You retired from the match.\n\n"
-                        f"**Hands played:** {self.session.hand_num}\n"
-                        f"**Net Winnings:** {self.session.total_session_winnings:,} {config.TOURNAMENT_CHIP_EMOJI}\n"
-                        f"**Final Balance:** {self.session.session_balance:,} {config.TOURNAMENT_CHIP_EMOJI}",
-            color=0x95a5a6
+        confirm_view = AIQuitConfirmView(self.session, self.cog_sessions, self)
+        await interaction.response.send_message(
+            content="⚠️ **Are you sure you want to quit the poker session?** This will end the match immediately.",
+            view=confirm_view,
+            ephemeral=True
         )
-        self.stop()
-        await interaction.edit_original_response(embed=embed, view=None, attachments=[])
 
 
 def get_session_view(session: AISession, cog_sessions: dict) -> discord.ui.View | None:

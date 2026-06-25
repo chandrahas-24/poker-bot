@@ -264,8 +264,8 @@ class AISession:
             loop_count += 1
             if loop_count > 15:
                 break
-            call_amt = p["bets"][1 - self.client_pos] - p["bets"][self.client_pos]
-            auto_action = "c" if call_amt > 0 else "k"
+            last_char = self.action_history[-1] if self.action_history else ""
+            auto_action = "c" if last_char.isdigit() else "k"
             state = SlumbotClient.act(self.token, auto_action)
             self.update_state(state)
             p = self.parse_state()
@@ -291,6 +291,8 @@ async def build_ai_embed(session: AISession) -> tuple[discord.Embed, discord.Fil
     title = f"🃏 Heads-Up vs Skymax  ·  Hand #{session.hand_num}"
     embed = discord.Embed(title=title, color=color)
     embed.set_footer(text=f"{label}")
+    if session.winnings is None:
+        embed.description = "💡 *Skymax plays GTO. Use standard sizing (e.g. 2x open-raise, 1/3 to 1/2 pot) to get more action!*"
 
     board_file = None
     if session.board:

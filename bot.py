@@ -176,7 +176,12 @@ async def on_ready():
 
     await bot.load_extension("poker")
     await bot.load_extension("tutorial_cog")
-    await bot.load_extension("eventlog")
+    try:
+        await bot.load_extension("eventlog")
+        print("✅ eventlog loaded")
+    except Exception as e:
+        traceback.print_exc()
+        print(f"❌ eventlog failed: {e}")
     await bot.load_extension("pokerai")
     # await bot.load_extension("highlight")
     # await bot.load_extension("tournament")

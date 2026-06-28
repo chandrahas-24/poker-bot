@@ -111,7 +111,6 @@ class EventLogsCog(commands.Cog):
     eventlog_group = app_commands.Group(
         name="eventlog",
         description="Commands for managing and viewing event logs",
-        default_permissions=discord.Permissions(administrator=True)
     )
 
     @eventlog_group.command(name="sql", description="[Dev] Run a read-only database query on the Event Logs")

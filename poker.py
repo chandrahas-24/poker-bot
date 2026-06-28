@@ -2565,6 +2565,7 @@ class PokerCog(commands.Cog):
             "tutorial.db",
             "tutorial.db-wal",
             "tutorial.db-shm"
+            "eventlog_database.db"
             # "tournament.db",
             # "tournament.db-wal",
             # "tournament.db-shm"

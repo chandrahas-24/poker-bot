@@ -7,6 +7,7 @@ import traceback
 from database import init_db, recover_chips_in_play
 import database as db
 from tutorial_db import init_db as init_tutorial_db
+import eventlog_database
 import tournament_db
 from discord.ext import tasks
 import datetime
@@ -158,6 +159,7 @@ async def daily_inactive_wipe():
 async def on_ready():
     await init_db()
     await init_tutorial_db()
+    await eventlog_database.init_log_db()
     # await tournament_db.init_db()
 
     recovered = await recover_chips_in_play()
@@ -174,8 +176,11 @@ async def on_ready():
 
     await bot.load_extension("poker")
     await bot.load_extension("tutorial_cog")
-    # await bot.load_extension("tournament")
+    await bot.load_extension("eventlog")
     await bot.load_extension("pokerai")
+    # await bot.load_extension("highlight")
+    # await bot.load_extension("tournament")
+
 
     YOUR_GUILD_ID = config.GUILD_ID
     if YOUR_GUILD_ID:

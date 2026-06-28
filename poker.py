@@ -2139,11 +2139,36 @@ class GameView(discord.ui.View):
             f"· 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}  · 1/2 Stack = +{stack_half}",
             view=view, ephemeral=True)
 
-    @discord.ui.button(label="Fold",  style=discord.ButtonStyle.red,    row=1)
+    @discord.ui.button(label="Fold", style=discord.ButtonStyle.red, row=1)
     async def btn_fold(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
-        await self._do_action(interaction, self.t.game.fold, interaction.user.id)
+        uid = interaction.user.id
+        if not self.t.game.is_turn(uid):
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
+            return
+
+        p = self.t.game.get_player(uid)
+
+        # Prevent accidental folds of Flush or higher (only works if Flop is out)
+        if p and p.hole_cards and len(self.t.game.community) >= 3:
+            score = evaluator.evaluate(p.hole_cards, self.t.game.community)
+            rank_class = evaluator.get_rank_class(score)
+
+            # Treys rank classes: 1 (Straight Flush), 2 (Quads), 3 (Full House), 4 (Flush)
+            if rank_class <= 4:
+                rank_name = evaluator.class_to_string(rank_class)
+
+                # Pass `self` so the confirm view can access `_do_action`
+                view = FoldConfirmView(self)
+
+                await interaction.response.send_message(
+                    f"⚠️ **Are you sure you want to fold?**\nYou currently have a **{rank_name}**!",
+                    view=view,
+                    ephemeral=True
+                )
+                return
+
+        # If they don't have a monster hand (or it's pre-flop), fold normally
+        await self._do_action(interaction, self.t.game.fold, uid)
 
     @discord.ui.button(label="My Cards", style=discord.ButtonStyle.grey, row=2)
     async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2404,6 +2429,37 @@ class CosmeticsView(discord.ui.View):
             except (discord.NotFound, discord.HTTPException):
                 pass
 
+
+class FoldConfirmView(discord.ui.View):
+    """Ephemeral prompt shown when a player tries to fold a Flush or better."""
+
+    def __init__(self, parent_view):
+        super().__init__(timeout=30)
+        self.parent_view = parent_view
+        self.t = parent_view.t
+
+    @discord.ui.button(label="Yes, Fold Anyway", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if not self.t.game.is_turn(uid):
+            await interaction.response.edit_message(content="❌ It is no longer your turn.", view=None)
+            self.stop()
+            return
+
+        await self.parent_view._do_action(interaction, self.t.game.fold, uid)
+
+        # Clean up the ephemeral prompt so it doesn't just sit there
+        try:
+            await interaction.edit_original_response(content="✅ You folded your hand.", view=None)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="❌ Fold cancelled.", view=None)
+        self.stop()
 
 # ── Autocomplete helpers for /poker equiptitle and /poker equipwinmsg ─────────
 

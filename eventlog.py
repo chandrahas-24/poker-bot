@@ -102,17 +102,17 @@ class RawSQLPaginationView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.format_page(), view=self)
 
+eventlog_group = app_commands.Group(
+        name="eventlog",
+        description="Commands for managing and viewing event logs",
+        default_permissions=discord.Permissions(administrator=True)
+    )
+
 
 class EventLogsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.processing_logs = set()
-
-    eventlog_group = app_commands.Group(
-        name="eventlog",
-        description="Commands for managing and viewing event logs",
-        default_permissions=discord.Permissions(administrator=True)
-    )
 
     @eventlog_group.command(name="sql", description="[Dev] Run a read-only database query on the Event Logs")
     @app_commands.describe(query="The SELECT query to run")
@@ -209,8 +209,6 @@ class EventLogsCog(commands.Cog):
             return
 
         emoji_name = str(payload.emoji.name).lower()
-        if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name != "✅":
-            return
 
         if payload.message_id in self.processing_logs:
             return
@@ -278,4 +276,5 @@ class EventLogsCog(commands.Cog):
 
 
 async def setup(bot):
+    bot.tree.add_command(eventlog_group)
     await bot.add_cog(EventLogsCog(bot))

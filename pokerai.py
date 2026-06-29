@@ -751,7 +751,11 @@ def get_session_view(session: AISession, cog_sessions: dict) -> discord.ui.View 
 class PokerAICog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.sessions: dict[int, AISession] = {}
+        if hasattr(bot, "poker_ai_sessions"):
+            self.sessions = bot.poker_ai_sessions
+        else:
+            self.sessions = {}
+            bot.poker_ai_sessions = self.sessions
 
     advtut = app_commands.Group(name="advtut", description="Poker Heads-Up vs Skymax")
 

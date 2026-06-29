@@ -1404,4 +1404,9 @@ class TutorialCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
+    global tutorial_sessions
+    if hasattr(bot, "tutorial_sessions"):
+        tutorial_sessions = bot.tutorial_sessions
+    else:
+        bot.tutorial_sessions = tutorial_sessions
     await bot.add_cog(TutorialCog(bot))

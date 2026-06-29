@@ -4832,4 +4832,9 @@ class RawSQLPaginationView(discord.ui.View):
         await interaction.response.edit_message(embed=self.format_page(), view=self)
 
 async def setup(bot):
+    global tables
+    if hasattr(bot, "poker_tables"):
+        tables = bot.poker_tables
+    else:
+        bot.poker_tables = tables
     await bot.add_cog(PokerCog(bot))

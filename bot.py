@@ -439,6 +439,107 @@ async def restart(ctx):
         await ctx.send(f"**Deployment Failed:**\n```python\n{e}\n```")
 
 
+@bot.command(aliases=["hotreload"])
+async def reload(ctx, cog_name: str = None):
+    global AUTHORIZED_ADMINS
+    if ctx.author.id not in AUTHORIZED_ADMINS:
+        await ctx.send("**Access Denied.** This command is restricted.")
+        return
+
+    await ctx.send("**Initiating Code Hot-Reload...**")
+
+    # 1. Run git pull inside the repository root
+    try:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        pull_output = subprocess.check_output(["git", "pull"], cwd=repo_dir).decode("utf-8")
+        await ctx.send(f"**Git Pull Success:**\n```\n{pull_output}\n```")
+    except Exception as e:
+        await ctx.send(f"⚠️ **Git Pull failed (continuing reload anyway):**\n```python\n{e}\n```")
+
+    import sys
+    import importlib
+
+    cog_name_lower = cog_name.lower() if cog_name else None
+    helpers_to_reload = []
+    cogs_to_reload = []
+
+    # Map target cog/helpers to reload
+    if cog_name_lower == "poker":
+        helpers_to_reload = ["config", "database", "engine", "card_images", "jackpot", "taxation"]
+        cogs_to_reload = ["poker"]
+    elif cog_name_lower == "eventlog":
+        helpers_to_reload = ["config", "eventlog_database"]
+        cogs_to_reload = ["eventlog"]
+    elif cog_name_lower in ("tutorial", "tutorial_cog"):
+        helpers_to_reload = ["config", "tutorial_db"]
+        cogs_to_reload = ["tutorial_cog"]
+    elif cog_name_lower in ("ai", "pokerai"):
+        helpers_to_reload = ["config"]
+        cogs_to_reload = ["pokerai"]
+    elif cog_name_lower is None:
+        helpers_to_reload = ["config", "database", "engine", "card_images", "jackpot", "taxation", "eventlog_database", "tournament_db", "tutorial_db"]
+        cogs_to_reload = ["poker", "eventlog", "tutorial_cog", "pokerai"]
+    else:
+        # Check if it is a loaded extension
+        ext_name = cog_name if cog_name in bot.extensions else (f"cogs.{cog_name}" if f"cogs.{cog_name}" in bot.extensions else None)
+        if ext_name:
+            cogs_to_reload = [cog_name]
+        else:
+            await ctx.send(f"❌ Unknown cog/extension `{cog_name}`.")
+            return
+
+    # 2. Close database connections for helpers being reloaded to prevent locks/leaks
+    dbs_to_close = [h for h in helpers_to_reload if h in ("database", "tournament_db", "tutorial_db")]
+    closed_dbs = []
+    for db_name in dbs_to_close:
+        if db_name in sys.modules:
+            db_mod = sys.modules[db_name]
+            if getattr(db_mod, "_db", None) is not None:
+                try:
+                    await db_mod._db.close()
+                    db_mod._db = None
+                    closed_dbs.append(db_name)
+                except Exception as e:
+                    await ctx.send(f"⚠️ Failed to close database connection for `{db_name}`:\n```python\n{e}\n```")
+
+    # 3. Reload helper modules
+    reloaded_helpers = []
+    for helper in helpers_to_reload:
+        if helper in sys.modules:
+            try:
+                importlib.reload(sys.modules[helper])
+                reloaded_helpers.append(helper)
+            except Exception as e:
+                await ctx.send(f"❌ Failed to reload helper `{helper}`:\n```python\n{e}\n```")
+                return
+
+    # 4. Reload cogs
+    reloaded_cogs = []
+    for cog in cogs_to_reload:
+        ext_name = cog if cog in bot.extensions else (f"cogs.{cog}" if f"cogs.{cog}" in bot.extensions else None)
+        if ext_name:
+            try:
+                await bot.reload_extension(ext_name)
+                reloaded_cogs.append(cog)
+            except Exception as e:
+                await ctx.send(f"❌ Failed to reload cog `{cog}`:\n```python\n{e}\n```")
+                return
+
+    # 5. Reassign global/static config dependencies in bot.py if config was reloaded
+    if "config" in reloaded_helpers:
+        AUTHORIZED_ADMINS = config.DEV_USER_IDS
+
+    # 6. Report success
+    msg = "✅ **Hot-Reload Complete!**\n"
+    if closed_dbs:
+        msg += f"**Closed DB Connections:** {', '.join(closed_dbs)}\n"
+    if reloaded_helpers:
+        msg += f"**Reloaded Helpers:** {', '.join(reloaded_helpers)}\n"
+    if reloaded_cogs:
+        msg += f"**Reloaded Cogs:** {', '.join(reloaded_cogs)}\n"
+    await ctx.send(msg)
+
+
 async def global_channel_restriction(interaction: discord.Interaction) -> bool:
     if not interaction.command:
         return True

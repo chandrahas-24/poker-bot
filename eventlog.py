@@ -265,8 +265,8 @@ class EventLogsCog(commands.Cog):
                 event_prize_msg=prize
             )
 
-            if success:
-                await message.add_reaction("💾")
+            #if success:
+            #    await message.add_reaction("💾")
 
         except Exception:
             traceback.print_exc()

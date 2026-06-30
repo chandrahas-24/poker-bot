@@ -68,8 +68,18 @@ RANKINGS_POPUP = (
 
 STREET_ADVANCE_KWS = ("🌊", "↩️", "🏁", "Showdown", "🏆")
 
-# Active tutorial sessions: {user_id: TutorialSession}
-tutorial_sessions: dict[int, "TutorialSession"] = {}
+import sys
+bot_instance = None
+for mod_name in ('__main__', 'bot'):
+    mod = sys.modules.get(mod_name)
+    if mod and hasattr(mod, 'bot'):
+        bot_instance = mod.bot
+        break
+
+if bot_instance and hasattr(bot_instance, 'tutorial_sessions'):
+    tutorial_sessions = bot_instance.tutorial_sessions
+else:
+    tutorial_sessions = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1404,9 +1414,6 @@ class TutorialCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    global tutorial_sessions
-    if hasattr(bot, "tutorial_sessions"):
-        tutorial_sessions = bot.tutorial_sessions
-    else:
+    if not hasattr(bot, "tutorial_sessions"):
         bot.tutorial_sessions = tutorial_sessions
     await bot.add_cog(TutorialCog(bot))

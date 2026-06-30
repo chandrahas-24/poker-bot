@@ -16,6 +16,7 @@ import config
 import jackpot
 import taxation
 from tutorial_cog import TutorialCog
+import sys
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -74,7 +75,21 @@ class TableState:
         if hasattr(self, "game") and self.game:
             self.game.is_tournament = val
 
-tables: dict[tuple, TableState] = {}
+_old_poker = sys.modules.get('poker')
+if _old_poker and hasattr(_old_poker, 'TableState'):
+    TableState = _old_poker.TableState
+
+bot_instance = None
+for mod_name in ('__main__', 'bot'):
+    mod = sys.modules.get(mod_name)
+    if mod and hasattr(mod, 'bot'):
+        bot_instance = mod.bot
+        break
+
+if bot_instance and hasattr(bot_instance, 'poker_tables'):
+    tables = bot_instance.poker_tables
+else:
+    tables = {}
 
 def get_table(key: tuple) -> TableState | None:
     return tables.get(key)
@@ -1680,6 +1695,19 @@ class RaisePickerView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.t = t; self.channel = channel; self.guild = guild
 
+        g = t.game
+        cp = g.current_player()
+        if cp:
+            call_amt = g.call_amount(cp)
+            min_raise_amt = g.last_raise_size if g.last_raise_size > 0 else g.BIG_BLIND
+            pot_third = max(call_amt, g.pot // 3)
+            pot_half = max(call_amt, g.pot // 2)
+
+            self.btn_min_raise.label = f"Min +{min_raise_amt}"
+            self.btn_third_pot.label = f"1/3 Pot +{pot_third}"
+            self.btn_half_pot.label = f"1/2 Pot +{pot_half}"
+            self.btn_all_in.label = f"All In"
+
     async def _do_raise(self, interaction: discord.Interaction, raise_amount: int):
         await interaction.response.defer()
         uid = interaction.user.id
@@ -1699,8 +1727,19 @@ class RaisePickerView(discord.ui.View):
         else:
             await refresh(self.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
 
+    @discord.ui.button(label="Min", style=discord.ButtonStyle.green, row=0)
+    async def btn_min_raise(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.t.game.is_turn(interaction.user.id):
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
+            return
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
+        min_raise_amt = g.last_raise_size if g.last_raise_size > 0 else g.BIG_BLIND
+        await self._do_raise(interaction, min_raise_amt)
+
     @discord.ui.button(label="1/3 Pot", style=discord.ButtonStyle.green, row=0)
-    async def third_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_third_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
             return
@@ -1711,7 +1750,7 @@ class RaisePickerView(discord.ui.View):
         await self._do_raise(interaction, amount)
 
     @discord.ui.button(label="1/2 Pot", style=discord.ButtonStyle.green, row=0)
-    async def half_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_half_pot(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
             return
@@ -1721,19 +1760,8 @@ class RaisePickerView(discord.ui.View):
         amount = max(g.call_amount(p), g.pot // 2)
         await self._do_raise(interaction, amount)
 
-    @discord.ui.button(label="1/2 Stack", style=discord.ButtonStyle.blurple, row=0)
-    async def half_stack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.t.game.is_turn(interaction.user.id):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
-            return
-        g = self.t.game
-        p = g.get_player(interaction.user.id)
-        if not p: await interaction.response.send_message("❌ Not your turn.", ephemeral=True); return
-        amount = max(g.call_amount(p), p.chips // 2)
-        await self._do_raise(interaction, amount)
-
     @discord.ui.button(label="All In 🚀", style=discord.ButtonStyle.red, row=0)
-    async def all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
             return
@@ -2131,12 +2159,12 @@ class GameView(discord.ui.View):
         g = self.t.game
         p = g.get_player(interaction.user.id)
         call_amt = g.call_amount(p) if p else 0
+        min_raise_amt = g.last_raise_size if g.last_raise_size > 0 else g.BIG_BLIND
         pot_third = max(call_amt, g.pot // 3) if p else 0
         pot_half = max(call_amt, g.pot // 2) if p else 0
-        stack_half = max(call_amt, p.chips // 2) if p else 0
         await interaction.followup.send(
             f"**Raise options** — Pot: {g.pot} {get_chip_emoji(self.t)}  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
-            f"· 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}  · 1/2 Stack = +{stack_half}",
+            f"· Min Raise = +{min_raise_amt}  · 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}",
             view=view, ephemeral=True)
 
     @discord.ui.button(label="Fold", style=discord.ButtonStyle.red, row=1)
@@ -4831,10 +4859,38 @@ class RawSQLPaginationView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.format_page(), view=self)
 
+async def _migrate_active_tables(bot):
+    await asyncio.sleep(1)
+    for key, t in list(tables.items()):
+        guild_id, channel_id = key
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception:
+                continue
+
+        # 1. Active hand migration
+        if t.game.street not in (Street.WAITING, Street.SHOWDOWN):
+            try:
+                if t.timer_task and not t.timer_task.done():
+                    t.timer_task.cancel()
+                    t.timer_task = None
+                await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+            except Exception as e:
+                print(f"Error migrating active table {t.id}: {e}")
+
+        # 2. Between hands migration
+        elif t.between_msg:
+            try:
+                if t.auto_task and not t.auto_task.done():
+                    t.auto_task.cancel()
+                schedule_next_hand(t, channel)
+            except Exception as e:
+                print(f"Error migrating between-hand table {t.id}: {e}")
+
 async def setup(bot):
-    global tables
-    if hasattr(bot, "poker_tables"):
-        tables = bot.poker_tables
-    else:
+    if not hasattr(bot, "poker_tables"):
         bot.poker_tables = tables
+    asyncio.create_task(_migrate_active_tables(bot))
     await bot.add_cog(PokerCog(bot))

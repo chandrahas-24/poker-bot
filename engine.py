@@ -4,7 +4,7 @@ from typing import Optional
 from enum import Enum, auto
 from math import ceil
 import random
-
+import sys
 import config
 import taxation
 
@@ -19,13 +19,17 @@ def card_str(card: int) -> str:
 def hand_str(cards: list[int]) -> str:
     return "  ".join(card_str(c) for c in cards)
 
-class Street(Enum):
-    WAITING  = auto()
-    PREFLOP  = auto()
-    FLOP     = auto()
-    TURN     = auto()
-    RIVER    = auto()
-    SHOWDOWN = auto()
+_old_engine = sys.modules.get('engine')
+if _old_engine and hasattr(_old_engine, 'Street'):
+    Street = _old_engine.Street
+else:
+    class Street(Enum):
+        WAITING  = auto()
+        PREFLOP  = auto()
+        FLOP     = auto()
+        TURN     = auto()
+        RIVER    = auto()
+        SHOWDOWN = auto()
 
 @dataclass
 class PokerPlayer:

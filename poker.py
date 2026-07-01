@@ -1150,7 +1150,7 @@ class PreferencesView(discord.ui.View):
                     "components": [
                         {
                             "type": 10,
-                            "content": "**Confirm Fold**\nConfigure warning prompt before folding. X is pot size. ALWAYS confirm if > flush"
+                            "content": "**Confirm Fold**\nConfigure warning prompt before folding. X is pot size. \nWill confirm if you have flush+ regardless of what u set."
                         }
                     ],
                     "accessory": button_to_dict(self.btn_confirm_fold)

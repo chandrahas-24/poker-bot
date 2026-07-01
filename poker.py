@@ -772,6 +772,510 @@ async def send_turn_ping(channel, t: TableState):
     t.ping_user_id = cp.user_id
     t.ping_msg = await channel.send(expected_content)
 
+# ── Action & Execution Helpers ────────────────────────────────────────────────
+
+async def run_table_action(guild: discord.Guild, channel, t: TableState, interaction: discord.Interaction, fn, *args):
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+    
+    uid = interaction.user.id
+    ok, msg = fn(*args)
+    if not ok:
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+        
+    parts = msg.split("\n")
+    street_markers = ["🌊", "↩️", "🏁"]
+    if any(m in msg for m in street_markers + ["Showdown"]):
+        slog_clear(t)
+        
+    for part in parts:
+        if part.strip():
+            slog(t, part)
+            
+    if t.game._hand_result:
+        await _process_result(guild, channel, t)
+    else:
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+
+class ActionConfirmView(discord.ui.View):
+    def __init__(self, t: TableState, channel, guild, user_id: int, action_fn, action_args: list, prompt_text: str):
+        super().__init__(timeout=30)
+        self.t = t
+        self.channel = channel
+        self.guild = guild
+        self.user_id = user_id
+        self.action_fn = action_fn
+        self.action_args = action_args
+        self.prompt_text = prompt_text
+
+    @discord.ui.button(label="Yes, Proceed", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This confirmation is not for you.", ephemeral=True)
+            return
+        
+        await run_table_action(self.guild, self.channel, self.t, interaction, self.action_fn, *self.action_args)
+        try:
+            await interaction.edit_original_response(content="✅ Action confirmed.", view=None)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This confirmation is not for you.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="❌ Action cancelled.", view=None)
+        self.stop()
+
+async def leave_table_execute(guild: discord.Guild, channel, t: TableState, interaction: discord.Interaction):
+    if t.closing:
+        return "❌ Table is closing anyway."
+        
+    chips_back, msg = t.game.remove_player(interaction.user.id)
+    
+    if t.is_tournament:
+        import tournament_db as tdb
+        if chips_back > 0:
+            await tdb.return_chips(interaction.user.id, chips_back)
+        await tdb.clear_chips_in_play(interaction.user.id)
+    else:
+        if chips_back > 0:
+            await db.return_chips(interaction.user.id, chips_back)
+        await db.clear_chips_in_play(interaction.user.id)
+        
+    if "will leave" in msg:
+        t.leave_cooldown_pending.add(interaction.user.id)
+        await channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
+    elif "left" in msg or "cashed out" in msg:
+        cooldown = config.TOURNAMENT_REJOIN_COOLDOWN if getattr(t, 'is_tournament', False) else config.REGULAR_REJOIN_COOLDOWN
+        t.rejoin_cooldowns[interaction.user.id] = time.time() + cooldown
+        await channel.send(
+            f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
+            
+    await refresh(channel, t)
+    return "✅ You left the table."
+
+async def join_table_execute(interaction: discord.Interaction, t: TableState, chips: int, bal: int, rejoin_fee: int, min_w: int, max_w: int, is_deferred: bool = False):
+    if not is_deferred:
+        await interaction.response.defer(ephemeral=True)
+
+    await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
+
+    if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
+        await interaction.followup.send("❌ You are banned from this table.", ephemeral=True)
+        return
+
+    # Deduct rejoin fee first
+    if rejoin_fee > 0:
+        ok_fee = await db.deduct_chips(interaction.user.id, rejoin_fee)
+        if not ok_fee:
+            await interaction.followup.send("❌ Failed to deduct rejoin fee.", ephemeral=True)
+            return
+        t.rejoin_cooldowns.pop(interaction.user.id, None)
+
+        try:
+            await db.adjust_jackpot(rejoin_fee)
+            await db.log_currency_event(interaction.user.id, "Jackpot", -rejoin_fee, "Paid rejoin bypass fee")
+        except Exception as e:
+            print(f"🚨 [ERROR] {e}")
+
+        await interaction.channel.send(
+            f"🎰 **{interaction.user.display_name}** paid **{rejoin_fee}** {get_chip_emoji(t)} directly to the **Jackpot** to bypass the rejoin cooldown!")
+
+    ok = await db.deduct_chips(interaction.user.id, chips)
+    if not ok:
+        if rejoin_fee > 0:
+            await db.return_chips(interaction.user.id, rejoin_fee)
+        await interaction.followup.send(f"❌ Failed to deduct chips.", ephemeral=True)
+        return
+
+    await db.mark_chips_in_play(interaction.user.id, interaction.user.name, chips)
+
+    msg = t.game.add_player(interaction.user.id, interaction.user.name, chips)
+    if msg.startswith("❌"):
+        await db.return_chips(interaction.user.id, chips)
+        if rejoin_fee > 0:
+            await db.return_chips(interaction.user.id, rejoin_fee)
+        await db.clear_chips_in_play(interaction.user.id)
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    await interaction.channel.send(f"✅ **{interaction.user.display_name}** joined the table with **{chips}** {get_chip_emoji(t)}!")
+    await refresh(interaction.channel, t)
+    await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
+
+class PreferencesModal(discord.ui.Modal):
+    def __init__(self, user_id: int, pref_key: str, title: str, view):
+        super().__init__(title=title)
+        self.user_id = user_id
+        self.pref_key = pref_key
+        self.view = view
+
+        label_str = "Enter Amount"
+        placeholder_str = "e.g. 1000"
+
+        if pref_key == "default_buyin_amount":
+            label_str = "Default Stack (in BBs or 'max')"
+            placeholder_str = "e.g. 100, 100BB, or max"
+        elif pref_key == "auto_rebuy_amount":
+            label_str = "Auto Rebuy Amount"
+            placeholder_str = "e.g. 1000"
+        elif pref_key.endswith("_threshold"):
+            label_str = "Enter Threshold Amount"
+            placeholder_str = "e.g. 500"
+
+        self.value_input = discord.ui.TextInput(
+            label=label_str,
+            placeholder=placeholder_str,
+            min_length=1,
+            max_length=15
+        )
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        input_str = self.value_input.value.strip().lower()
+        if self.pref_key == "default_buyin_amount" and input_str in ["max", "full", "wallet", "all"]:
+            val = -1
+        else:
+            raw_val = input_str.replace("bb", "").strip()
+            val = parse_chips(raw_val)
+            if val is None or val < 0:
+                await interaction.response.send_message("❌ Enter a valid number greater than or equal to 0, or 'max'.", ephemeral=True)
+                return
+
+        if self.pref_key.endswith("_threshold"):
+            mode_key = self.pref_key.replace("_threshold", "_mode")
+            await db.set_player_preference(self.user_id, **{mode_key: "threshold", self.pref_key: val})
+        else:
+            await db.set_player_preference(self.user_id, **{self.pref_key: val})
+
+        await self.view.refresh_preferences(interaction)
+
+def button_to_dict(btn: discord.ui.Button) -> dict:
+    return {
+        "type": 2,
+        "style": btn.style.value,
+        "label": btn.label,
+        "custom_id": btn.custom_id
+    }
+
+class PreferencesView(discord.ui.View):
+    def __init__(self, user: discord.User | discord.Member):
+        super().__init__(timeout=120)
+        self.user = user
+        self.user_id = user.id
+        self.pref = {}
+
+        # Instantiate buttons with custom_ids and callbacks
+        self.btn_auto_rebuy = discord.ui.Button(custom_id="pref_auto_rebuy")
+        self.btn_auto_rebuy.callback = self.toggle_auto_rebuy
+
+        self.btn_auto_showdown = discord.ui.Button(custom_id="pref_auto_showdown")
+        self.btn_auto_showdown.callback = self.toggle_auto_showdown
+
+        self.btn_default_buyin = discord.ui.Button(custom_id="pref_default_buyin")
+        self.btn_default_buyin.callback = self.toggle_default_buyin
+
+        self.btn_confirm_all_in = discord.ui.Button(custom_id="pref_confirm_all_in")
+        self.btn_confirm_all_in.callback = self.on_confirm_all_in_click
+
+        self.btn_confirm_fold = discord.ui.Button(custom_id="pref_confirm_fold")
+        self.btn_confirm_fold.callback = self.on_confirm_fold_click
+
+        self.btn_confirm_leave = discord.ui.Button(custom_id="pref_confirm_leave")
+        self.btn_confirm_leave.callback = self.toggle_confirm_leave
+
+        self.btn_confirm_call_raise = discord.ui.Button(custom_id="pref_confirm_call_raise")
+        self.btn_confirm_call_raise.callback = self.on_confirm_call_raise_click
+
+        # Add items so they are registered in ViewStore for dispatching
+        self.add_item(self.btn_auto_rebuy)
+        self.add_item(self.btn_auto_showdown)
+        self.add_item(self.btn_default_buyin)
+        self.add_item(self.btn_confirm_all_in)
+        self.add_item(self.btn_confirm_fold)
+        self.add_item(self.btn_confirm_leave)
+        self.add_item(self.btn_confirm_call_raise)
+
+    def has_components_v2(self) -> bool:
+        return True
+
+    async def init_data(self):
+        self.pref = await db.get_player_preference(self.user_id)
+        self.update_button_states()
+
+    def update_button_states(self):
+        # Auto Rebuy
+        arb_val = self.pref.get("auto_rebuy_amount", 0)
+        self.btn_auto_rebuy.label = "Off" if arb_val == 0 else f"{arb_val:,}"
+        self.btn_auto_rebuy.style = discord.ButtonStyle.red if arb_val == 0 else discord.ButtonStyle.green
+
+        # Auto Showdown
+        asd_val = self.pref.get("auto_showdown", "prompt")
+        self.btn_auto_showdown.label = asd_val.title()
+        if asd_val == "show":
+            self.btn_auto_showdown.style = discord.ButtonStyle.green
+        elif asd_val == "muck":
+            self.btn_auto_showdown.style = discord.ButtonStyle.red
+        else:
+            self.btn_auto_showdown.style = discord.ButtonStyle.grey
+
+        # Default Join Stack
+        dbi_val = self.pref.get("default_buyin_amount", 0)
+        if dbi_val == -1:
+            self.btn_default_buyin.label = "Max Stack"
+            self.btn_default_buyin.style = discord.ButtonStyle.green
+        else:
+            self.btn_default_buyin.label = "Off" if dbi_val == 0 else f"{dbi_val:,} BB"
+            self.btn_default_buyin.style = discord.ButtonStyle.red if dbi_val == 0 else discord.ButtonStyle.green
+
+        # Confirm All-In
+        cai_mode = self.pref.get("confirm_all_in_mode", "always")
+        cai_thresh = self.pref.get("confirm_all_in_threshold", 0)
+        if cai_mode == "always":
+            self.btn_confirm_all_in.label = "Always"
+            self.btn_confirm_all_in.style = discord.ButtonStyle.green
+        elif cai_mode == "never":
+            self.btn_confirm_all_in.label = "Never"
+            self.btn_confirm_all_in.style = discord.ButtonStyle.red
+        else:
+            self.btn_confirm_all_in.label = f"> {cai_thresh:,}"
+            self.btn_confirm_all_in.style = discord.ButtonStyle.blurple
+
+        # Confirm Fold
+        cf_mode = self.pref.get("confirm_fold_mode", "always")
+        cf_thresh = self.pref.get("confirm_fold_threshold", 0)
+        if cf_mode == "always":
+            self.btn_confirm_fold.label = "Always"
+            self.btn_confirm_fold.style = discord.ButtonStyle.green
+        elif cf_mode == "never":
+            self.btn_confirm_fold.label = "Never"
+            self.btn_confirm_fold.style = discord.ButtonStyle.red
+        else:
+            self.btn_confirm_fold.label = f"> {cf_thresh:,}"
+            self.btn_confirm_fold.style = discord.ButtonStyle.blurple
+
+        # Confirm Leave
+        cl_val = self.pref.get("confirm_leave", 1)
+        self.btn_confirm_leave.label = "Always" if cl_val == 1 else "Never"
+        self.btn_confirm_leave.style = discord.ButtonStyle.green if cl_val == 1 else discord.ButtonStyle.red
+
+        # Confirm Call/Raise
+        ccr_mode = self.pref.get("confirm_call_raise_mode", "always")
+        ccr_thresh = self.pref.get("confirm_call_raise_threshold", 0)
+        if ccr_mode == "always":
+            self.btn_confirm_call_raise.label = "Always"
+            self.btn_confirm_call_raise.style = discord.ButtonStyle.green
+        elif ccr_mode == "never":
+            self.btn_confirm_call_raise.label = "Never"
+            self.btn_confirm_call_raise.style = discord.ButtonStyle.red
+        else:
+            self.btn_confirm_call_raise.label = f"> {ccr_thresh:,}"
+            self.btn_confirm_call_raise.style = discord.ButtonStyle.blurple
+
+    def to_components(self) -> list[dict]:
+        self.update_button_states()
+
+        container = {
+            "type": 17,
+            "accent_color": 0x36393F,
+            "components": [
+                # Title Text Display
+                {
+                    "type": 10,
+                    "content": "# Preferences\nConfigure your personal poker settings below."
+                },
+                # Separator
+                {
+                    "type": 14,
+                    "divider": True,
+                    "spacing": 1
+                },
+                # Section 1: Auto Rebuy
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Auto Rebuy**\nAutomatically top-up your stack between hands when you fall below the big blind."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_auto_rebuy)
+                },
+                # Section 2: Auto Showdown
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Auto Showdown**\nChoose whether to prompt, show, or muck your cards automatically at showdown."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_auto_showdown)
+                },
+                # Section 3: Default Buy-In
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Default Buy-In**\nSkip the join modal when entering a table by configuring a default stack size."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_default_buyin)
+                },
+                # Separator
+                {
+                    "type": 14,
+                    "divider": True,
+                    "spacing": 1
+                },
+                # Section 4: Confirm All-In
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Confirm All-In**\nConfigure warning prompt before executing an All-In action."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_confirm_all_in)
+                },
+                # Section 5: Confirm Fold
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Confirm Fold**\nConfigure warning prompt before folding. X is pot size. ALWAYS confirm if > flush"
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_confirm_fold)
+                },
+                # Section 6: Confirm Leave
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Confirm Leave**\nConfigure warning prompt before leaving a table."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_confirm_leave)
+                },
+                # Section 7: Confirm Call/Raise
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Confirm Call/Raise**\nConfigure warning prompt when calling or raising exceeds X chips."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_confirm_call_raise)
+                }
+            ]
+        }
+        return [container]
+
+    async def toggle_auto_rebuy(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        val = self.pref.get("auto_rebuy_amount", 0)
+        if val > 0:
+            await db.set_player_preference(self.user_id, auto_rebuy_amount=0)
+            await self.refresh_preferences(interaction)
+        else:
+            modal = PreferencesModal(self.user_id, "auto_rebuy_amount", "Auto Rebuy Amount", self)
+            await interaction.response.send_modal(modal)
+
+    async def toggle_auto_showdown(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        curr = self.pref.get("auto_showdown", "prompt")
+        modes = ["prompt", "show", "muck"]
+        nxt = modes[(modes.index(curr) + 1) % len(modes)]
+        await db.set_player_preference(self.user_id, auto_showdown=nxt)
+        await self.refresh_preferences(interaction)
+
+    async def toggle_default_buyin(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        val = self.pref.get("default_buyin_amount", 0)
+        if val > 0:
+            await db.set_player_preference(self.user_id, default_buyin_amount=0)
+            await self.refresh_preferences(interaction)
+        else:
+            modal = PreferencesModal(self.user_id, "default_buyin_amount", "Default Join Stack", self)
+            await interaction.response.send_modal(modal)
+
+    async def on_confirm_all_in_click(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        mode = self.pref.get("confirm_all_in_mode", "always")
+        if mode == "always":
+            await db.set_player_preference(self.user_id, confirm_all_in_mode="never")
+            await self.refresh_preferences(interaction)
+        elif mode == "never":
+            modal = PreferencesModal(self.user_id, "confirm_all_in_threshold", "Set All-In Threshold", self)
+            await interaction.response.send_modal(modal)
+        else:
+            await db.set_player_preference(self.user_id, confirm_all_in_mode="always")
+            await self.refresh_preferences(interaction)
+
+    async def on_confirm_fold_click(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        mode = self.pref.get("confirm_fold_mode", "always")
+        if mode == "always":
+            await db.set_player_preference(self.user_id, confirm_fold_mode="never")
+            await self.refresh_preferences(interaction)
+        elif mode == "never":
+            modal = PreferencesModal(self.user_id, "confirm_fold_threshold", "Set Fold Threshold", self)
+            await interaction.response.send_modal(modal)
+        else:
+            await db.set_player_preference(self.user_id, confirm_fold_mode="always")
+            await self.refresh_preferences(interaction)
+
+    async def toggle_confirm_leave(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        val = self.pref.get("confirm_leave", 1)
+        new_val = 0 if val == 1 else 1
+        await db.set_player_preference(self.user_id, confirm_leave=new_val)
+        await self.refresh_preferences(interaction)
+
+    async def on_confirm_call_raise_click(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        mode = self.pref.get("confirm_call_raise_mode", "always")
+        if mode == "always":
+            await db.set_player_preference(self.user_id, confirm_call_raise_mode="never")
+            await self.refresh_preferences(interaction)
+        elif mode == "never":
+            modal = PreferencesModal(self.user_id, "confirm_call_raise_threshold", "Set Call/Raise Threshold", self)
+            await interaction.response.send_modal(modal)
+        else:
+            await db.set_player_preference(self.user_id, confirm_call_raise_mode="always")
+            await self.refresh_preferences(interaction)
+
+    async def refresh_preferences(self, interaction: discord.Interaction):
+        self.pref = await db.get_player_preference(self.user_id)
+        if interaction.response.is_done():
+            await interaction.followup.edit_message(message_id="@original", view=self)
+        else:
+            await interaction.response.edit_message(view=self)
+
 # ── Refresh ───────────────────────────────────────────────────────────────────
 
 async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cache: dict = None):
@@ -1350,6 +1854,19 @@ async def _reveal_phase(channel, t: TableState, result):
     if not result.pot_results:
         winner = result.winners[0] if result.winners else None
         if winner and winner.hole_cards:
+            pref = await db.get_player_preference(winner.user_id)
+            auto_action = pref.get("auto_showdown", "prompt")
+            if auto_action == "muck":
+                return
+            elif auto_action == "show":
+                caption = f"👁️ **{winner.display_name}** shows: {hand_str(winner.hole_cards)}"
+                if USE_IMAGES:
+                    file = await asyncio.to_thread(card_images.make_strip, winner.hole_cards, 0, False, winner.egirl_saro)
+                    await channel.send(caption, file=file)
+                else:
+                    await channel.send(caption)
+                return
+
             deadline = int(time.time()) + timeout
             view = ShowdownRevealView(t, result, [winner.user_id], timeout=timeout)
             msg = await channel.send(
@@ -1387,8 +1904,31 @@ async def _reveal_phase(channel, t: TableState, result):
     if not candidates:
         return  # Chop pot — everyone tied and won, so everyone already showed automatically
 
+    pending_ids = []
+    for p in candidates:
+        pref = await db.get_player_preference(p.user_id)
+        auto_action = pref.get("auto_showdown", "prompt")
+        if auto_action == "muck":
+            continue
+        elif auto_action == "show":
+            if len(result.community) >= 3:
+                score = evaluator.evaluate(p.hole_cards, result.community)
+                rank_str = f" — *{evaluator.class_to_string(evaluator.get_rank_class(score))}*"
+            else:
+                rank_str = ""
+            caption = f"👁️ **{p.display_name}** shows: {hand_str(p.hole_cards)}{rank_str}"
+            if USE_IMAGES:
+                file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, False, p.egirl_saro)
+                await channel.send(caption, file=file)
+            else:
+                await channel.send(caption)
+        else:
+            pending_ids.append(p.user_id)
+
+    if not pending_ids:
+        return
+
     deadline = int(time.time()) + timeout
-    pending_ids = [p.user_id for p in candidates]
     mentions = " ".join(f"<@{uid}>" for uid in pending_ids)
 
     view = ShowdownRevealView(t, result, pending_ids, timeout=timeout)
@@ -1664,30 +2204,36 @@ class RaiseCustomModal(discord.ui.Modal, title="Custom Raise"):
         self.t = t; self.channel = channel; self.guild = guild
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Defer first — only one response allowed
-        await interaction.response.defer()
         raise_amount = parse_chips(self.amount.value)
         if raise_amount is None:
-            await interaction.followup.send("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
+            await interaction.response.send_message("❌ Enter a valid amount (e.g. 500, 2k, 1.5k).", ephemeral=True); return
         uid = interaction.user.id
         p   = self.t.game.get_player(uid)
         if not p or not self.t.game.is_turn(uid):
-            await interaction.followup.send("❌ It's not your turn.", ephemeral=True); return
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
         if raise_amount <= 0:
-            await interaction.followup.send("❌ Must be greater than 0.", ephemeral=True); return
-        success, msg = self.t.game.raise_bet(uid, raise_amount)
-        if not success:
-            await interaction.followup.send(msg, ephemeral=True); return
-        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-            slog_clear(self.t)
+            await interaction.response.send_message("❌ Must be greater than 0.", ephemeral=True); return
 
-        for part in msg.split("\n"):
-            if part.strip():
-                slog(self.t, part)
-        if self.t.game._hand_result:
-            await _process_result(interaction.guild, self.channel, self.t)
-        else:
-            await refresh(self.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+        pref = await db.get_player_preference(uid)
+        mode = pref.get("confirm_call_raise_mode", "always")
+        thresh = pref.get("confirm_call_raise_threshold", 0)
+        should_confirm = True
+        if mode == "never":
+            should_confirm = False
+        elif mode == "threshold":
+            if raise_amount <= thresh:
+                should_confirm = False
+
+        if should_confirm:
+            view = ActionConfirmView(self.t, self.channel, self.guild, uid, self.t.game.raise_bet, [uid, raise_amount], f"⚠️ **Are you sure you want to raise by {raise_amount:,} chips?**")
+            await interaction.response.send_message(
+                f"⚠️ **Are you sure you want to raise by {raise_amount:,} chips?**",
+                view=view,
+                ephemeral=True
+            )
+            return
+
+        await run_table_action(self.guild, self.channel, self.t, interaction, self.t.game.raise_bet, uid, raise_amount)
 
 class RaisePickerView(discord.ui.View):
     """Shown when player clicks Raise — offers preset options."""
@@ -1709,23 +2255,30 @@ class RaisePickerView(discord.ui.View):
             self.btn_all_in.label = f"All In"
 
     async def _do_raise(self, interaction: discord.Interaction, raise_amount: int):
-        await interaction.response.defer()
         uid = interaction.user.id
         if not self.t.game.is_turn(uid):
-            await interaction.followup.send("❌ It's not your turn.", ephemeral=True); return
-        success, msg = self.t.game.raise_bet(uid, raise_amount)
-        if not success:
-            await interaction.followup.send(msg, ephemeral=True); return
-        if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-            slog_clear(self.t)
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True); return
 
-        for part in msg.split("\n"):
-            if part.strip():
-                slog(self.t, part)
-        if self.t.game._hand_result:
-            await _process_result(self.guild, self.channel, self.t)
-        else:
-            await refresh(self.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+        pref = await db.get_player_preference(uid)
+        mode = pref.get("confirm_call_raise_mode", "always")
+        thresh = pref.get("confirm_call_raise_threshold", 0)
+        should_confirm = True
+        if mode == "never":
+            should_confirm = False
+        elif mode == "threshold":
+            if raise_amount <= thresh:
+                should_confirm = False
+
+        if should_confirm:
+            view = ActionConfirmView(self.t, self.channel, self.guild, uid, self.t.game.raise_bet, [uid, raise_amount], f"⚠️ **Are you sure you want to raise by {raise_amount:,} chips?**")
+            await interaction.response.send_message(
+                f"⚠️ **Are you sure you want to raise by {raise_amount:,} chips?**",
+                view=view,
+                ephemeral=True
+            )
+            return
+
+        await run_table_action(self.guild, self.channel, self.t, interaction, self.t.game.raise_bet, uid, raise_amount)
 
     @discord.ui.button(label="Min", style=discord.ButtonStyle.green, row=0)
     async def btn_min_raise(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1766,8 +2319,26 @@ class RaisePickerView(discord.ui.View):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
             return
 
-        # Trigger the private confirmation prompt!
-        view = AllInConfirmView(self.t, self.channel, self.guild)
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if not p: return
+
+        pref = await db.get_player_preference(interaction.user.id)
+        mode = pref.get("confirm_all_in_mode", "always")
+        thresh = pref.get("confirm_all_in_threshold", 0)
+
+        should_confirm = True
+        if mode == "never":
+            should_confirm = False
+        elif mode == "threshold":
+            if p.chips <= thresh:
+                should_confirm = False
+
+        if not should_confirm:
+            await self._do_raise(interaction, p.chips)
+            return
+
+        view = ActionConfirmView(self.t, self.channel, self.guild, interaction.user.id, self.t.game.raise_bet, [interaction.user.id, p.chips], "⚠️ **Are you sure you want to go ALL IN?**\n*(This will commit all your remaining chips to the pot!)*")
         await interaction.response.send_message(
             "⚠️ **Are you sure you want to go ALL IN?**\n*(This will commit all your remaining chips to the pot!)*",
             view=view,
@@ -1872,57 +2443,7 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
                 + (f" (wallet: {self.bal} − {self.rejoin_fee} rejoin fee)." if self.rejoin_fee else "."),
                 ephemeral=True); return
 
-        # Defer before all DB work
-        await interaction.response.defer(ephemeral=True)
-
-        await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
-
-        t = self.t
-        if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
-            await interaction.followup.send("❌ You are banned from this table.", ephemeral=True); return
-
-        # Deduct rejoin fee first, goes to jackpot.
-        if self.rejoin_fee > 0:
-            ok_fee = await db.deduct_chips(interaction.user.id, self.rejoin_fee)
-            if not ok_fee:
-                await interaction.followup.send("❌ Failed to deduct rejoin fee.", ephemeral=True);
-                return
-            t.rejoin_cooldowns.pop(interaction.user.id, None)  # cooldown cleared on payment
-
-            try:
-                # 🚨 NEW: 100% of the bypass fee is added directly to the Jackpot
-                await db.adjust_jackpot(self.rejoin_fee)
-                await db.log_currency_event(interaction.user.id, "Jackpot", -self.rejoin_fee, "Paid rejoin bypass fee")
-            except Exception as e:
-                print(f"🚨 [ERROR] {e}")
-                import traceback
-                traceback.print_exc()
-
-            await interaction.channel.send(
-                f"🎰 **{interaction.user.display_name}** paid **{self.rejoin_fee}** {get_chip_emoji(self.t)} directly to the **Jackpot** to bypass the rejoin cooldown!")
-
-        ok = await db.deduct_chips(interaction.user.id, chips)
-        if not ok:
-            if self.rejoin_fee > 0:
-                await db.return_chips(interaction.user.id, self.rejoin_fee)   # refund fee on failure
-            await interaction.followup.send(f"❌ Failed to deduct chips.", ephemeral=True)
-            return
-
-        # STRICT USERNAME: We now inject .name instead of .display_name!
-        await db.mark_chips_in_play(interaction.user.id, interaction.user.name, chips)
-
-        msg = t.game.add_player(interaction.user.id, interaction.user.name, chips)
-        if msg.startswith("❌"):
-            await db.return_chips(interaction.user.id, chips)
-            if self.rejoin_fee > 0:
-                await db.return_chips(interaction.user.id, self.rejoin_fee)   # refund fee on failure
-            await db.clear_chips_in_play(interaction.user.id)
-            await interaction.followup.send(msg, ephemeral=True)
-            return
-
-        await interaction.channel.send(f"✅ **{interaction.user.display_name}** joined the table with **{chips}** {get_chip_emoji(t)}!")
-        await refresh(interaction.channel, t)
-        await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
+        await join_table_execute(interaction, self.t, chips, self.bal, self.rejoin_fee, self.min_w, self.max_w)
 
 
 class LeaveConfirmView(discord.ui.View):
@@ -1934,37 +2455,9 @@ class LeaveConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Yes, Leave", style=discord.ButtonStyle.red)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.t.closing:
-            return await interaction.response.edit_message(content="❌ Table is closing anyway.", view=None)
-
-        chips_back, msg = self.t.game.remove_player(interaction.user.id)
-
-        # 1. DEFER IMMEDIATELY BEFORE DB WRITES
         await interaction.response.defer()
-
-        # 2. Safely write to DB (branch for tournament vs regular)
-        if self.t.is_tournament:
-            import tournament_db as tdb
-            if chips_back > 0:
-                await tdb.return_chips(interaction.user.id, chips_back)
-            await tdb.clear_chips_in_play(interaction.user.id)
-        else:
-            if chips_back > 0:
-                await db.return_chips(interaction.user.id, chips_back)
-            await db.clear_chips_in_play(interaction.user.id)
-
-
-        if "will leave" in msg:
-            self.t.leave_cooldown_pending.add(interaction.user.id)
-            await interaction.channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
-        elif "left" in msg or "cashed out" in msg:
-            cooldown = config.TOURNAMENT_REJOIN_COOLDOWN if getattr(self.t, 'is_tournament', False) else config.REGULAR_REJOIN_COOLDOWN
-            self.t.rejoin_cooldowns[interaction.user.id] = time.time() + cooldown
-            await interaction.channel.send(
-                f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
-
-        await interaction.edit_original_response(content="✅ You left the table.", view=None)
-        await refresh(interaction.channel, self.t)
+        res_msg = await leave_table_execute(interaction.guild, interaction.channel, self.t, interaction)
+        await interaction.edit_original_response(content=res_msg, view=None)
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
@@ -2104,6 +2597,20 @@ class GameView(discord.ui.View):
             await interaction.response.send_message(
                 f"❌ Need at least **{min_w}** {get_chip_emoji(self.t)} to join. Wallet: **{bal}** {get_chip_emoji(self.t)}.", ephemeral=True)
             return
+
+        pref = await db.get_player_preference(uid)
+        default_bb = pref.get("default_buyin_amount", 0)
+        if default_bb > 0 or default_bb == -1:
+            if default_bb == -1:
+                default_stack = min(bal, max_w) if max_w > 0 else bal
+            else:
+                bb = self.t.game.BIG_BLIND
+                default_stack = default_bb * bb
+
+            if default_stack >= min_w and (max_w == 0 or default_stack <= max_w) and default_stack <= bal:
+                await join_table_execute(interaction, self.t, default_stack, bal, rejoin_fee=0, min_w=min_w, max_w=max_w, is_deferred=False)
+                return
+
         await interaction.response.send_modal(JoinModal(self.t, bal, min_w, max_w))
 
 
@@ -2128,7 +2635,13 @@ class GameView(discord.ui.View):
             await interaction.response.send_message("❌ You're not at the table.", ephemeral=True)
             return
 
-        # 🚨 Trigger the completely private ephemeral confirmation prompt!
+        pref = await db.get_player_preference(interaction.user.id)
+        if not pref.get("confirm_leave", 1):
+            await interaction.response.defer(ephemeral=True)
+            res_msg = await leave_table_execute(interaction.guild, interaction.channel, self.t, interaction)
+            await interaction.followup.send(res_msg, ephemeral=True)
+            return
+
         view = LeaveConfirmView(self.t)
         await interaction.response.send_message(
             "⚠️ Are you sure you want to leave?\n*(This will trigger a 10-minute rejoin cooldown!)*",
@@ -2141,6 +2654,31 @@ class GameView(discord.ui.View):
         if not self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's not your turn.", ephemeral=True);
             return
+
+        g = self.t.game
+        p = g.get_player(interaction.user.id)
+        if p:
+            call_amt = g.call_amount(p)
+            if call_amt > 0:
+                pref = await db.get_player_preference(interaction.user.id)
+                mode = pref.get("confirm_call_raise_mode", "always")
+                thresh = pref.get("confirm_call_raise_threshold", 0)
+                should_confirm = True
+                if mode == "never":
+                    should_confirm = False
+                elif mode == "threshold":
+                    if call_amt <= thresh:
+                        should_confirm = False
+
+                if should_confirm:
+                    view = ActionConfirmView(self.t, interaction.channel, interaction.guild, interaction.user.id, self.t.game.check_or_call, [interaction.user.id], f"⚠️ **Are you sure you want to call {call_amt:,} chips?**")
+                    await interaction.response.send_message(
+                        f"⚠️ **Are you sure you want to call {call_amt:,} chips?**",
+                        view=view,
+                        ephemeral=True
+                    )
+                    return
+
         await self._do_action(interaction, self.t.game.check_or_call, interaction.user.id)
 
     @discord.ui.button(label="Raise", style=discord.ButtonStyle.green, row=1)
@@ -2177,12 +2715,14 @@ class GameView(discord.ui.View):
         p = self.t.game.get_player(uid)
 
         # Prevent accidental folds of Flush or higher (only works if Flop is out)
+        is_strong_hand = False
         if p and p.hole_cards and len(self.t.game.community) >= 3:
             score = evaluator.evaluate(p.hole_cards, self.t.game.community)
             rank_class = evaluator.get_rank_class(score)
 
             # Treys rank classes: 1 (Straight Flush), 2 (Quads), 3 (Full House), 4 (Flush)
             if rank_class <= 4:
+                is_strong_hand = True
                 rank_name = evaluator.class_to_string(rank_class)
 
                 # Pass `self` so the confirm view can access `_do_action`
@@ -2190,6 +2730,27 @@ class GameView(discord.ui.View):
 
                 await interaction.response.send_message(
                     f"⚠️ **Are you sure you want to fold?**\nYou currently have a **{rank_name}**!",
+                    view=view,
+                    ephemeral=True
+                )
+                return
+
+        # If not Flush or better, check Fold confirmation preference based on pot size
+        if not is_strong_hand:
+            pref = await db.get_player_preference(uid)
+            mode = pref.get("confirm_fold_mode", "always")
+            thresh = pref.get("confirm_fold_threshold", 0)
+            should_confirm = True
+            if mode == "never":
+                should_confirm = False
+            elif mode == "threshold":
+                if self.t.game.pot <= thresh:
+                    should_confirm = False
+
+            if should_confirm:
+                view = ActionConfirmView(self.t, interaction.channel, interaction.guild, uid, self.t.game.fold, [uid], "⚠️ **Are you sure you want to fold?**")
+                await interaction.response.send_message(
+                    "⚠️ **Are you sure you want to fold?**",
                     view=view,
                     ephemeral=True
                 )
@@ -4306,31 +4867,11 @@ class PokerCog(commands.Cog):
         else:
             await interaction.response.send_message("❌ Tutorial is not available.", ephemeral=True)
 
-    @poker.command(name="autorebuy",
-                   description="Automatically top up your stack between hands when you fall below the big blind")
-    @app_commands.describe(amount="Chips to top up to (0 = disabled, remove 'amount' option to check current setting)")
-    async def autorebuy(self, interaction: discord.Interaction, amount: int = None):
-
-        if amount is None:
-            current = await db.get_autorebuy(interaction.user.id)
-            if current > 0:
-                return await interaction.response.send_message(
-                    f"ℹ️ Your auto-rebuy is currently set to **{current:,}** chips.", ephemeral=True)
-            else:
-                return await interaction.response.send_message("ℹ️ Your auto-rebuy is currently **disabled**.",
-                                                               ephemeral=True)
-
-        if amount < 0:
-            return await interaction.response.send_message("❌ Amount can't be negative.", ephemeral=True)
-
-        await db.set_autorebuy(interaction.user.id, amount)
-
-        if amount == 0:
-            return await interaction.response.send_message("✅ Auto-rebuy disabled.", ephemeral=True)
-
-        await interaction.response.send_message(
-            f"✅ Auto-rebuy set to **{amount:,}** chips. Your stack will be topped up automatically between hands if lower than bb.",
-            ephemeral=True)
+    @poker.command(name="preferences", description="Configure your auto-rebuy, auto-showdown, and confirmation settings")
+    async def preferences_cmd(self, interaction: discord.Interaction):
+        view = PreferencesView(interaction.user)
+        await view.init_data()
+        await interaction.response.send_message(view=view, ephemeral=True)
 
     @pokeradmin.command(name="sql", description="[Dev] Run a read-only database query")
     @app_commands.describe(query="The SELECT query to run")

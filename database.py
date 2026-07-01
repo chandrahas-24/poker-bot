@@ -256,10 +256,9 @@ async def init_db():
         """)
 
         try:
-            await db.execute("ALTER TABLE wallets ADD COLUMN autorebuy_amount INTEGER DEFAULT 0")
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e).lower():
-                raise
+            await db.execute("ALTER TABLE wallets DROP COLUMN autorebuy_amount")
+        except aiosqlite.OperationalError:
+            pass
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
@@ -270,6 +269,22 @@ async def init_db():
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS player_preferences (
+                user_id INTEGER PRIMARY KEY,
+                auto_rebuy_amount INTEGER DEFAULT 0,
+                auto_showdown TEXT DEFAULT 'prompt',
+                default_buyin_amount INTEGER DEFAULT 0,
+                confirm_all_in_mode TEXT DEFAULT 'always',
+                confirm_all_in_threshold INTEGER DEFAULT 0,
+                confirm_fold_mode TEXT DEFAULT 'never',
+                confirm_fold_threshold INTEGER DEFAULT 0,
+                confirm_leave INTEGER DEFAULT 1,
+                confirm_call_raise_mode TEXT DEFAULT 'never',
+                confirm_call_raise_threshold INTEGER DEFAULT 0
+            )
+        """)
 
         await db.commit()
         await init_inactivity_tracking(db)
@@ -1984,21 +1999,73 @@ async def get_currency_logs(user_id: int) -> list[dict]:
         return [dict(r) for r in await c.fetchall()]
 
 
-# Auto rebuy
+# Player Preferences
 
-async def get_autorebuy(user_id: int) -> int:
+DEFAULT_PREFERENCES = {
+    "auto_rebuy_amount": 0,
+    "auto_showdown": "prompt",
+    "default_buyin_amount": 0,
+    "confirm_all_in_mode": "always",
+    "confirm_all_in_threshold": 0,
+    "confirm_fold_mode": "never",
+    "confirm_fold_threshold": 0,
+    "confirm_leave": 1,
+    "confirm_call_raise_mode": "never",
+    "confirm_call_raise_threshold": 0
+}
+
+async def get_player_preference(user_id: int) -> dict:
     db = await _get_db()
-    async with db.execute("SELECT autorebuy_amount FROM wallets WHERE user_id=?", (user_id,)) as c:
+    async with db.execute("SELECT * FROM player_preferences WHERE user_id = ?", (user_id,)) as c:
         row = await c.fetchone()
-        return row[0] if row else 0
+        if not row:
+            return dict(DEFAULT_PREFERENCES)
+        return dict(row)
 
-
-async def set_autorebuy(user_id: int, amount: int):
+async def set_player_preference(user_id: int, **kwargs):
     db = await _get_db()
+    curr = await get_player_preference(user_id)
+    for k, v in kwargs.items():
+        if k in DEFAULT_PREFERENCES:
+            curr[k] = v
+
     async with _write_lock:
         await db.execute("""
-            INSERT INTO wallets (user_id, username, balance, autorebuy_amount)
-            VALUES (?, 'Unknown Player', 0, ?)
-            ON CONFLICT(user_id) DO UPDATE SET autorebuy_amount = ?
-        """, (user_id, amount, amount))
+            INSERT INTO player_preferences (
+                user_id, auto_rebuy_amount, auto_showdown, default_buyin_amount,
+                confirm_all_in_mode, confirm_all_in_threshold,
+                confirm_fold_mode, confirm_fold_threshold,
+                confirm_leave, confirm_call_raise_mode, confirm_call_raise_threshold
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                auto_rebuy_amount = excluded.auto_rebuy_amount,
+                auto_showdown = excluded.auto_showdown,
+                default_buyin_amount = excluded.default_buyin_amount,
+                confirm_all_in_mode = excluded.confirm_all_in_mode,
+                confirm_all_in_threshold = excluded.confirm_all_in_threshold,
+                confirm_fold_mode = excluded.confirm_fold_mode,
+                confirm_fold_threshold = excluded.confirm_fold_threshold,
+                confirm_leave = excluded.confirm_leave,
+                confirm_call_raise_mode = excluded.confirm_call_raise_mode,
+                confirm_call_raise_threshold = excluded.confirm_call_raise_threshold
+        """, (
+            user_id,
+            curr["auto_rebuy_amount"],
+            curr["auto_showdown"],
+            curr["default_buyin_amount"],
+            curr["confirm_all_in_mode"],
+            curr["confirm_all_in_threshold"],
+            curr["confirm_fold_mode"],
+            curr["confirm_fold_threshold"],
+            curr["confirm_leave"],
+            curr["confirm_call_raise_mode"],
+            curr["confirm_call_raise_threshold"]
+        ))
         await db.commit()
+
+async def get_autorebuy(user_id: int) -> int:
+    pref = await get_player_preference(user_id)
+    return pref.get("auto_rebuy_amount", 0)
+
+async def set_autorebuy(user_id: int, amount: int):
+    await set_player_preference(user_id, auto_rebuy_amount=amount)

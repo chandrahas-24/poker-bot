@@ -255,11 +255,6 @@ async def init_db():
             )
         """)
 
-        try:
-            await db.execute("ALTER TABLE wallets DROP COLUMN autorebuy_amount")
-        except aiosqlite.OperationalError:
-            pass
-
         await db.execute("CREATE INDEX IF NOT EXISTS idx_currency_user ON currency_log(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hand_log_table ON hand_log(guild_id, table_id)")
 

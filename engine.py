@@ -491,30 +491,61 @@ class PokerGame:
         Returns True if an action was taken, False if conditions weren't met.
         Clears the premove regardless.
         """
-        move = p.premove
+        moves = p.premove if isinstance(p.premove, list) else ([p.premove] if p.premove else [])
         p.premove = None  # always clear, one-shot only
 
-        if move is None:
-            return False, ""
+        for move in moves:
+            if move is None:
+                continue
 
-        action = move["action"]
-        call_amt = self.call_amount(p)
+            action = move["action"]
+            call_amt = self.call_amount(p)
+            success, msg = False, ""
 
-        if action == "check" and call_amt == 0:
-            return self.check_or_call(p.user_id)
-        elif action == "call_any":
-            return self.check_or_call(p.user_id)
-        elif action == "call_upto":
-            if call_amt <= move["amount"]:
-                return self.check_or_call(p.user_id)
-        elif action == "fold_any":
-            if call_amt == 0:
-                return self.check_or_call(p.user_id)
-            else:
-                return self.fold(p.user_id)
-        elif action == "fold_if_gt":
-            if call_amt > move["amount"]:
-                return self.fold(p.user_id)
+            if action == "check" and call_amt == 0:
+                success, msg = self.check_or_call(p.user_id)
+            elif action == "call_any":
+                success, msg = self.check_or_call(p.user_id)
+            elif action == "call_upto":
+                if call_amt <= move["amount"]:
+                    success, msg = self.check_or_call(p.user_id)
+            elif action == "fold_any":
+                if call_amt == 0:
+                    success, msg = self.check_or_call(p.user_id)
+                else:
+                    success, msg = self.fold(p.user_id)
+            elif action == "fold_if_gt":
+                if call_amt > move["amount"]:
+                    success, msg = self.fold(p.user_id)
+            elif action == "raise_all_in":
+                success, msg = self.raise_bet(p.user_id, p.chips)
+            elif action == "raise_to":
+                target_total = move["amount"]
+                relative_raise = target_total - self.current_bet
+                if relative_raise > 0:
+                    min_raise = self.last_raise_size if self.last_raise_size > 0 else self.BIG_BLIND
+                    call_needed = self.current_bet - p.bet
+                    total_needed = call_needed + relative_raise
+                    if total_needed >= p.chips or relative_raise >= min_raise:
+                        success, msg = self.raise_bet(p.user_id, relative_raise)
+            elif action == "raise_by":
+                relative_raise = move["amount"]
+                min_raise = self.last_raise_size if self.last_raise_size > 0 else self.BIG_BLIND
+                call_needed = self.current_bet - p.bet
+                total_needed = call_needed + relative_raise
+                if total_needed >= p.chips or relative_raise >= min_raise:
+                    success, msg = self.raise_bet(p.user_id, relative_raise)
+
+            if success:
+                parts = msg.split("\n")
+                dec_parts = []
+                for part in parts:
+                    if part.strip():
+                        if p.display_name in part:
+                            dec_parts.append(f"⚡ {part.strip()}")
+                        else:
+                            dec_parts.append(part.strip())
+                return True, "\n".join(dec_parts)
 
         return False, ""
 

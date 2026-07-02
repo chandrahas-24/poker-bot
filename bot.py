@@ -529,6 +529,21 @@ async def reload(ctx, cog_name: str = None):
     if "config" in reloaded_helpers:
         AUTHORIZED_ADMINS = config.DEV_USER_IDS
 
+    # 5.5 Re-sync Slash Commands Tree with Discord
+    sync_msg = ""
+    try:
+        YOUR_GUILD_ID = config.GUILD_ID
+        if YOUR_GUILD_ID:
+            guild = discord.Object(id=YOUR_GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            sync_msg = f"Synced commands to guild {YOUR_GUILD_ID}"
+        else:
+            await bot.tree.sync()
+            sync_msg = "Synced commands globally"
+    except Exception as e:
+        sync_msg = f"⚠️ **Command Sync failed:** {e}"
+
     # 6. Report success
     msg = "✅ **Hot-Reload Complete!**\n"
     if closed_dbs:
@@ -537,6 +552,8 @@ async def reload(ctx, cog_name: str = None):
         msg += f"**Reloaded Helpers:** {', '.join(reloaded_helpers)}\n"
     if reloaded_cogs:
         msg += f"**Reloaded Cogs:** {', '.join(reloaded_cogs)}\n"
+    if sync_msg:
+        msg += f"{sync_msg}\n"
     await ctx.send(msg)
 
 

@@ -4300,6 +4300,143 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(embed=embed)
 
+    @pokeradmin.command(name="salt", description="[Admin] View daily house profits in a monthly calendar layout")
+    @app_commands.describe(month="YYYY-MM format (e.g. 2026-07) - defaults to current month")
+    async def salt(self, interaction: discord.Interaction, month: str = None):
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        # 1. Parse Year & Month
+        import re
+        from datetime import datetime
+        if month:
+            if not re.match(r"^\d{4}-\d{2}$", month):
+                await interaction.followup.send("❌ Invalid month format. Use YYYY-MM (e.g. 2026-07).")
+                return
+            target_year_month = month
+        else:
+            target_year_month = datetime.utcnow().strftime("%Y-%m")
+
+        year_str, month_str = target_year_month.split("-")
+        y_val = int(year_str)
+        m_val = int(month_str)
+
+        # 2. Query Revenue Data
+        db_conn = await db._get_db()
+        daily_totals = {}
+        query = """
+            SELECT ts, amount 
+            FROM house_revenue 
+            WHERE ts LIKE ?
+        """
+        try:
+            async with db_conn.execute(query, (f"{target_year_month}%",)) as c:
+                rows = await c.fetchall()
+                for ts_str, amt in rows:
+                    try:
+                        date_part = ts_str.split("T")[0]
+                        day = int(date_part.split("-")[2])
+                        daily_totals[day] = daily_totals.get(day, 0) + amt
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Error querying house revenue: {e}")
+
+        # 3. Generate Calendar Grid
+        import calendar
+        cal = calendar.Calendar(firstweekday=6)  # Sunday-start
+        try:
+            weeks = cal.monthdayscalendar(y_val, m_val)
+        except Exception:
+            await interaction.followup.send("❌ Invalid year or month values.")
+            return
+
+        month_name = calendar.month_name[m_val]
+
+        def format_revenue(val: int) -> str:
+            if val == 0:
+                return "0"
+            if val >= 1_000_000:
+                val_m = val / 1_000_000
+                if val_m == int(val_m):
+                    return f"{int(val_m)}M"
+                return f"{val_m:.1f}M"
+            elif val >= 100_000:
+                val_k = val / 1_000
+                if val_k == int(val_k):
+                    return f"{int(val_k)}K"
+                return f"{val_k:.1f}K"
+            return str(val)
+
+        def pad_col(s: str) -> str:
+            if len(s) >= 7:
+                return s[:7]
+            total_pad = 7 - len(s)
+            left_pad = total_pad // 2
+            right_pad = total_pad - left_pad
+            return " " * left_pad + s + " " * right_pad
+
+        # ANSI Escape Codes for formatting
+        ANSI_RESET = "\u001b[0m"
+        ANSI_YELLOW = "\u001b[33m"
+        ANSI_CYAN = "\u001b[36m"
+        ANSI_GREEN = "\u001b[32m"
+        ANSI_GREY = "\u001b[30m"
+
+        def format_ansi_line(cells: list, sep_color: str) -> str:
+            current_color = None
+            res_parts = []
+            for i, (text, color) in enumerate(cells):
+                if color != current_color:
+                    res_parts.append(color)
+                    current_color = color
+                res_parts.append(text)
+                if i < len(cells) - 1:
+                    if sep_color != current_color:
+                        res_parts.append(sep_color)
+                        current_color = sep_color
+                    res_parts.append("|")
+            if current_color != ANSI_RESET:
+                res_parts.append(ANSI_RESET)
+            return "".join(res_parts)
+
+        lines = []
+        lines.append(f"**Poker Revenue — {month_name} {y_val}**")
+        lines.append("```ansi")
+
+        headers = [(pad_col(day), ANSI_YELLOW) for day in ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]]
+        lines.append(format_ansi_line(headers, ANSI_GREY))
+        lines.append(f"{ANSI_GREY}======================================================{ANSI_RESET}")
+
+        for i, week in enumerate(weeks):
+            date_line_parts = []
+            rev_line_parts = []
+            for day in week:
+                if day == 0:
+                    date_line_parts.append((pad_col("."), ANSI_GREY))
+                    rev_line_parts.append((pad_col("."), ANSI_GREY))
+                else:
+                    date_line_parts.append((pad_col(f"{day:02d}"), ANSI_CYAN))
+                    rev_val = daily_totals.get(day, 0)
+                    if rev_val > 0:
+                        rev_line_parts.append((pad_col(format_revenue(rev_val)), ANSI_GREEN))
+                    else:
+                        rev_line_parts.append((pad_col("0"), ANSI_GREY))
+
+            lines.append(format_ansi_line(date_line_parts, ANSI_GREY))
+            lines.append(format_ansi_line(rev_line_parts, ANSI_GREY))
+            if i < len(weeks) - 1:
+                lines.append(f"{ANSI_GREY}-------+-------+-------+-------+-------+-------+-------{ANSI_RESET}")
+
+        lines.append("```")
+
+        total_rev = sum(daily_totals.values())
+        lines.append(f"**Total:** {total_rev:,} <:poker_chip:1490458259855773707>")
+
+        await interaction.followup.send("\n".join(lines))
+
     @pokeradmin.command(name="adjustrevenue", description="[Admin] Manually adjust all-time revenue tracker")
     @app_commands.describe(amount="Amount to add (or negative to subtract)")
     async def adjustrevenue(self, interaction: discord.Interaction, amount: int):

@@ -5288,6 +5288,65 @@ class StatsView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_highlights_embed(), view=self)
 
 
+async def should_confirm_premove_all_in(t: TableState, user_id: int, move: dict) -> bool:
+    p = t.game.get_player(user_id)
+    if not p:
+        return False
+        
+    is_all_in = False
+    action = move["action"]
+    
+    if action == "raise_all_in":
+        is_all_in = True
+    elif action == "call_upto":
+        if move["amount"] >= p.chips:
+            is_all_in = True
+    elif action == "raise_to":
+        if move["amount"] >= p.chips + p.bet:
+            is_all_in = True
+    elif action == "raise_by":
+        call_needed = t.game.current_bet - p.bet
+        if call_needed + move["amount"] >= p.chips:
+            is_all_in = True
+            
+    if not is_all_in:
+        return False
+        
+    pref = await db.get_player_preference(user_id)
+    cai_mode = pref.get("confirm_all_in_mode", "always")
+    cai_thresh = pref.get("confirm_all_in_threshold", 0)
+    
+    if cai_mode == "never":
+        return False
+    elif cai_mode == "threshold":
+        if p.chips <= cai_thresh:
+            return False
+            
+    return True
+
+class PremoveConfirmAllInView(discord.ui.View):
+    def __init__(self, parent_view: discord.ui.View, pending_move: dict):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.pending_move = pending_move
+
+    @discord.ui.button(label="Yes, Proceed", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.parent_view._append(self.pending_move):
+            await interaction.response.send_message("❌ Premove chain is limited to 5 actions. Click 'Cancel' to start over.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content=f"⚡ **Premove Chain:** {self.parent_view._get_chain_str()}",
+            view=self.parent_view
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"⚡ **Premove Chain:** {self.parent_view._get_chain_str()}",
+            view=self.parent_view
+        )
+
 class PremoveView(discord.ui.View):
     def __init__(self, t: TableState, user_id: int):
         super().__init__(timeout=120)
@@ -5356,7 +5415,15 @@ class PremoveView(discord.ui.View):
 
     @discord.ui.button(label="All-In", style=discord.ButtonStyle.red, row=0)
     async def pm_all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self._append({"action": "raise_all_in"}):
+        move = {"action": "raise_all_in"}
+        if await should_confirm_premove_all_in(self.t, self.user_id, move):
+            await interaction.response.edit_message(
+                content="⚠️ **You are about to queue an All-In premove. Are you sure you want to proceed?**",
+                view=PremoveConfirmAllInView(self, move)
+            )
+            return
+
+        if not self._append(move):
             await interaction.response.send_message("❌ Premove chain is limited to 5 actions. Click 'Cancel' to start over.", ephemeral=True)
             return
         await interaction.response.edit_message(content=f"⚡ **Premove Chain:** {self._get_chain_str()}", view=self)
@@ -5509,94 +5576,6 @@ class CurrencyLogView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-class PremoveView(discord.ui.View):
-    def __init__(self, t: TableState, user_id: int):
-        super().__init__(timeout=120)
-        self.t = t
-        self.user_id = user_id
-
-    def _append(self, move: dict):
-        p = self.t.game.get_player(self.user_id)
-        if p:
-            if p.premove is None or not isinstance(p.premove, list):
-                p.premove = []
-            p.premove.append(move)
-
-    def _get_chain_str(self) -> str:
-        p = self.t.game.get_player(self.user_id)
-        if not p or not p.premove:
-            return "None"
-        
-        labels = []
-        moves = p.premove if isinstance(p.premove, list) else [p.premove]
-        for m in moves:
-            if m is None: continue
-            act = m["action"]
-            if act == "check":
-                labels.append("Check")
-            elif act == "call_any":
-                labels.append("Call Any")
-            elif act == "call_upto":
-                labels.append(f"Call ≤ {m['amount']:,}")
-            elif act == "fold_any":
-                labels.append("Fold Any")
-            elif act == "fold_if_gt":
-                labels.append(f"Fold > {m['amount']:,}")
-            elif act == "raise_all_in":
-                labels.append("All-In")
-            elif act == "raise_to":
-                labels.append(f"Raise To {m['amount']:,}")
-            elif act == "raise_by":
-                labels.append(f"Raise By {m['amount']:,}")
-        return " ➔ ".join(labels) if labels else "None"
-
-    @discord.ui.button(label="Check", style=discord.ButtonStyle.blurple, row=0)
-    async def pm_check(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._append({"action": "check"})
-        await interaction.response.edit_message(content=f"⚡ **Premove Chain:** {self._get_chain_str()}", view=self)
-
-    @discord.ui.button(label="Fold Any", style=discord.ButtonStyle.red, row=0)
-    async def pm_fold_any(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._append({"action": "fold_any"})
-        await interaction.response.edit_message(content=f"⚡ **Premove Chain:** {self._get_chain_str()}", view=self)
-
-    @discord.ui.button(label="Call Any", style=discord.ButtonStyle.blurple, row=0)
-    async def pm_call_any(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._append({"action": "call_any"})
-        await interaction.response.edit_message(content=f"⚡ **Premove Chain:** {self._get_chain_str()}", view=self)
-
-    @discord.ui.button(label="All-In", style=discord.ButtonStyle.red, row=0)
-    async def pm_all_in(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._append({"action": "raise_all_in"})
-        await interaction.response.edit_message(content=f"⚡ **Premove Chain:** {self._get_chain_str()}", view=self)
-
-    @discord.ui.button(label="Call ≤ X", style=discord.ButtonStyle.green, row=1)
-    async def pm_call_upto(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PremoveAmountModal(self.t, self.user_id, "call_upto", self))
-
-    @discord.ui.button(label="Fold > X", style=discord.ButtonStyle.green, row=1)
-    async def pm_fold_if_gt(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PremoveAmountModal(self.t, self.user_id, "fold_if_gt", self))
-
-    @discord.ui.button(label="Raise To X", style=discord.ButtonStyle.green, row=1)
-    async def pm_raise_to(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PremoveAmountModal(self.t, self.user_id, "raise_to", self))
-
-    @discord.ui.button(label="Raise By X", style=discord.ButtonStyle.green, row=1)
-    async def pm_raise_by(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PremoveAmountModal(self.t, self.user_id, "raise_by", self))
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=2)
-    async def pm_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        p = self.t.game.get_player(self.user_id)
-        if p:
-            p.premove = None
-        await interaction.response.edit_message(content="🚫 Premove chain cancelled.", view=None)
-
-    @discord.ui.button(label="Done", style=discord.ButtonStyle.grey, row=2)
-    async def pm_done(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content=f"✅ Premove chain: **{self._get_chain_str()}**", view=None)
-
 
 class PremoveAmountModal(discord.ui.Modal):
     def __init__(self, t: TableState, user_id: int, action: str, view: discord.ui.View):
@@ -5639,7 +5618,15 @@ class PremoveAmountModal(discord.ui.Modal):
         else:
             amt = parsed_val
 
-        if not self.view._append({"action": self.action, "amount": amt}):
+        move = {"action": self.action, "amount": amt}
+        if await should_confirm_premove_all_in(self.t, self.user_id, move):
+            await interaction.response.edit_message(
+                content="⚠️ **This premove would put you All-In. Are you sure you want to proceed?**",
+                view=PremoveConfirmAllInView(self.view, move)
+            )
+            return
+
+        if not self.view._append(move):
             await interaction.response.send_message("❌ Premove chain is limited to 5 actions. Click 'Cancel' to start over.", ephemeral=True)
             return
 

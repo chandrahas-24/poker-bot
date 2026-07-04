@@ -4384,13 +4384,15 @@ class PokerCog(commands.Cog):
         grey_color = (110, 120, 140)   # Grey for zero revenue
 
         # Fonts
-        font_path = "/System/Library/Fonts/HelveticaNeue.ttc"
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        font_path_bold = os.path.join(base_dir, "assets", "Roboto-Bold.ttf")
+        font_path_medium = os.path.join(base_dir, "assets", "Roboto-Medium.ttf")
         try:
-            font_title = ImageFont.truetype(font_path, 34)
-            font_header = ImageFont.truetype(font_path, 22)
-            font_date = ImageFont.truetype(font_path, 18)
-            font_rev = ImageFont.truetype(font_path, 24)
-            font_total = ImageFont.truetype(font_path, 26)
+            font_title = ImageFont.truetype(font_path_bold, 34)
+            font_header = ImageFont.truetype(font_path_bold, 22)
+            font_date = ImageFont.truetype(font_path_medium, 18)
+            font_rev = ImageFont.truetype(font_path_bold, 24)
+            font_total = ImageFont.truetype(font_path_bold, 26)
         except Exception:
             font_title = font_header = font_date = font_rev = font_total = ImageFont.load_default()
 

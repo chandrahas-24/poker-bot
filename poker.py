@@ -4344,10 +4344,13 @@ class PokerCog(commands.Cog):
         except Exception as e:
             print(f"Error querying house revenue: {e}")
 
-        # 3. Generate Calendar Grid
+        # 3. Generate Calendar Grid Image
         import calendar
-        cal = calendar.Calendar(firstweekday=6)  # Sunday-start
+        import os
+        from PIL import Image, ImageDraw, ImageFont
+
         try:
+            cal = calendar.Calendar(firstweekday=6)
             weeks = cal.monthdayscalendar(y_val, m_val)
         except Exception:
             await interaction.followup.send("❌ Invalid year or month values.")
@@ -4370,72 +4373,114 @@ class PokerCog(commands.Cog):
                 return f"{val_k:.1f}K"
             return str(val)
 
-        def pad_col(s: str) -> str:
-            if len(s) >= 7:
-                return s[:7]
-            total_pad = 7 - len(s)
-            left_pad = total_pad // 2
-            right_pad = total_pad - left_pad
-            return " " * left_pad + s + " " * right_pad
+        # Colors for the PIL image
+        bg_color = (19, 19, 26)       # Deep slate/black
+        card_bg = (33, 33, 47)        # Lighter slate
+        empty_card_bg = (24, 24, 33)  # Muted card for empty days
+        header_color = (255, 255, 255)# White
+        text_muted = (130, 130, 160)  # Muted grey-blue
+        cyan_color = (56, 189, 248)   # Cyan for date
+        green_color = (74, 222, 128)  # Bright green for positive revenue
+        grey_color = (110, 120, 140)   # Grey for zero revenue
 
-        # ANSI Escape Codes for formatting
-        ANSI_RESET = "\u001b[0m"
-        ANSI_YELLOW = "\u001b[33m"
-        ANSI_CYAN = "\u001b[36m"
-        ANSI_GREEN = "\u001b[32m"
-        ANSI_GREY = "\u001b[30m"
+        # Fonts
+        font_path = "/System/Library/Fonts/HelveticaNeue.ttc"
+        try:
+            font_title = ImageFont.truetype(font_path, 26)
+            font_header = ImageFont.truetype(font_path, 16)
+            font_date = ImageFont.truetype(font_path, 14)
+            font_rev = ImageFont.truetype(font_path, 18)
+            font_total = ImageFont.truetype(font_path, 20)
+        except Exception:
+            font_title = font_header = font_date = font_rev = font_total = ImageFont.load_default()
 
-        def format_ansi_line(cells: list, sep_color: str) -> str:
-            current_color = None
-            res_parts = []
-            for i, (text, color) in enumerate(cells):
-                if color != current_color:
-                    res_parts.append(color)
-                    current_color = color
-                res_parts.append(text)
-                if i < len(cells) - 1:
-                    if sep_color != current_color:
-                        res_parts.append(sep_color)
-                        current_color = sep_color
-                    res_parts.append("|")
-            if current_color != ANSI_RESET:
-                res_parts.append(ANSI_RESET)
-            return "".join(res_parts)
+        num_weeks = len(weeks)
+        padding = 20
+        card_w = 100
+        card_h = 80
+        gap = 10
+        
+        header_h = 80
+        weekdays_h = 40
+        grid_h = card_h * num_weeks + gap * (num_weeks - 1)
+        footer_h = 60
+        
+        img_w = padding * 2 + card_w * 7 + gap * 6
+        img_h = padding + header_h + weekdays_h + grid_h + footer_h + padding
 
-        lines = []
-        lines.append(f"**Poker Revenue — {month_name} {y_val}**")
-        lines.append("```ansi")
+        img = Image.new("RGB", (img_w, img_h), bg_color)
+        draw = ImageDraw.Draw(img)
 
-        headers = [(pad_col(day), ANSI_YELLOW) for day in ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]]
-        lines.append(format_ansi_line(headers, ANSI_GREY))
-        lines.append(f"{ANSI_GREY}======================================================{ANSI_RESET}")
+        # Title
+        title_text = f"Poker Revenue — {month_name} {y_val}"
+        draw.text((padding, padding + 15), title_text, font=font_title, fill=header_color)
 
-        for i, week in enumerate(weeks):
-            date_line_parts = []
-            rev_line_parts = []
-            for day in week:
+        # Weekdays
+        weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+        start_y = padding + header_h
+        for idx, day_lbl in enumerate(weekdays):
+            x = padding + idx * (card_w + gap)
+            try:
+                bbox = draw.textbbox((0, 0), day_lbl, font=font_header)
+                text_w = bbox[2] - bbox[0]
+            except Exception:
+                text_w = len(day_lbl) * 10
+            text_x = x + (card_w - text_w) // 2
+            draw.text((text_x, start_y), day_lbl, font=font_header, fill=text_muted)
+
+        # Cards Grid
+        start_grid_y = start_y + weekdays_h
+        for row_idx, week in enumerate(weeks):
+            y = start_grid_y + row_idx * (card_h + gap)
+            for col_idx, day in enumerate(week):
+                x = padding + col_idx * (card_w + gap)
+                
                 if day == 0:
-                    date_line_parts.append((pad_col("."), ANSI_GREY))
-                    rev_line_parts.append((pad_col("."), ANSI_GREY))
+                    draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=empty_card_bg)
+                    try:
+                        bbox = draw.textbbox((0, 0), ".", font=font_date)
+                        text_w = bbox[2] - bbox[0]
+                        text_h = bbox[3] - bbox[1]
+                    except Exception:
+                        text_w, text_h = 5, 5
+                    draw.text((x + (card_w - text_w) // 2, y + (card_h - text_h) // 2 - 5), ".", font=font_date, fill=(50, 50, 70))
                 else:
-                    date_line_parts.append((pad_col(f"{day:02d}"), ANSI_CYAN))
+                    draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=card_bg)
+                    draw.text((x + 8, y + 6), f"{day:02d}", font=font_date, fill=cyan_color)
+                    
                     rev_val = daily_totals.get(day, 0)
-                    if rev_val > 0:
-                        rev_line_parts.append((pad_col(format_revenue(rev_val)), ANSI_GREEN))
-                    else:
-                        rev_line_parts.append((pad_col("0"), ANSI_GREY))
+                    rev_str = format_revenue(rev_val)
+                    color = green_color if rev_val > 0 else grey_color
+                    
+                    try:
+                        bbox = draw.textbbox((0, 0), rev_str, font=font_rev)
+                        text_w = bbox[2] - bbox[0]
+                        text_h = bbox[3] - bbox[1]
+                    except Exception:
+                        text_w, text_h = len(rev_str) * 10, 15
+                    draw.text((x + (card_w - text_w) // 2, y + 35), rev_str, font=font_rev, fill=color)
 
-            lines.append(format_ansi_line(date_line_parts, ANSI_GREY))
-            lines.append(format_ansi_line(rev_line_parts, ANSI_GREY))
-            if i < len(weeks) - 1:
-                lines.append(f"{ANSI_GREY}-------+-------+-------+-------+-------+-------+-------{ANSI_RESET}")
-
-        lines.append("```")
-
+        # Footer
         total_rev = sum(daily_totals.values())
-        lines.append(f"**Total:** {total_rev:,} <:poker_chip:1490458259855773707>")
+        footer_y = start_grid_y + grid_h + 20
+        draw.line([padding, footer_y, img_w - padding, footer_y], fill=(40, 40, 60), width=1)
+        
+        total_text = f"Total Monthly Revenue: {total_rev:,} Chips"
+        draw.text((padding, footer_y + 20), total_text, font=font_total, fill=green_color)
 
-        await interaction.followup.send("\n".join(lines))
+        # Save and send
+        temp_img_path = f"revenue_{target_year_month}.png"
+        img.save(temp_img_path)
+
+        file = discord.File(temp_img_path, filename=f"revenue_{target_year_month}.png")
+        await interaction.followup.send(file=file)
+
+        # Clean up
+        try:
+            if os.path.exists(temp_img_path):
+                os.remove(temp_img_path)
+        except Exception as e:
+            print(f"Error removing temp calendar image: {e}")
 
     @pokeradmin.command(name="adjustrevenue", description="[Admin] Manually adjust all-time revenue tracker")
     @app_commands.describe(amount="Amount to add (or negative to subtract)")

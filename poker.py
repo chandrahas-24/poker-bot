@@ -4386,24 +4386,24 @@ class PokerCog(commands.Cog):
         # Fonts
         font_path = "/System/Library/Fonts/HelveticaNeue.ttc"
         try:
-            font_title = ImageFont.truetype(font_path, 26)
-            font_header = ImageFont.truetype(font_path, 16)
-            font_date = ImageFont.truetype(font_path, 14)
-            font_rev = ImageFont.truetype(font_path, 18)
-            font_total = ImageFont.truetype(font_path, 20)
+            font_title = ImageFont.truetype(font_path, 34)
+            font_header = ImageFont.truetype(font_path, 22)
+            font_date = ImageFont.truetype(font_path, 18)
+            font_rev = ImageFont.truetype(font_path, 24)
+            font_total = ImageFont.truetype(font_path, 26)
         except Exception:
             font_title = font_header = font_date = font_rev = font_total = ImageFont.load_default()
 
         num_weeks = len(weeks)
         padding = 20
-        card_w = 100
-        card_h = 80
+        card_w = 115
+        card_h = 95
         gap = 10
         
-        header_h = 80
-        weekdays_h = 40
+        header_h = 90
+        weekdays_h = 45
         grid_h = card_h * num_weeks + gap * (num_weeks - 1)
-        footer_h = 60
+        footer_h = 70
         
         img_w = padding * 2 + card_w * 7 + gap * 6
         img_h = padding + header_h + weekdays_h + grid_h + footer_h + padding
@@ -4424,7 +4424,7 @@ class PokerCog(commands.Cog):
                 bbox = draw.textbbox((0, 0), day_lbl, font=font_header)
                 text_w = bbox[2] - bbox[0]
             except Exception:
-                text_w = len(day_lbl) * 10
+                text_w = len(day_lbl) * 12
             text_x = x + (card_w - text_w) // 2
             draw.text((text_x, start_y), day_lbl, font=font_header, fill=text_muted)
 
@@ -4442,11 +4442,11 @@ class PokerCog(commands.Cog):
                         text_w = bbox[2] - bbox[0]
                         text_h = bbox[3] - bbox[1]
                     except Exception:
-                        text_w, text_h = 5, 5
+                        text_w, text_h = 6, 6
                     draw.text((x + (card_w - text_w) // 2, y + (card_h - text_h) // 2 - 5), ".", font=font_date, fill=(50, 50, 70))
                 else:
                     draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=card_bg)
-                    draw.text((x + 8, y + 6), f"{day:02d}", font=font_date, fill=cyan_color)
+                    draw.text((x + 10, y + 8), f"{day:02d}", font=font_date, fill=cyan_color)
                     
                     rev_val = daily_totals.get(day, 0)
                     rev_str = format_revenue(rev_val)
@@ -4457,8 +4457,8 @@ class PokerCog(commands.Cog):
                         text_w = bbox[2] - bbox[0]
                         text_h = bbox[3] - bbox[1]
                     except Exception:
-                        text_w, text_h = len(rev_str) * 10, 15
-                    draw.text((x + (card_w - text_w) // 2, y + 35), rev_str, font=font_rev, fill=color)
+                        text_w, text_h = len(rev_str) * 12, 18
+                    draw.text((x + (card_w - text_w) // 2, y + 48), rev_str, font=font_rev, fill=color)
 
         # Footer
         total_rev = sum(daily_totals.values())

@@ -568,7 +568,8 @@ async def get_player_stats(user_id: int) -> dict | None:
                COALESCE(s.royal_flush_wins, 0) AS royal_flush_wins,
                COALESCE(s.times_wiped, 0) AS times_wiped,
                COALESCE(s.vpip_count, 0) AS vpip_count,
-               COALESCE(s.vpip_hands, 0) AS vpip_hands
+               COALESCE(s.vpip_hands, 0) AS vpip_hands,
+               (SELECT COALESCE(SUM(amount), 0) FROM currency_log WHERE user_id = s.user_id AND event_type = 'Jackpot' AND amount > 0) AS jackpot_winnings
         FROM stats s LEFT JOIN wallets w ON s.user_id = w.user_id
         WHERE s.user_id = ?
     """, (user_id,)) as c:

@@ -5310,6 +5310,7 @@ class StatsView(discord.ui.View):
             f"**Four of a Kind:** `{self.row['quads_wins']}`\n"
             f"**Straight Flush:** `{self.row['straight_flush_wins']}`\n"
             f"**Royal Flush:** `{self.row['royal_flush_wins']}`\n"
+            f"**Jackpot Winnings:** `{self.row.get('jackpot_winnings', 0):,}` <:poker_chip:1490458259855773707>\n"
         )
 
         if self.row.get('times_wiped', 0) > 0:

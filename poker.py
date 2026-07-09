@@ -2702,7 +2702,6 @@ class GameView(discord.ui.View):
         pot_half = max(call_amt, g.pot // 2) if p else 0
         await interaction.followup.send(
             f"**Raise options** — Pot: {g.pot} {get_chip_emoji(self.t)}  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n"
-            f"· Min Raise = +{min_raise_amt}  · 1/3 Pot = +{pot_third}  · 1/2 Pot = +{pot_half}",
             view=view, ephemeral=True)
 
     @discord.ui.button(label="Fold", style=discord.ButtonStyle.red, row=1)

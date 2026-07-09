@@ -153,14 +153,18 @@ class EventLogsCog(commands.Cog):
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
     @eventlog_group.command(name="hoststats", description="View total events hosted by staff since a specific date")
-    @app_commands.describe(start_date="Start date in YYYY-MM-DD format (e.g., 2023-10-01)")
-    async def eventlog_hoststats(self, interaction: discord.Interaction, start_date: str):
+    @app_commands.describe(start_date="Start date in YYYY-MM-DD format (e.g., 2023-10-01)", end_date="End date in YYYY-MM-DD format (optional, defaults to today)")
+    async def eventlog_hoststats(self, interaction: discord.Interaction, start_date: str, end_date: str = None):
         if not await is_event_staff(interaction):
             await interaction.response.send_message("❌ Missing required permissions.", ephemeral=True)
             return
 
         try:
             datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            if end_date:
+                datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            else:
+                end_date = datetime.date.today().strftime("%Y-%m-%d")
         except ValueError:
             await interaction.response.send_message("❌ Invalid date format. Please use **YYYY-MM-DD**.", ephemeral=True)
             return
@@ -169,14 +173,14 @@ class EventLogsCog(commands.Cog):
 
         try:
             # Requires fetch_staff_stats to be present in eventlog_database.py
-            records = await eventlog_database.fetch_staff_stats(start_date)
+            records = await eventlog_database.fetch_staff_stats(start_date, end_date)
 
             if not records:
-                await interaction.followup.send(f"❌ No events logged since **{start_date}**.")
+                await interaction.followup.send(f"❌ No events logged between **{start_date}** and **{end_date}**.")
                 return
 
             embed = discord.Embed(
-                title=f"📊 Staff Event Stats (Since {start_date})",
+                title=f"📊 Staff Event Stats ({start_date} - {end_date})",
                 color=0x3498db
             )
 

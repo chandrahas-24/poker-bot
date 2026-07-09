@@ -76,17 +76,17 @@ async def execute_ro_query(query: str):
             return await cursor.fetchall()
 
 
-async def fetch_staff_stats(start_date: str):
-    """Fetches total events hosted per staff member since a given date."""
+async def fetch_staff_stats(start_date: str, end_date: str):
+    """Fetches total events hosted per staff member between start_date and end_date."""
     async with aiosqlite.connect("eventlog_database.db") as db:
         db.row_factory = aiosqlite.Row
 
         query = """
             SELECT staff_id, COUNT(*) as total_events 
             FROM event_logs 
-            WHERE timestamp >= ? 
+            WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY staff_id 
             ORDER BY total_events DESC
         """
-        async with db.execute(query, (f"{start_date} 00:00:00",)) as cursor: # appended 00:00:00 to start at midnight
+        async with db.execute(query, (f"{start_date} 00:00:00", f"{end_date} 23:59:59")) as cursor:
             return await cursor.fetchall()

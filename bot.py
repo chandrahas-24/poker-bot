@@ -22,6 +22,7 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, allowed_mentions=discord.AllowedMentions(users=True))
+bot.startup_complete = False
 
 # ── Donation listener config ──────────────────────────────────────────────────
 DONATION_BOT_ID  = 270904126974590976
@@ -157,6 +158,11 @@ async def daily_inactive_wipe():
 
 @bot.event
 async def on_ready():
+    if bot.startup_complete:
+        print("🔄 Reconnected to Discord.")
+        return
+
+    bot.startup_complete = True
     await init_db()
     await init_tutorial_db()
     await eventlog_database.init_log_db()

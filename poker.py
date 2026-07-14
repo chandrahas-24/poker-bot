@@ -4306,7 +4306,11 @@ class PokerCog(commands.Cog):
     @pokeradmin.command(name="salt", description="[Admin] View daily house profits in a monthly calendar layout")
     @app_commands.describe(month="YYYY-MM format (e.g. 2026-07) - defaults to current month")
     async def salt(self, interaction: discord.Interaction, month: str = None):
-        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+        if not (
+                interaction.user.guild_permissions.administrator
+                or interaction.user.id in self.DEV_USER_IDS
+                or interaction.guild.get_role(1010238899320270999) in interaction.user.roles
+        ):
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=False)

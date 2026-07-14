@@ -4284,7 +4284,11 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="revenue", description="[Admin] View projected house profits")
     async def revenue(self, interaction: discord.Interaction):
-        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+        if not (
+                interaction.user.guild_permissions.administrator
+                or interaction.user.id in self.DEV_USER_IDS
+                or interaction.guild.get_role(1010238899320270999) in interaction.user.roles
+        ):
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
         await interaction.response.defer(ephemeral=False)

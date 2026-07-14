@@ -4284,6 +4284,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="revenue", description="[Admin] View projected house profits")
     async def revenue(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=False)
         if not (
                 interaction.user.guild_permissions.administrator
                 or interaction.user.id in self.DEV_USER_IDS
@@ -4291,7 +4292,6 @@ class PokerCog(commands.Cog):
         ):
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True);
             return
-        await interaction.response.defer(ephemeral=False)
 
         stats = await db.get_revenue_stats()
 
@@ -4306,6 +4306,8 @@ class PokerCog(commands.Cog):
     @pokeradmin.command(name="salt", description="[Admin] View daily house profits in a monthly calendar layout")
     @app_commands.describe(month="YYYY-MM format (e.g. 2026-07) - defaults to current month")
     async def salt(self, interaction: discord.Interaction, month: str = None):
+        await interaction.response.defer(ephemeral=False)
+
         if not (
                 interaction.user.guild_permissions.administrator
                 or interaction.user.id in self.DEV_USER_IDS
@@ -4313,7 +4315,6 @@ class PokerCog(commands.Cog):
         ):
             await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=False)
 
         # 1. Parse Year & Month
         import re

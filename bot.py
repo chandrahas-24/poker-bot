@@ -519,6 +519,9 @@ async def reload(ctx, cog_name: str = None):
                 await ctx.send(f"❌ Failed to reload helper `{helper}`:\n```python\n{e}\n```")
                 return
 
+    if "database" in reloaded_helpers:
+        await sys.modules["database"].load_custom_cosmetics()
+
     # 4. Reload cogs
     reloaded_cogs = []
     for cog in cogs_to_reload:

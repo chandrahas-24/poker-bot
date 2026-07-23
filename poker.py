@@ -5285,7 +5285,7 @@ class PokerCog(commands.Cog):
     @app_commands.describe(start="Start date YYYY-MM-DD (required)",
                            end="End date YYYY-MM-DD (optional, defaults to start date)")
     async def dealer_hours(self, interaction: discord.Interaction, start: str, end: str = None):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
@@ -5303,7 +5303,7 @@ class PokerCog(commands.Cog):
         for r in rows:
             lines.append(f"• **{r['dealer_name']}** — {r['minutes']} min")
 
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        await interaction.followup.send("\n".join(lines))
 
 class StatsView(discord.ui.View):
     def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):

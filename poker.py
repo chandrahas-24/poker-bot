@@ -5285,7 +5285,7 @@ class PokerCog(commands.Cog):
     @app_commands.describe(start="Start date YYYY-MM-DD (required)",
                            end="End date YYYY-MM-DD (optional, defaults to start date)")
     async def dealer_hours(self, interaction: discord.Interaction, start: str, end: str = None):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return

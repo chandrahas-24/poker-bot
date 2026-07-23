@@ -3246,7 +3246,6 @@ class PokerCog(commands.Cog):
                 return
         t = TableState(name, interaction.user.id, interaction.user.name)
         tables[(interaction.guild_id, interaction.channel_id)] = t
-        await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'open')
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
@@ -3357,6 +3356,7 @@ class PokerCog(commands.Cog):
             return
 
         t.msg_count = 0
+        await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'start')
         await refresh(interaction.channel, t, new_hand=True)
         await interaction.followup.send("✅ Hand started!", ephemeral=True)
 

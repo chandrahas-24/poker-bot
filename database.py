@@ -650,7 +650,7 @@ async def close_unclosed_dealer_sessions():
     async with db.execute("""
         SELECT table_id, dealer_id, dealer_name, ts
         FROM dealer_session_log d1
-        WHERE event IN ('open', 'dealer_change')
+        WHERE event IN ('start', 'dealer_change')
         AND NOT EXISTS (
             SELECT 1 FROM dealer_session_log d2
             WHERE d2.table_id = d1.table_id
@@ -2131,7 +2131,7 @@ async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
     totals = defaultdict(lambda: {'dealer_name': '', 'seconds': 0})
 
     for dealer_id, dealer_name, event, ts in rows:
-        if event in ('open', 'dealer_change'):
+        if event in ('start', 'dealer_change'):
             if open_event:
                 did, dname, start = open_event
                 delta = dt.fromisoformat(ts) - dt.fromisoformat(start)

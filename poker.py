@@ -567,7 +567,7 @@ async def post_hand_log(channel, t: TableState, result):
 
         # 🚨 Check the snapshot to append (folded)
         if sp and sp.hole_cards:
-            cards = hand_str(sp.hole_cards)
+            cards = hand_str(sp.hole_cards) + (" ✨" if sp.egirl_saro else "")
             if uid in folded_ids:
                 cards += " (folded)"
         else:
@@ -1823,7 +1823,8 @@ class ShowdownRevealView(discord.ui.View):
         else:
             rank_str = ""
 
-        caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{rank_str}"
+        shiny = " ✨" if sp.egirl_saro else ""
+        caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{shiny}{rank_str}"
         if USE_IMAGES:
             await interaction.response.defer()
             file = await asyncio.to_thread(card_images.make_strip, sp.hole_cards, 0, False, sp.egirl_saro)
@@ -1891,7 +1892,8 @@ async def _reveal_phase(channel, t: TableState, result):
         if w.hole_cards:
             score = evaluator.evaluate(w.hole_cards, result.community)
             rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
-            caption = f"🏆 **{w.display_name}** wins and shows: {hand_str(w.hole_cards)} — *{rank_str}*"
+            shiny = " ✨" if w.egirl_saro else ""
+            caption = f"🏆 **{w.display_name}** wins and shows: {hand_str(w.hole_cards)}{shiny} — *{rank_str}*"
             if USE_IMAGES:
                 file = await asyncio.to_thread(card_images.make_strip, w.hole_cards, 0, False, w.egirl_saro)
                 await channel.send(caption, file=file)
@@ -2762,7 +2764,7 @@ class GameView(discord.ui.View):
     async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = self.t.game.get_player(interaction.user.id)
         if not p or not p.hole_cards:
-            await interaction.response.send_message("❌ No cards right now.", ephemeral=True);
+            await interaction.response.send_message("❌ No cards right now.", ephemeral=True)
             return
 
         strength = ""
@@ -2772,20 +2774,22 @@ class GameView(discord.ui.View):
             pct = round((1 - score / 7462) * 100, 1)
             strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
 
-        caption = f"Your hole cards — {p.chips} {get_chip_emoji(self.t)} at table{strength}\n**Cards:** {hand_str(p.hole_cards)}"
+        shiny = " ✨" if p.egirl_saro else ""
+        caption = f"Your hole cards — {p.chips} {get_chip_emoji(self.t)} at table{strength}\n**Cards:** {hand_str(p.hole_cards)}{shiny}"
 
-        # 1. INSTANTLY send the text so players with slow internet see their cards immediately
-        await interaction.response.send_message(caption, ephemeral=True)
-
-        # 2. Generate the heavy image and patch it in a second later
         if USE_IMAGES:
+            await interaction.response.defer(ephemeral=True)
             try:
                 file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, True, p.egirl_saro)
-                await interaction.edit_original_response(attachments=[file])
+                await interaction.followup.send(caption, file=file, ephemeral=True)
             except Exception as e:
                 print(f"🚨 [ERROR] {e}")
                 import traceback
                 traceback.print_exc()
+                await interaction.followup.send(caption, ephemeral=True)  # text-only fallback
+            return
+
+        await interaction.response.send_message(caption, ephemeral=True)
 
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):

@@ -281,6 +281,18 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS dealer_session_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id    TEXT NOT NULL,
+                table_name  TEXT NOT NULL,
+                dealer_id   INTEGER NOT NULL,
+                dealer_name TEXT NOT NULL,
+                event       TEXT NOT NULL,
+                ts          TEXT NOT NULL
+            )
+        """)
+
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
@@ -631,6 +643,35 @@ async def recover_chips_in_play() -> list[dict]:
         await db.execute("DELETE FROM chips_in_play")
         await db.commit()
     return rows
+
+async def close_unclosed_dealer_sessions():
+    """Called on restart — closes any sessions that never got a close/no_players event."""
+    db = await _get_db()
+    async with db.execute("""
+        SELECT table_id, dealer_id, dealer_name, ts
+        FROM dealer_session_log d1
+        WHERE event IN ('open', 'dealer_change')
+        AND NOT EXISTS (
+            SELECT 1 FROM dealer_session_log d2
+            WHERE d2.table_id = d1.table_id
+            AND d2.ts > d1.ts
+            AND d2.event IN ('close', 'no_players', 'crash')
+        )
+    """) as c:
+        rows = await c.fetchall()
+
+    if not rows:
+        return
+
+    now = datetime.utcnow().isoformat()
+    async with _write_lock:
+        for table_id, dealer_id, dealer_name in rows:
+            await db.execute(
+                "INSERT INTO dealer_session_log (table_id, table_name, dealer_id, dealer_name, event, ts) VALUES (?,?,?,?,?,?)",
+                (table_id, '', dealer_id, dealer_name, 'crash', now)
+            )
+        await db.commit()
+    print(f"⚠️  Closed {len(rows)} unclosed dealer session(s) after restart")
 
 
 # ── Audit log ─────────────────────────────────────────────────────────────────
@@ -2065,3 +2106,47 @@ async def get_autorebuy(user_id: int) -> int:
 
 async def set_autorebuy(user_id: int, amount: int):
     await set_player_preference(user_id, auto_rebuy_amount=amount)
+
+async def log_dealer_event(table_id: str, table_name: str, dealer_id: int, dealer_name: str, event: str):
+    async with _write_lock:
+        db = await _get_db()
+        await db.execute(
+            "INSERT INTO dealer_session_log (table_id, table_name, dealer_id, dealer_name, event, ts) VALUES (?,?,?,?,?,?)",
+            (table_id, table_name, dealer_id, dealer_name, event, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
+    """start_date, end_date: 'YYYY-MM-DD' inclusive."""
+    db = await _get_db()
+    async with db.execute(
+        "SELECT dealer_id, dealer_name, event, ts FROM dealer_session_log WHERE DATE(ts) BETWEEN ? AND ? ORDER BY ts ASC",
+        (start_date, end_date)
+    ) as c:
+        rows = await c.fetchall()
+
+    from collections import defaultdict
+    from datetime import datetime as dt
+    open_event = None
+    totals = defaultdict(lambda: {'dealer_name': '', 'seconds': 0})
+
+    for dealer_id, dealer_name, event, ts in rows:
+        if event in ('open', 'dealer_change'):
+            if open_event:
+                did, dname, start = open_event
+                delta = dt.fromisoformat(ts) - dt.fromisoformat(start)
+                totals[did]['dealer_name'] = dname
+                totals[did]['seconds'] += int(delta.total_seconds())
+            open_event = (dealer_id, dealer_name, ts)
+        elif event in ('close', 'no_players', 'crash'):
+            if open_event:
+                did, dname, start = open_event
+                delta = dt.fromisoformat(ts) - dt.fromisoformat(start)
+                totals[did]['dealer_name'] = dname
+                totals[did]['seconds'] += int(delta.total_seconds())
+                open_event = None
+
+    return [
+        {'dealer_id': did, 'dealer_name': v['dealer_name'], 'minutes': round(v['seconds'] / 60, 1)}
+        for did, v in sorted(totals.items(), key=lambda x: -x[1]['seconds'])
+    ]

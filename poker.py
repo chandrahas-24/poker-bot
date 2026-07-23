@@ -390,6 +390,7 @@ async def _auto_next_hand(t: TableState, channel):
     total = len(active) + len(pending_with_chips)
 
     if total < 2:
+        await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'no_players')
         await refresh(channel, t, cosmetics_cache=None)
         await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
@@ -425,6 +426,7 @@ async def _close_table(channel, t: TableState):
     if getattr(t, 'is_fully_closed', False):
         return
     t.is_fully_closed = True
+    await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'close')
 
     t.closing = True
     key = (channel.guild.id, channel.id)
@@ -3244,6 +3246,7 @@ class PokerCog(commands.Cog):
                 return
         t = TableState(name, interaction.user.id, interaction.user.name)
         tables[(interaction.guild_id, interaction.channel_id)] = t
+        await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'open')
         settings = await db.get_settings(interaction.guild_id)
         t.game.SMALL_BLIND = settings["small_blind"]
         t.game.BIG_BLIND   = settings["big_blind"]
@@ -3885,6 +3888,7 @@ class PokerCog(commands.Cog):
         # Switch the tip recipient
         t.manager_id = user.id
         t.manager_name = user.name  # Update the saved name!
+        await db.log_dealer_event(t.id, t.name, user.id, user.name, 'dealer_change')
 
         await interaction.followup.send(
             f"🔄 **{user.mention}** has taken over as the dealer! All new tips will go to them.")
@@ -5276,6 +5280,30 @@ class PokerCog(commands.Cog):
                 await _process_result(interaction.guild, interaction.channel, t)
             else:
                 await refresh(interaction.channel, t, cosmetics_cache=getattr(t, 'cosmetics_cache', {}))
+
+    @pokermgr.command(name="dealerhours", description="[Manager] Show minutes hosted per dealer between two UTC dates")
+    @app_commands.describe(start="Start date YYYY-MM-DD (required)",
+                           end="End date YYYY-MM-DD (optional, defaults to start date)")
+    async def dealer_hours(self, interaction: discord.Interaction, start: str, end: str = None):
+        await interaction.response.defer(ephemeral=True)
+        if not await is_manager(interaction):
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
+            return
+
+        end_date = end or start
+        rows = await db.get_dealer_minutes(start, end_date)
+
+        if not rows:
+            label = start if not end else f"{start} → {end_date}"
+            await interaction.followup.send(f"No dealer sessions logged for `{label}`.", ephemeral=True)
+            return
+
+        label = start if end_date == start else f"{start} → {end_date}"
+        lines = [f"**Dealer Hours — {label}**"]
+        for r in rows:
+            lines.append(f"• **{r['dealer_name']}** — {r['minutes']} min")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 class StatsView(discord.ui.View):
     def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):

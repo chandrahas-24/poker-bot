@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 import traceback
 
-from database import init_db, recover_chips_in_play
+from database import init_db, recover_chips_in_play, close_unclosed_dealer_sessions
 import database as db
 from tutorial_db import init_db as init_tutorial_db
 import eventlog_database
@@ -169,6 +169,7 @@ async def on_ready():
     # await tournament_db.init_db()
 
     recovered = await recover_chips_in_play()
+    await close_unclosed_dealer_sessions()
     if recovered:
         print(f"⚠️  Recovered chips for {len(recovered)} player(s) after restart:")
         for r in recovered:

@@ -518,7 +518,12 @@ class PokerGame:
                 if call_amt > move["amount"]:
                     success, msg = self.fold(p.user_id)
             elif action == "raise_all_in":
-                success, msg = self.raise_bet(p.user_id, p.chips)
+                call_needed = self.current_bet - p.bet
+                raise_on_top = p.chips - call_needed
+                if raise_on_top <= 0:
+                    success, msg = self.check_or_call(p.user_id)
+                else:
+                    success, msg = self.raise_bet(p.user_id, raise_on_top)
             elif action == "raise_to":
                 target_total = move["amount"]
                 relative_raise = target_total - self.current_bet

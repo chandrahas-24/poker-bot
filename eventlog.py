@@ -262,6 +262,8 @@ class EventLogsCog(commands.Cog):
             return
 
         emoji_name = str(payload.emoji.name).lower()
+        if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name != "✅" and "hockey" not in emoji_name:
+            return
 
         if payload.message_id in self.processing_logs:
             return
@@ -319,8 +321,8 @@ class EventLogsCog(commands.Cog):
                 event_prize_msg=prize
             )
 
-            #if success:
-            #    await message.add_reaction("💾")
+            if success:
+                await message.add_reaction("💾")
 
         except Exception:
             traceback.print_exc()

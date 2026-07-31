@@ -2869,64 +2869,82 @@ class ConfirmResetView2(discord.ui.View):
 
 # ── Cosmetics UI ─────────────────────────────────────────────────────────────
 
-def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict):
-    """Build the /poker titles embed and its interactive select-menu view."""
+def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "titles"):
+    """Build the /poker titles embed and its interactive select-menu view on separate pages."""
     owned_titles = set(cosmetics["unlocked_titles"])
-    owned_msgs   = set(cosmetics["unlocked_win_msgs"])
-    active_t     = cosmetics.get("active_title")
-    active_m     = cosmetics.get("active_win_msg")
+    owned_msgs = set(cosmetics["unlocked_win_msgs"])
+    active_t = cosmetics.get("active_title")
+    active_m = cosmetics.get("active_win_msg")
 
     embed = discord.Embed(title="🎖️ Your Cosmetics", color=0x9b59b6)
 
-    # Get visible cosmetics for this user
-    visible_titles = db.get_visible_cosmetics_for_user(user_id, owned_titles, db.TITLES)
-    visible_winmsgs = db.get_visible_cosmetics_for_user(user_id, owned_msgs, db.WIN_MESSAGES)
+    # ── TITLES PAGE ────────────────────────────────────────────────────────────
+    if page == "titles":
+        visible_titles = db.get_visible_cosmetics_for_user(user_id, owned_titles, db.TITLES)
+        t_lines = []
+        for tid, info in visible_titles.items():
+            rarity = db.RARITY_LABEL.get(info["rarity"], "")
+            display_str = f"`{info['display']}` - {rarity}" if rarity else f"`{info['display']}`"
+            if tid in owned_titles:
+                equipped = "  ◀ **equipped**" if tid == active_t else ""
+                desc = f" — *{info['description']}*" if info.get('description') else ""
+                t_lines.append(f"✅ {display_str}{desc}{equipped}")
+            else:
+                desc = info['description'] if info['rarity'] != 'legendary' else "???"
+                t_lines.append(f"🔒 ~{display_str}~ — *{desc}*")
 
-    # ── Titles field ───────────────────────────────────────────────────────────
-    t_lines = []
-    for tid, info in visible_titles.items():
-        rarity = db.RARITY_LABEL.get(info["rarity"], "")
-        if tid in owned_titles:
-            equipped = "  ◀ **equipped**" if tid == active_t else ""
-            desc = f" — *{info['description']}*" if info.get('description') else ""
-            t_lines.append(f"✅ {info['display']} {rarity}{desc}{equipped}")
+        total_visible = len(visible_titles)
+
+        # Group exactly 10 items per field
+        chunk_size = 10
+        t_chunks = [t_lines[i:i + chunk_size] for i in range(0, len(t_lines), chunk_size)]
+
+        if not t_chunks:
+            embed.add_field(name=f"🎖️ Titles ({len(owned_titles)}/{total_visible} unlocked)", value="None yet.",
+                            inline=False)
         else:
-            desc = info['description'] if info['rarity'] != 'legendary' else "???"
-            t_lines.append(f"🔒 ~~{info['display']}~~ — *{desc}*")
+            for i, chunk in enumerate(t_chunks):
+                # Use main header for the first chunk, invisible zero-width space for the rest
+                name = f"🎖️ Titles ({len(owned_titles)}/{total_visible} unlocked)" if i == 0 else "\u200b"
+                embed.add_field(name=name, value="\n".join(chunk)[:1024], inline=False)
 
-    total_visible = len(visible_titles)
-    embed.add_field(
-        name=f"🎖️ Titles  ({len(owned_titles)}/{total_visible} unlocked)",
-        value="\n".join(t_lines) or "None yet.",
-        inline=False,
-    )
+    # ── WIN MESSAGES PAGE ──────────────────────────────────────────────────────
+    else:
+        visible_winmsgs = db.get_visible_cosmetics_for_user(user_id, owned_msgs, db.WIN_MESSAGES)
+        m_lines = []
+        for mid, info in visible_winmsgs.items():
+            rarity = db.RARITY_LABEL.get(info["rarity"], "")
+            display_str = f"{info['display']} - {rarity}" if rarity else f"{info['display']}"
+            if mid in owned_msgs:
+                equipped = "  ◀ **equipped**" if mid == active_m else ""
+                desc = f" — *{info['description']}*" if info.get('description') else ""
+                m_lines.append(f"✅ {display_str}{desc}{equipped}")
+            else:
+                desc = info['description'] if info['rarity'] != 'legendary' else "???"
+                m_lines.append(f"🔒 ~{display_str}~ — *{desc}*")
 
-    # ── Win messages field ────────────────────────────────────────────────────
-    m_lines = []
-    for mid, info in visible_winmsgs.items():
-        rarity = db.RARITY_LABEL.get(info["rarity"], "")
-        if mid in owned_msgs:
-            equipped = "  ◀ **equipped**" if mid == active_m else ""
-            desc = f" — *{info['description']}*" if info.get('description') else ""
-            m_lines.append(f"✅ {info['display']} {rarity}{desc}{equipped}")
+        total_visible_msgs = len(visible_winmsgs)
+
+        # Group exactly 10 items per field
+        chunk_size = 10
+        m_chunks = [m_lines[i:i + chunk_size] for i in range(0, len(m_lines), chunk_size)]
+
+        if not m_chunks:
+            embed.add_field(name=f"💬 Win Messages ({len(owned_msgs)}/{total_visible_msgs} unlocked)", value="None yet.",
+                            inline=False)
         else:
-            desc = info['description'] if info['rarity'] != 'legendary' else "???"
-            m_lines.append(f"🔒 ~~{info['display']}~~ — *{desc}*")
+            for i, chunk in enumerate(m_chunks):
+                # Use main header for the first chunk, invisible zero-width space for the rest
+                name = f"💬 Win Messages ({len(owned_msgs)}/{total_visible_msgs} unlocked)" if i == 0 else "\u200b"
+                embed.add_field(name=name, value="\n".join(chunk)[:1024], inline=False)
 
-    total_visible_msgs = len(visible_winmsgs)
-    embed.add_field(
-        name=f"💬 Win Messages  ({len(owned_msgs)}/{total_visible_msgs} unlocked)",
-        value="\n".join(m_lines) or "None yet.",
-        inline=False,
-    )
-
-    embed.set_footer(text="Use the dropdowns below to equip — only your unlocked items appear.")
-    view = CosmeticsView(user_id, owned_titles, owned_msgs, active_t, active_m)
+    embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
+    view = CosmeticsView(user_id, owned_titles, owned_msgs, active_t, active_m, page)
     return embed, view
 
 
 class CosmeticsView(discord.ui.View):
-    """Attach two Select menus to /poker titles so the user can equip without typing IDs."""
+    """Attach Select menus and a page toggle button to /poker titles."""
 
     def __init__(
         self,
@@ -2935,53 +2953,54 @@ class CosmeticsView(discord.ui.View):
         owned_msgs: set[str],
         active_title: str | None,
         active_msg: str | None,
+        page: str = "titles"
     ):
         super().__init__(timeout=120)
         self.user_id = user_id
+        self.page = page
         self.message: discord.Message | discord.WebhookMessage | None = None
 
-        # ── Title select ───────────────────────────────────────────────────────
-        title_opts = [discord.SelectOption(label="— Remove title —", value="none", emoji="❌")]
-        for tid in owned_titles:
-            info = db.TITLES.get(tid)
-            if info:
-                title_opts.append(discord.SelectOption(
-                    label=info["display"],
-                    value=tid,
-                    default=(tid == active_title),
-                ))
-        # Discord requires 1–25 options; cap just in case
-        title_opts = title_opts[:25]
+        if self.page == "titles":
+            # ── Title select ───────────────────────────────────────────────────
+            title_opts = [discord.SelectOption(label="— Remove title —", value="none", emoji="❌")]
+            for tid in owned_titles:
+                info = db.TITLES.get(tid)
+                if info:
+                    title_opts.append(discord.SelectOption(
+                        label=info["display"], value=tid, default=(tid == active_title)
+                    ))
 
-        title_select = discord.ui.Select(
-            placeholder="🎖️ Equip a title…",
-            options=title_opts,
-            custom_id="cosmetics:title",
-            row=0,
-        )
-        title_select.callback = self._on_title_select
-        self.add_item(title_select)
+            title_select = discord.ui.Select(
+                placeholder="🎖️ Equip a title…", options=title_opts[:25], custom_id="cosmetics:title", row=0
+            )
+            title_select.callback = self._on_title_select
+            self.add_item(title_select)
 
-        # ── Win-message select ────────────────────────────────────────────────
-        msg_opts = [discord.SelectOption(label="— Remove win message —", value="none", emoji="❌")]
-        for mid in owned_msgs:
-            info = db.WIN_MESSAGES.get(mid)
-            if info:
-                msg_opts.append(discord.SelectOption(
-                    label=info["display"],
-                    value=mid,
-                    default=(mid == active_msg),
-                ))
-        msg_opts = msg_opts[:25]
+            # Pagination Button
+            switch_btn = discord.ui.Button(label="View Win Messages", style=discord.ButtonStyle.primary, row=1, emoji="💬")
+            switch_btn.callback = self._on_switch
+            self.add_item(switch_btn)
 
-        msg_select = discord.ui.Select(
-            placeholder="💬 Equip a win message…",
-            options=msg_opts,
-            custom_id="cosmetics:winmsg",
-            row=1,
-        )
-        msg_select.callback = self._on_msg_select
-        self.add_item(msg_select)
+        else:
+            # ── Win-message select ─────────────────────────────────────────────
+            msg_opts = [discord.SelectOption(label="— Remove win message —", value="none", emoji="❌")]
+            for mid in owned_msgs:
+                info = db.WIN_MESSAGES.get(mid)
+                if info:
+                    msg_opts.append(discord.SelectOption(
+                        label=info["display"], value=mid, default=(mid == active_msg)
+                    ))
+
+            msg_select = discord.ui.Select(
+                placeholder="💬 Equip a win message…", options=msg_opts[:25], custom_id="cosmetics:winmsg", row=0
+            )
+            msg_select.callback = self._on_msg_select
+            self.add_item(msg_select)
+
+            # Pagination Button
+            switch_btn = discord.ui.Button(label="View Titles", style=discord.ButtonStyle.primary, row=1, emoji="🎖️")
+            switch_btn.callback = self._on_switch
+            self.add_item(switch_btn)
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -2989,13 +3008,21 @@ class CosmeticsView(discord.ui.View):
             return False
         return True
 
+    async def _on_switch(self, interaction: discord.Interaction):
+        if not await self._guard(interaction): return
+        new_page = "winmsgs" if self.page == "titles" else "titles"
+        cosmetics = await db.get_cosmetics(self.user_id)
+        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=new_page)
+        new_view.message = self.message
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
     async def _on_title_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction): return
         chosen = interaction.data["values"][0]
         tid = None if chosen == "none" else chosen
         await db.set_active_title(self.user_id, tid)
         cosmetics = await db.get_cosmetics(self.user_id)
-        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics)
+        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
         new_view.message = self.message
         label = db.TITLES[tid]["display"] if tid else "removed"
         await interaction.response.edit_message(
@@ -3008,7 +3035,7 @@ class CosmeticsView(discord.ui.View):
         mid = None if chosen == "none" else chosen
         await db.set_active_win_msg(self.user_id, mid)
         cosmetics = await db.get_cosmetics(self.user_id)
-        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics)
+        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
         new_view.message = self.message
         label = db.WIN_MESSAGES[mid]["display"] if mid else "removed"
         await interaction.response.edit_message(
@@ -4803,7 +4830,7 @@ class PokerCog(commands.Cog):
 
     # ── Titles & Win Messages ──────────────────────────────────────────────────
 
-    @poker.command(name="titles", description="View and equip your unlocked titles and win messages")
+    @poker.command(name="cosmetics", description="View and equip your unlocked titles and win messages")
     async def titles_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         cosmetics = await db.get_cosmetics(interaction.user.id)

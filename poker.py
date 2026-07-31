@@ -2876,10 +2876,11 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
     active_t = cosmetics.get("active_title")
     active_m = cosmetics.get("active_win_msg")
 
-    embed = discord.Embed(title="🎖️ Your Cosmetics", color=0x9b59b6)
+    embed = discord.Embed(color=0x9b59b6)
 
     # ── TITLES PAGE ────────────────────────────────────────────────────────────
     if page == "titles":
+        embed.title = f"🎖️ Titles ({len(owned_titles)}/{len(db.get_visible_cosmetics_for_user(user_id, owned_titles, db.TITLES))} unlocked)"
         visible_titles = db.get_visible_cosmetics_for_user(user_id, owned_titles, db.TITLES)
         t_lines = []
         for tid, info in visible_titles.items():
@@ -2893,24 +2894,20 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 desc = info['description'] if info['rarity'] != 'legendary' else "???"
                 t_lines.append(f"🔒 ~{display_str}~ — *{desc}*")
 
-        total_visible = len(visible_titles)
-
         # Group exactly 10 items per field
         chunk_size = 10
         t_chunks = [t_lines[i:i + chunk_size] for i in range(0, len(t_lines), chunk_size)]
 
         if not t_chunks:
-            embed.add_field(name=f"🎖️ Titles ({len(owned_titles)}/{total_visible} unlocked)", value="None yet.",
-                            inline=False)
+            embed.add_field(name="\u200b", value="None yet.", inline=False)
         else:
-            for i, chunk in enumerate(t_chunks):
-                # Use main header for the first chunk, invisible zero-width space for the rest
-                name = f"🎖️ Titles ({len(owned_titles)}/{total_visible} unlocked)" if i == 0 else "\u200b"
-                embed.add_field(name=name, value="\n".join(chunk)[:1024], inline=False)
+            for chunk in t_chunks:
+                embed.add_field(name="\u200b", value="\n".join(chunk)[:1024], inline=False)
 
     # ── WIN MESSAGES PAGE ──────────────────────────────────────────────────────
     else:
         visible_winmsgs = db.get_visible_cosmetics_for_user(user_id, owned_msgs, db.WIN_MESSAGES)
+        embed.title = f"💬 Win Messages ({len(owned_msgs)}/{len(visible_winmsgs)} unlocked)"
         m_lines = []
         for mid, info in visible_winmsgs.items():
             rarity = db.RARITY_LABEL.get(info["rarity"], "")
@@ -2923,25 +2920,19 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 desc = info['description'] if info['rarity'] != 'legendary' else "???"
                 m_lines.append(f"🔒 ~{display_str}~ — *{desc}*")
 
-        total_visible_msgs = len(visible_winmsgs)
-
         # Group exactly 10 items per field
         chunk_size = 10
         m_chunks = [m_lines[i:i + chunk_size] for i in range(0, len(m_lines), chunk_size)]
 
         if not m_chunks:
-            embed.add_field(name=f"💬 Win Messages ({len(owned_msgs)}/{total_visible_msgs} unlocked)", value="None yet.",
-                            inline=False)
+            embed.add_field(name="\u200b", value="None yet.", inline=False)
         else:
-            for i, chunk in enumerate(m_chunks):
-                # Use main header for the first chunk, invisible zero-width space for the rest
-                name = f"💬 Win Messages ({len(owned_msgs)}/{total_visible_msgs} unlocked)" if i == 0 else "\u200b"
-                embed.add_field(name=name, value="\n".join(chunk)[:1024], inline=False)
+            for chunk in m_chunks:
+                embed.add_field(name="\u200b", value="\n".join(chunk)[:1024], inline=False)
 
     embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
     view = CosmeticsView(user_id, owned_titles, owned_msgs, active_t, active_m, page)
     return embed, view
-
 
 class CosmeticsView(discord.ui.View):
     """Attach Select menus and a page toggle button to /poker titles."""
@@ -4836,6 +4827,11 @@ class PokerCog(commands.Cog):
         cosmetics = await db.get_cosmetics(interaction.user.id)
         embed, view = _build_cosmetics_embed_and_view(interaction.user.id, cosmetics)
         view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    @poker.command(name="titles", description="View and equip your unlocked titles and win messages")
+    async def titles_alias(self, interaction: discord.Interaction):
+        await self.titles_cmd.callback(self, interaction)
+
 
     @poker.command(name="equiptitle", description="Equip one of your unlocked titles")
     @app_commands.describe(title_id="Your unlocked title — pick from the list")

@@ -261,8 +261,7 @@ class EventLogsCog(commands.Cog):
         if payload.channel_id not in EVENT_LOG_CHANNELS:
             return
 
-        emoji_name = str(payload.emoji.name).lower()
-        if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name != "✅" and "hockey" not in emoji_name:
+        if payload.emoji.name == "❌":
             return
 
         if payload.message_id in self.processing_logs:

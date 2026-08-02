@@ -1,6 +1,4 @@
 import aiosqlite
-from datetime import datetime, timezone, timedelta
-
 async def init_log_db():
     async with aiosqlite.connect("eventlog_database.db") as db:
         await db.execute('''
@@ -25,15 +23,10 @@ async def init_log_db():
 
 
 async def save_embed_log(staff_id: int, staff_username: str, message_id: int, donator_username: str, event_type: str,
-                         event_prize_msg: str) -> bool:
+                         event_prize_msg: str, timestamp: str) -> bool:
     """Inserts the parsed embed data into the database."""
     try:
         async with aiosqlite.connect("eventlog_database.db") as db:
-            ist_time = (
-                    datetime.now(timezone.utc)
-                    + timedelta(hours=5, minutes=30)
-            ).strftime("%Y-%m-%d %H:%M:%S")
-
 
             await db.execute(
                 """
@@ -48,7 +41,7 @@ async def save_embed_log(staff_id: int, staff_username: str, message_id: int, do
                     donator_username,
                     event_type,
                     event_prize_msg,
-                    ist_time
+                    timestamp
                 )
             )
             await db.commit()

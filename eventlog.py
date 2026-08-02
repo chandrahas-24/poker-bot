@@ -275,6 +275,11 @@ class EventLogsCog(commands.Cog):
 
             try:
                 message = await channel.fetch_message(payload.message_id)
+                message_timestamp = (
+                    message.created_at
+                    .astimezone(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+                    .strftime("%Y-%m-%d %H:%M:%S")
+                )
             except discord.NotFound:
                 return
 
@@ -317,7 +322,8 @@ class EventLogsCog(commands.Cog):
                 message_id=payload.message_id,
                 donator_username=donator,
                 event_type=event_type,
-                event_prize_msg=prize
+                event_prize_msg=prize,
+                timestamp = message_timestamp
             )
 
             if success:

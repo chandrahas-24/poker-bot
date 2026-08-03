@@ -5352,7 +5352,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="dealerhours", description="[Manager] Show minutes hosted per dealer between two UTC dates")
     @app_commands.describe(start="Start date (required)",
-                           end="End date (optional, defaults to start date)")
+                           end="End date (optional, defaults to today)")
     @app_commands.autocomplete(
         start=date_autocomplete,
         end=date_autocomplete,
@@ -5377,7 +5377,7 @@ class PokerCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        rows = await db.get_dealer_minutes(start, end_date)
+        rows = await db.get_dealer_minutes(start, end)
 
         if not rows:
             label = start if not end else f"{start} → {end_date}"

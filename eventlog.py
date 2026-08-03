@@ -8,10 +8,9 @@ import aiosqlite
 import re
 import traceback
 import math
-import datetime
 import eventlog_database
 import config
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import dateparser
 
 DATE_FORMAT = "%Y-%m-%d"
@@ -335,7 +334,7 @@ class EventLogsCog(commands.Cog):
                 message = await channel.fetch_message(payload.message_id)
                 message_timestamp = (
                     message.created_at
-                    .astimezone(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+                    .astimezone(timezone(timedelta(hours=5, minutes=30)))
                     .strftime("%Y-%m-%d %H:%M:%S")
                 )
             except discord.NotFound:

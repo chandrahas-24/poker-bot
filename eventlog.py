@@ -11,6 +11,53 @@ import math
 import datetime
 import eventlog_database
 import config
+from datetime import date, datetime, timedelta
+import dateparser
+
+DATE_FORMAT = "%Y-%m-%d"
+
+def parse_date(value: str) -> date:
+    dt = dateparser.parse(
+        value,
+        settings={
+            "PREFER_DATES_FROM": "past",   # "Aug 1" -> most recent Aug 1
+            "DATE_ORDER": "YMD",           # Prefer YYYY-MM-DD
+        },
+    )
+
+    if dt is None:
+        raise ValueError("Invalid date")
+
+    return dt.date()
+
+
+async def date_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    current = current.lower()
+
+    choices = []
+
+    special = [
+        ("Today", "today"),
+        ("Yesterday", "yesterday"),
+        ("Last Week", "last week")
+    ]
+
+    for name, value in special:
+        if current in name.lower() or current in value:
+            choices.append(app_commands.Choice(name=name, value=value))
+
+    # Last 14 days -> today
+    for i in range(14, -1, -1):
+        d = date.today() - timedelta(days=i)
+        s = d.strftime(DATE_FORMAT)
+
+        if current in s:
+            choices.append(app_commands.Choice(name=s, value=s))
+
+    return choices
 
 EVENT_LOG_CHANNELS = [982697197000876032, 1335375276879777812]
 STAFF_ROLE_IDS = [1010238899320270999]
@@ -156,20 +203,31 @@ class EventLogsCog(commands.Cog):
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
 
     @eventlog_group.command(name="hoststats", description="View total events hosted by staff since a specific date")
-    @app_commands.describe(start_date="Start date in YYYY-MM-DD format (e.g., 2023-10-01)", end_date="End date in YYYY-MM-DD format (optional, defaults to today)")
+    @app_commands.describe(
+        start_date="Start date",
+        end_date="End date (defaults to today)"
+    )
+    @app_commands.autocomplete(
+        start_date=date_autocomplete,
+        end_date=date_autocomplete,
+    )
     async def eventlog_hoststats(self, interaction: discord.Interaction, start_date: str, end_date: str = None):
         if not await is_event_staff(interaction):
             await interaction.response.send_message("❌ Missing required permissions.", ephemeral=True)
             return
 
         try:
-            datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            start_date = parse_date(start_date).strftime(DATE_FORMAT)
+
             if end_date:
-                datetime.datetime.strptime(end_date, "%Y-%m-%d")
+                end_date = parse_date(end_date).strftime(DATE_FORMAT)
             else:
-                end_date = datetime.date.today().strftime("%Y-%m-%d")
+                end_date = date.today().strftime(DATE_FORMAT)
         except ValueError:
-            await interaction.response.send_message("❌ Invalid date format. Please use **YYYY-MM-DD**.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Invalid date.",
+                ephemeral=True,
+            )
             return
 
         await interaction.response.defer(ephemeral=False)

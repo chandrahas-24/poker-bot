@@ -9,7 +9,7 @@ import database as db
 from treys import Evaluator, Card
 import card_images
 import os, asyncio, uuid, zipfile, traceback
-from datetime import datetime, timedelta, time as dt_time, timezone as _tz
+from datetime import datetime, timedelta, time as dt_time, timezone as _tz, date
 import time
 import math
 import config
@@ -17,6 +17,7 @@ import jackpot
 import taxation
 from tutorial_cog import TutorialCog
 import sys
+import dateparser
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -36,6 +37,51 @@ def parse_chips(value: str) -> int | None:
         return int(float(v))
     except (ValueError, TypeError):
         return None
+
+DATE_FORMAT = "%Y-%m-%d"
+
+def parse_date(value: str) -> date:
+    dt = dateparser.parse(
+        value,
+        settings={
+            "PREFER_DATES_FROM": "past",
+            "DATE_ORDER": "YMD",
+        },
+    )
+
+    if dt is None:
+        raise ValueError("Invalid date")
+
+    return dt.date()
+
+
+async def date_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    current = current.lower()
+
+    choices = []
+
+    special = [
+        ("Today", "today"),
+        ("Yesterday", "yesterday"),
+        ("Last Week", "last week")
+    ]
+
+    for name, value in special:
+        if current in name.lower() or current in value:
+            choices.append(app_commands.Choice(name=name, value=value))
+
+    # Last 14 days through today
+    for i in range(14, -1, -1):
+        d = date.today() - timedelta(days=i)
+        s = d.strftime(DATE_FORMAT)
+
+        if current in s:
+            choices.append(app_commands.Choice(name=s, value=s))
+
+    return choices
 
 class TableState:
     def __init__(self, name: str, manager_id: int, manager_name: str = "Unknown"):
@@ -5305,8 +5351,12 @@ class PokerCog(commands.Cog):
                 await refresh(interaction.channel, t, cosmetics_cache=getattr(t, 'cosmetics_cache', {}))
 
     @pokermgr.command(name="dealerhours", description="[Manager] Show minutes hosted per dealer between two UTC dates")
-    @app_commands.describe(start="Start date YYYY-MM-DD (required)",
-                           end="End date YYYY-MM-DD (optional, defaults to start date)")
+    @app_commands.describe(start="Start date (required)",
+                           end="End date (optional, defaults to start date)")
+    @app_commands.autocomplete(
+        start=date_autocomplete,
+        end=date_autocomplete,
+    )
     async def dealer_hours(self, interaction: discord.Interaction, start: str, end: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
@@ -5314,6 +5364,20 @@ class PokerCog(commands.Cog):
             return
 
         end_date = end or start
+        try:
+            start = parse_date(start).strftime(DATE_FORMAT)
+
+            if end:
+                end = parse_date(end).strftime(DATE_FORMAT)
+            else:
+                end = start
+
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Invalid date.",
+                ephemeral=True,
+            )
+            return
         rows = await db.get_dealer_minutes(start, end_date)
 
         if not rows:

@@ -5380,11 +5380,11 @@ class PokerCog(commands.Cog):
         rows = await db.get_dealer_minutes(start, end)
 
         if not rows:
-            label = start if not end else f"{start} → {end_date}"
+            label = start if not end else f"{start} → {end}"
             await interaction.followup.send(f"No dealer sessions logged for `{label}`.", ephemeral=True)
             return
 
-        label = start if end_date == start else f"{start} → {end_date}"
+        label = start if end == start else f"{start} → {end}"
         lines = [f"**Dealer Hours — {label}**"]
         for r in rows:
             lines.append(f"• **{r['dealer_name']}** — {r['minutes']} min")

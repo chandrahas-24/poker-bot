@@ -5363,14 +5363,13 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
-        end_date = end or start
         try:
             start = parse_date(start).strftime(DATE_FORMAT)
 
             if end:
                 end = parse_date(end).strftime(DATE_FORMAT)
             else:
-                end = start
+                end = date.today().strftime(DATE_FORMAT)
 
         except ValueError:
             await interaction.response.send_message(

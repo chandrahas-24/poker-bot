@@ -7,6 +7,7 @@ import random
 import sys
 import config
 import taxation
+import datetime
 
 evaluator = Evaluator()
 
@@ -265,6 +266,9 @@ class PokerGame:
 
         _ACE_OF_SPADES = Card.new('As')
         _EGIRL_CHANCE = config.EGIRL_SARO_CHANCE
+        if self.MIN_BUYIN >= 250 and datetime.datetime.now().weekday() == 5:
+            _EGIRL_CHANCE = config.HIGH_TABLE_SATURDAY_EGIRL_CHANCE
+        self.egirl_saro_holders.clear()
         self.egirl_saro_holders.clear()
 
         for p in self.players:

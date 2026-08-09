@@ -184,9 +184,9 @@ async def on_ready():
     await bot.load_extension("poker.tutorial_cog")
     await bot.load_extension("eventlog.eventlog")
     await bot.load_extension("poker.pokerai")
-    await bot.load_extension("hotpotato")
-    await bot.load_extension("uno.unodemo")
-    await bot.load_extension("uno.uno_cog")
+    #await bot.load_extension("hotpotato")
+    #await bot.load_extension("uno.unodemo")
+    #await bot.load_extension("uno.uno_cog")
     # await bot.load_extension("highlight")
     # await bot.load_extension("tournament.tournament")
 

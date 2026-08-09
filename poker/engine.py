@@ -20,7 +20,7 @@ def card_str(card: int) -> str:
 def hand_str(cards: list[int]) -> str:
     return "  ".join(card_str(c) for c in cards)
 
-_old_engine = sys.modules.get('engine')
+_old_engine = sys.modules.get('poker.engine')
 if _old_engine and hasattr(_old_engine, 'Street'):
     Street = _old_engine.Street
 else:

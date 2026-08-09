@@ -122,7 +122,7 @@ class TableState:
         if hasattr(self, "game") and self.game:
             self.game.is_tournament = val
 
-_old_poker = sys.modules.get('')
+_old_poker = sys.modules.get('poker.poker')
 if _old_poker and hasattr(_old_poker, 'TableState'):
     TableState = _old_poker.TableState
 

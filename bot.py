@@ -4,11 +4,10 @@ import os
 from dotenv import load_dotenv
 import traceback
 
-from database import init_db, recover_chips_in_play, close_unclosed_dealer_sessions
-import database as db
-from tutorial_db import init_db as init_tutorial_db
-import eventlog_database
-import tournament_db
+from poker.database import init_db, recover_chips_in_play, close_unclosed_dealer_sessions
+from poker import database as db
+from poker.tutorial_db import init_db as init_tutorial_db
+from eventlog import eventlog_database
 from discord.ext import tasks
 import datetime
 import subprocess
@@ -181,12 +180,15 @@ async def on_ready():
     #     for r in tourney_recovered:
     #         print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
 
-    await bot.load_extension("poker")
-    await bot.load_extension("tutorial_cog")
-    await bot.load_extension("eventlog")
-    await bot.load_extension("pokerai")
+    await bot.load_extension("poker.poker")
+    await bot.load_extension("poker.tutorial_cog")
+    await bot.load_extension("eventlog.eventlog")
+    await bot.load_extension("poker.pokerai")
+    await bot.load_extension("hotpotato")
+    await bot.load_extension("uno.unodemo")
+    await bot.load_extension("uno.uno_cog")
     # await bot.load_extension("highlight")
-    # await bot.load_extension("tournament")
+    # await bot.load_extension("tournament.tournament")
 
 
     YOUR_GUILD_ID = config.GUILD_ID
@@ -483,9 +485,12 @@ async def reload(ctx, cog_name: str = None):
     elif cog_name_lower in ("ai", "pokerai"):
         helpers_to_reload = ["config"]
         cogs_to_reload = ["pokerai"]
+    elif cog_name_lower in ("hotpotato", "potato"):
+        helpers_to_reload = ["config"]
+        cogs_to_reload = ["hotpotato"]
     elif cog_name_lower is None:
         helpers_to_reload = ["config", "database", "engine", "card_images", "jackpot", "taxation", "eventlog_database", "tournament_db", "tutorial_db"]
-        cogs_to_reload = ["poker", "eventlog", "tutorial_cog", "pokerai"]
+        cogs_to_reload = ["poker", "eventlog", "tutorial_cog", "pokerai", "hotpotato"]
     else:
         # Check if it is a loaded extension
         ext_name = cog_name if cog_name in bot.extensions else (f"cogs.{cog_name}" if f"cogs.{cog_name}" in bot.extensions else None)

@@ -6,7 +6,7 @@ from math import ceil
 import random
 import sys
 import config
-import taxation
+from . import taxation
 import datetime
 
 evaluator = Evaluator()

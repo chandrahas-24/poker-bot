@@ -1,6 +1,6 @@
 from datetime import datetime
 import config
-import database as db
+from . import database as db
 import math
 
 

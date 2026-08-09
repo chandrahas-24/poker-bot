@@ -1,6 +1,4 @@
 import discord
-import zipfile
-import io
 import os
 from discord import app_commands
 from discord.ext import commands
@@ -8,7 +6,7 @@ import aiosqlite
 import re
 import traceback
 import math
-import eventlog_database
+from . import eventlog_database
 import config
 from datetime import date, datetime, timedelta, timezone
 import dateparser
@@ -263,52 +261,54 @@ class EventLogsCog(commands.Cog):
             traceback.print_exc()
             await interaction.followup.send(f"❌ **Error:** `{e}`")
 
-    @eventlog_group.command(name="backup", description="[Dev] Zips and DMs you the database file.")
+    @eventlog_group.command(name="backup", description="[Dev] DMs you the database file.")
     async def eventlog_backup(self, interaction: discord.Interaction):
-        # 1. Permission check
         if not await is_event_staff(interaction):
-            await interaction.response.send_message("❌ Missing required permissions.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Missing required permissions.",
+                ephemeral=True
+            )
             return
 
-        # Defer response ephemerally so interaction doesn't time out during zipping/uploading
         await interaction.response.defer(ephemeral=True)
 
-        db_path = "eventlog_database.db"
+        db_path = config.EVENTLOG_DB_PATH
 
         if not os.path.exists(db_path):
-            await interaction.followup.send("❌ Database file not found.", ephemeral=True)
+            await interaction.followup.send(
+                "❌ Database file not found.",
+                ephemeral=True
+            )
             return
 
         try:
-            # 2. Compress the DB file in memory (RAM) using BytesIO
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                # Add the database file into the zip
-                zip_file.write(db_path, arcname=os.path.basename(db_path))
+            file = discord.File(
+                db_path,
+                filename="eventlog_database.db"
+            )
 
-            # Reset stream position to the beginning before sending
-            zip_buffer.seek(0)
+            await interaction.user.send(
+                content="🗄️ **Here is your eventlog database:**",
+                file=file
+            )
 
-            # 3. Create the Discord File object
-            file = discord.File(fp=zip_buffer, filename="eventlog_database.zip")
+            await interaction.followup.send(
+                "✅ The database has been sent to your DMs!",
+                ephemeral=True
+            )
 
-            # 4. DM the user who triggered the command
-            try:
-                await interaction.user.send(
-                    content="📦 **Here is your database backup:**",
-                    file=file
-                )
-                await interaction.followup.send("✅ The database backup has been sent to your DMs!", ephemeral=True)
-            except discord.Forbidden:
-                # Triggers if the user's DMs are closed/blocked
-                await interaction.followup.send(
-                    "❌ Couldn't send you a DM! Please check your privacy settings and allow direct messages from server members.",
-                    ephemeral=True
-                )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Couldn't send you a DM! Please check your privacy settings.",
+                ephemeral=True
+            )
 
         except Exception as e:
             traceback.print_exc()
-            await interaction.followup.send(f"❌ An error occurred while creating the backup: `{e}`", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ An error occurred: `{e}`",
+                ephemeral=True
+            )
 
     @commands.Cog.listener("on_raw_reaction_add")
     async def process_embed_logs(self, payload: discord.RawReactionActionEvent):

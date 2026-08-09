@@ -4,8 +4,6 @@ import os
 from datetime import datetime, timedelta
 import config
 import traceback
-import json
-
 # 1. FORCE the bot to look inside the Railway Volume
 # Replace '/app/data/poker.db' with whatever your Mount Path + filename is
 DB_PATH = config.DB_PATH

@@ -4,19 +4,20 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from engine import PokerGame, Street, hand_str
-import database as db
 from treys import Evaluator, Card
-import card_images
 import os, asyncio, uuid, zipfile, traceback
 from datetime import datetime, timedelta, time as dt_time, timezone as _tz, date
 import time
 import math
-import config
-import jackpot
-import taxation
-from tutorial_cog import TutorialCog
 import sys
+import config
+
+from .engine import PokerGame, Street, hand_str
+from . import database as db
+from . import jackpot
+from . import taxation
+from . import card_images
+from tournament import tournament_db as tdb
 import dateparser
 
 evaluator  = Evaluator()
@@ -121,7 +122,7 @@ class TableState:
         if hasattr(self, "game") and self.game:
             self.game.is_tournament = val
 
-_old_poker = sys.modules.get('poker')
+_old_poker = sys.modules.get('')
 if _old_poker and hasattr(_old_poker, 'TableState'):
     TableState = _old_poker.TableState
 
@@ -303,7 +304,7 @@ async def _auto_next_hand(t: TableState, channel):
     view = None
     try:
         if t.is_tournament:
-            import tournament
+            from tournament import tournament
             view = tournament.TournamentBetweenHandsView(t)
         else:
             view = BetweenHandsView(t)
@@ -342,7 +343,6 @@ async def _auto_next_hand(t: TableState, channel):
 
             is_tourney = getattr(t, 'is_tournament', False)
             if is_tourney:
-                import tournament_db as tdb
                 _bal = tdb.get_balance
                 _deduct = tdb.deduct_chips
                 _return = tdb.return_chips
@@ -442,7 +442,6 @@ async def _auto_next_hand(t: TableState, channel):
         return
 
     if getattr(t, 'is_tournament', False):
-        import tournament_db as tdb
         # Include pending_with_chips in the UID list
         active_uids = [p.user_id for p in active] + [p.user_id for p in pending_with_chips]
         dominance_warning = await tdb.get_team_dominance_warning(active_uids)
@@ -496,7 +495,6 @@ async def _close_table(channel, t: TableState):
 
     is_tourney = getattr(t, 'is_tournament', False)
     if is_tourney:
-        import tournament_db as tdb
         _ret   = tdb.return_chips
         _clear = tdb.clear_chips_in_play
     else:
@@ -885,7 +883,6 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
     chips_back, msg = t.game.remove_player(interaction.user.id)
     
     if t.is_tournament:
-        import tournament_db as tdb
         if chips_back > 0:
             await tdb.return_chips(interaction.user.id, chips_back)
         await tdb.clear_chips_in_play(interaction.user.id)
@@ -1351,7 +1348,7 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
     embed = build_embed(t, title_cache, t.manager_name)   # sets attachment://board.png if file present
 
     if t.is_tournament:
-        import tournament
+        from tournament import tournament
         view = tournament.TournamentGameView(t)
     else:
         view  = GameView(t)
@@ -1590,7 +1587,7 @@ async def _process_result(guild, channel, t: TableState):
     cancel_timer(t)
 
     if t.is_tournament:
-        import tournament_db
+        from tournament import tournament_db
         wagers_this_hand = result.wagers or {}
         if wagers_this_hand:
             await tournament_db.log_period_wagers(wagers_this_hand)
@@ -3213,21 +3210,10 @@ class PokerCog(commands.Cog):
 
         # 1. Get the absolute path to the directory this script lives in
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        clean_zip_name = f"poker_backup_{date_str}.zip"
+        clean_zip_name = f"data_backup_{date_str}.zip"
         zip_path = os.path.join("", clean_zip_name)
 
-        files_to_zip = [
-            "poker.db",
-            "poker.db-wal",
-            "poker.db-shm",
-            "tutorial.db",
-            "tutorial.db-wal",
-            "tutorial.db-shm"
-            "eventlog_database.db"
-            # "tournament.db",
-            # "tournament.db-wal",
-            # "tournament.db-shm"
-        ]
+        data_dir = os.path.join(base_dir, "..", "data")
 
         try:
             # Force SQLite to flush the WAL to the main DB safely for the main poker DB
@@ -3236,7 +3222,7 @@ class PokerCog(commands.Cog):
                 await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
             try:
-                import tournament_db
+                from tournament import tournament_db
                 await tournament_db.checkpoint()
             except ImportError:
                 pass
@@ -3245,9 +3231,14 @@ class PokerCog(commands.Cog):
 
             # 2. Write the zip file safely using absolute paths and arcname
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for full_path in files_to_zip:
-                    if os.path.exists(full_path):
-                        zipf.write(full_path, arcname=os.path.basename(full_path))
+                for root, _, files in os.walk(data_dir):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+
+                        zipf.write(
+                            full_path,
+                            arcname=os.path.relpath(full_path, data_dir)
+                        )
 
             # 3. Send the file to Discord
             with open(zip_path, 'rb') as f:
@@ -3372,7 +3363,6 @@ class PokerCog(commands.Cog):
 
         is_tourney = getattr(t, 'is_tournament', False)
         if is_tourney:
-            import tournament_db as tdb
             _ret = tdb.return_chips
             _clear = tdb.clear_chips_in_play
         else:
@@ -3392,7 +3382,6 @@ class PokerCog(commands.Cog):
         t.game.kicked_users.clear()
 
         if getattr(t, 'is_tournament', False):
-            import tournament_db as tdb
             bb = t.game.BIG_BLIND
 
             # 1. Grab seated players who can play
@@ -4203,7 +4192,6 @@ class PokerCog(commands.Cog):
 
         is_tourney = getattr(t, 'is_tournament', False)
         if is_tourney:
-            import tournament_db as tdb
             _bal = tdb.get_balance
             _deduct = tdb.deduct_chips
             _return = tdb.return_chips
@@ -4624,7 +4612,7 @@ class PokerCog(commands.Cog):
             return
 
         # 4. Update the database directly
-        import database as db
+        from . import database as db
         conn = await db._get_db()
         try:
             await conn.execute("UPDATE wallets SET last_activity = ? WHERE user_id = ?", (new_iso, user.id))
@@ -5211,7 +5199,7 @@ class PokerCog(commands.Cog):
             await interaction.response.send_message("❌ **Access Denied.** You do not have permission.", ephemeral=True)
             return
 
-        import database as db
+        from . import database as db
         conn = await db._get_db()
 
         try:

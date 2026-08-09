@@ -6,11 +6,10 @@ import asyncio
 import time
 import urllib.request
 import urllib.error
-from enum import Enum, auto
 from treys import Card, Evaluator
 
 import config
-import card_images
+from . import card_images
 
 evaluator = Evaluator()
 

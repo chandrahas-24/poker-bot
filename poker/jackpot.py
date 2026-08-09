@@ -1,5 +1,5 @@
 import math
-import database as db
+from . import database as db
 from treys import Evaluator, Card
 
 evaluator = Evaluator()

@@ -7,11 +7,9 @@ from discord import app_commands
 import traceback
 
 import config
-import database as db
-import tournament_db as tdb
-from poker import TableState, tables, refresh, slog, slog_clear, schedule_next_hand, Street, parse_chips, RawSQLPaginationView
-from engine import Street
-
+from poker import database as db
+from . import tournament_db as tdb
+from poker.poker import TableState, tables, refresh, slog, slog_clear, schedule_next_hand, Street, parse_chips, RawSQLPaginationView, GameView
 
 # -- Tournament Join Modal ----------------------------------------------------
 
@@ -146,8 +144,6 @@ class TournamentRebuyModal(discord.ui.Modal, title="Add Tournament Chips"):
 
 
 # -- Tournament Game View -----------------------------------------------------
-
-from poker import GameView
 
 class TournamentGameView(GameView):
     @discord.ui.button(label="Wallet", style=discord.ButtonStyle.grey, row=2)
@@ -394,7 +390,6 @@ class TournamentTeamsView(discord.ui.View):
         team = self.teams[self.page]
         embed = discord.Embed(title=f"🛡️ Team: {team['name']}", color=0x3498DB)
 
-        import tournament_db as tdb
         import config
 
         # Dynamically fetch the live roster for this specific team
@@ -488,7 +483,6 @@ class TournamentCog(commands.Cog):
         channel = self.bot.get_channel(config.TOURNAMENT_REGISTER_CHANNEL_ID)
         if not channel: return
 
-        import tournament_db as tdb
         cycle_day, warnings, penalties = await tdb.process_daily_tourney_check()
 
         if cycle_day == 1:
@@ -607,7 +601,7 @@ class TournamentCog(commands.Cog):
 
         # Load and apply guild settings
         settings = await db.get_settings(interaction.guild_id)
-        from poker import TABLE_RESEND_MSGS
+        from poker.poker import TABLE_RESEND_MSGS
         t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
         tables[key] = t
 
@@ -699,7 +693,7 @@ class TournamentCog(commands.Cog):
         await interaction.response.send_message(
             f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
 
-        from poker import _process_result
+        from poker.poker import _process_result
         if t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, t)
         else:
@@ -765,7 +759,6 @@ class TournamentCog(commands.Cog):
             await interaction.response.send_message("Managers only.", ephemeral=True);
             return
 
-        import tournament_db as tdb
         import datetime
 
         team = await tdb.get_team_by_name(team_name)
@@ -884,7 +877,6 @@ class TournamentCog(commands.Cog):
             await interaction.response.send_message("Managers only.", ephemeral=True)
             return
 
-        import tournament_db as tdb
         team = await tdb.get_team_by_name(team_name)
         if not team:
             await interaction.response.send_message("❌ Team not found.", ephemeral=True)
@@ -921,7 +913,6 @@ class TournamentCog(commands.Cog):
     @tourney.command(name="myactivity", description="Check your dynamic 25% wager quota and activity")
     async def myactivity(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        import tournament_db as tdb
         stats = await tdb.get_player_stats(interaction.user.id)
 
         if not stats:
@@ -1023,7 +1014,6 @@ class TournamentCog(commands.Cog):
             await interaction.followup.send("❌ Error: Cannot find the tournament registration channel.")
             return
 
-        import tournament_db as tdb
         cycle_day, warnings, penalties = await tdb.process_daily_tourney_check()
 
         await interaction.followup.send(
@@ -1059,7 +1049,6 @@ class TournamentCog(commands.Cog):
     @tourney.command(name="teams", description="View all registered tournament teams")
     async def list_teams(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        import tournament_db as tdb
         teams = await tdb.get_all_teams_info()
 
         if not teams:
@@ -1144,7 +1133,6 @@ class TournamentCog(commands.Cog):
             await interaction.followup.send("❌ Invalid day. Please choose 1 (Start) or 2 (Warnings).", ephemeral=True)
             return
 
-        import tournament_db as tdb
         db_conn = await tdb._get_db()
         async with tdb._write_lock:
             # 1. Update the cycle_day in tourney_state (always id=1)
@@ -1203,7 +1191,6 @@ class TournamentCog(commands.Cog):
             return
 
         # 3. Update the tournament database directly
-        import tournament_db as tdb
         db_conn = await tdb._get_db()
         try:
             async with tdb._write_lock:

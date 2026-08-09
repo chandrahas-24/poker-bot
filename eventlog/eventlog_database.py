@@ -1,6 +1,9 @@
 import aiosqlite
+import config
+
+DB_PATH = config.EVENTLOG_DB_PATH
 async def init_log_db():
-    async with aiosqlite.connect("eventlog_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS event_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,7 +29,7 @@ async def save_embed_log(staff_id: int, staff_username: str, message_id: int, do
                          event_prize_msg: str, timestamp: str) -> bool:
     """Inserts the parsed embed data into the database."""
     try:
-        async with aiosqlite.connect("eventlog_database.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             await db.execute(
                 """
@@ -52,7 +55,7 @@ async def save_embed_log(staff_id: int, staff_username: str, message_id: int, do
 
 async def fetch_logs(limit: int = 10, donator: str = None):
     """Fetches recent logs, optionally filtering by donator username."""
-    async with aiosqlite.connect("eventlog_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         query = "SELECT * FROM event_logs"
@@ -86,7 +89,7 @@ async def execute_ro_query(query: str):
 
 async def fetch_staff_stats(start_date: str, end_date: str):
     """Fetches total events hosted per staff member between start_date and end_date."""
-    async with aiosqlite.connect("eventlog_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         query = """

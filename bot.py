@@ -185,8 +185,8 @@ async def on_ready():
     await bot.load_extension("eventlog.eventlog")
     await bot.load_extension("poker.pokerai")
     #await bot.load_extension("hotpotato")
-    #await bot.load_extension("uno.unodemo")
-    #await bot.load_extension("uno.uno_cog")
+    await bot.load_extension("uno.unodemo")
+    await bot.load_extension("uno.uno_cog")
     # await bot.load_extension("highlight")
     # await bot.load_extension("tournament.tournament")
 
@@ -474,20 +474,17 @@ async def reload(ctx, cog_name: str = None):
 
     # Map target cog/helpers to reload
     if cog_name_lower == "poker":
-        helpers_to_reload = ["config", "database", "engine", "card_images", "jackpot", "taxation"]
-        cogs_to_reload = ["poker"]
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation"]
+        cogs_to_reload = ["poker.poker"]
     elif cog_name_lower == "eventlog":
-        helpers_to_reload = ["config", "eventlog_database"]
-        cogs_to_reload = ["eventlog"]
+        helpers_to_reload = ["config", "eventlog.eventlog_database"]
+        cogs_to_reload = ["eventlog.eventlog"]
     elif cog_name_lower in ("tutorial", "tutorial_cog"):
-        helpers_to_reload = ["config", "tutorial_db"]
-        cogs_to_reload = ["tutorial_cog"]
+        helpers_to_reload = ["config", "poker.tutorial_db"]
+        cogs_to_reload = ["poker.tutorial_cog"]
     elif cog_name_lower in ("ai", "pokerai"):
         helpers_to_reload = ["config"]
-        cogs_to_reload = ["pokerai"]
-    elif cog_name_lower in ("hotpotato", "potato"):
-        helpers_to_reload = ["config"]
-        cogs_to_reload = ["hotpotato"]
+        cogs_to_reload = ["poker.pokerai"]
     elif cog_name_lower is None:
         helpers_to_reload = ["config", "database", "engine", "card_images", "jackpot", "taxation", "eventlog_database", "tournament_db", "tutorial_db"]
         cogs_to_reload = ["poker", "eventlog", "tutorial_cog", "pokerai", "hotpotato"]

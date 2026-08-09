@@ -1,12 +1,17 @@
 import os
 from dotenv import load_dotenv
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent
 
 # Load the secret tokens from .env
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "poker.db"
-TOURNAMENT_DB_PATH = "tournament.db"
+DB_PATH = BASE_DIR / "data" / "poker" / "poker.db"
+TOURNAMENT_DB_PATH = BASE_DIR / "data" / "tournament" / "tournament.db"
+TUTORIAL_DB_PATH = BASE_DIR / "data" / "tutorial" / "tutorial.db"
+EVENTLOG_DB_PATH = BASE_DIR / "data" / "eventlog" / "eventlog_database.db"
 TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
 TOURNAMENT_STARTING_CHIPS = 5000
 

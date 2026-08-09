@@ -486,8 +486,8 @@ async def reload(ctx, cog_name: str = None):
         helpers_to_reload = ["config"]
         cogs_to_reload = ["poker.pokerai"]
     elif cog_name_lower is None:
-        helpers_to_reload = ["config", "database", "engine", "card_images", "jackpot", "taxation", "eventlog_database", "tournament_db", "tutorial_db"]
-        cogs_to_reload = ["poker", "eventlog", "tutorial_cog", "pokerai", "hotpotato"]
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
+        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai"]
     else:
         # Check if it is a loaded extension
         ext_name = cog_name if cog_name in bot.extensions else (f"cogs.{cog_name}" if f"cogs.{cog_name}" in bot.extensions else None)

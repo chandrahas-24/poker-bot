@@ -643,18 +643,20 @@ async def recover_chips_in_play() -> list[dict]:
     return rows
 
 async def close_unclosed_dealer_sessions():
-    """Called on restart — closes any sessions that never got a close/no_players event."""
+    """Called on restart — closes only the currently active dealer per table."""
     db = await _get_db()
+
     async with db.execute("""
         SELECT table_id, dealer_id, dealer_name, ts
         FROM dealer_session_log d1
-        WHERE event IN ('start', 'dealer_change')
-        AND NOT EXISTS (
-            SELECT 1 FROM dealer_session_log d2
+        WHERE d1.id = (
+            SELECT d2.id
+            FROM dealer_session_log d2
             WHERE d2.table_id = d1.table_id
-            AND d2.ts > d1.ts
-            AND d2.event IN ('close', 'no_players', 'crash')
+            ORDER BY d2.ts DESC, d2.id DESC
+            LIMIT 1
         )
+        AND d1.event IN ('start', 'dealer_change')
     """) as c:
         rows = await c.fetchall()
 
@@ -662,17 +664,21 @@ async def close_unclosed_dealer_sessions():
         return
 
     now = datetime.utcnow().isoformat()
+
     async with _write_lock:
         for row in rows:
-            table_id = row[0]
-            dealer_id = row[1]
-            dealer_name = row[2]
             await db.execute(
-                "INSERT INTO dealer_session_log (table_id, table_name, dealer_id, dealer_name, event, ts) VALUES (?,?,?,?,?,?)",
-                (table_id, '', dealer_id, dealer_name, 'crash', now)
+                """
+                INSERT INTO dealer_session_log
+                (table_id, table_name, dealer_id, dealer_name, event, ts)
+                VALUES (?, '', ?, ?, 'crash', ?)
+                """,
+                (row["table_id"], row["dealer_id"], row["dealer_name"], now)
             )
+
         await db.commit()
-    print(f"⚠️  Closed {len(rows)} unclosed dealer session(s) after restart")
+
+    print(f"⚠️ Closed {len(rows)} unclosed dealer session(s) after restart")
 
 
 # ── Audit log ─────────────────────────────────────────────────────────────────

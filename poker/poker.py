@@ -5097,8 +5097,8 @@ class PokerCog(commands.Cog):
         await interaction.followup.send(f"🃏 Test Hand: {hand_str(cards)}", file=file)
 
     @poker.command(name="currencylog", description="View recent chip transactions")
-    @app_commands.describe(user="Player to check (Admins/Devs only, leave blank for yourself)")
-    async def currencylog(self, interaction: discord.Interaction, user: discord.Member = None):
+    @app_commands.describe(minimum="Only show transactions with this many chips or more", user="Player to check (Admins/Devs only, leave blank for yourself)")
+    async def currencylog(self, interaction: discord.Interaction, user: discord.Member = None, minimum: int = None):
         target = user or interaction.user
 
         # 🚨 Permission Check
@@ -5111,7 +5111,7 @@ class PokerCog(commands.Cog):
         logs = await db.get_currency_logs(target.id)
 
         # Pass the caller (to verify button clicks) AND the target (for the embed profile)
-        view = CurrencyLogView(caller=interaction.user, target=target, logs=logs)
+        view = CurrencyLogView(caller=interaction.user, target=target, logs=logs, minimum=minimum)
         await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral = True)
 
     @poker.command(name="tutorial",
@@ -5634,11 +5634,20 @@ class PremoveView(discord.ui.View):
         await interaction.response.edit_message(content=f"✅ Premove chain: **{self._get_chain_str()}**", view=None)
 
 class CurrencyLogView(discord.ui.View):
-    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, logs: list[dict]):
+    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, logs: list[dict], minimum=None):
         super().__init__(timeout=120)
         self.caller = caller   # The person clicking the buttons
         self.target = target   # The person whose logs we are viewing
         self.all_logs = logs
+        self.minimum = minimum
+
+        if minimum is not None:
+            logs = [
+                log for log in logs
+                if abs(log["amount"]) >= minimum
+            ]
+
+        self.logs = logs
         self.logs = logs
         self.page = 0
         self.per_page = 5

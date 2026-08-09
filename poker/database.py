@@ -663,7 +663,10 @@ async def close_unclosed_dealer_sessions():
 
     now = datetime.utcnow().isoformat()
     async with _write_lock:
-        for table_id, dealer_id, dealer_name in rows:
+        for row in rows:
+            table_id = row[0]
+            dealer_id = row[1]
+            dealer_name = row[2]
             await db.execute(
                 "INSERT INTO dealer_session_log (table_id, table_name, dealer_id, dealer_name, event, ts) VALUES (?,?,?,?,?,?)",
                 (table_id, '', dealer_id, dealer_name, 'crash', now)

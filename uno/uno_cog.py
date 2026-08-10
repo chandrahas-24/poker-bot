@@ -87,6 +87,24 @@ from .unodemo import (
 log = logging.getLogger("uno")
 
 
+def safe_task(coro, name: str | None = None) -> asyncio.Task:
+    """
+    Wraps a fire-and-forget coroutine so an unexpected exception gets
+    logged with a full traceback instead of only reaching asyncio's
+    default (easy-to-miss) "Task exception was never retrieved" handler.
+    Use this for anything scheduled with create_task() that nobody
+    awaits/checks later — right now that's just the per-turn timer loop.
+    """
+    async def _wrapper():
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Background task %r crashed", name or coro)
+    return asyncio.create_task(_wrapper(), name=name)
+
+
 async def report_component_error(interaction: discord.Interaction, error: Exception, item, source: str):
     """
     Shared error handler for every interactive View/LayoutView/Modal below.
@@ -804,29 +822,52 @@ class TableView(discord.ui.LayoutView):
             await interaction.response.send_message("You're not in this game.", ephemeral=True)
             return
 
-        try:
-            if len(player.hand) > MAX_BUTTONS_TOTAL:
-                # Too many cards for a button grid — force the text modal.
+        if len(player.hand) > MAX_BUTTONS_TOTAL:
+            # Too many cards for a button grid — force the text modal.
+            # A modal MUST be the raw, undeferred initial response, so this
+            # branch can't defer — it's engine-only work (no image/network
+            # I/O) up to this point, so it's already fast enough.
+            try:
                 await interaction.response.send_modal(PlayCardModal(self.cog, session))
-            else:
-                await self.cog.load_emoji_cache()
-                view = HandPlayView(self.cog, session, interaction.user.id)
+            except discord.InteractionResponded:
+                log.warning("uno_play: interaction already responded before send_modal (double-click?)")
+            return
+
+        # Below this point we're doing real I/O (application-emoji fetch on
+        # first use, PIL image composition) that risks blowing past
+        # Discord's ~3s ack window. Rather than defer up front (which would
+        # burn the modal fallback — a modal must be the raw, un-deferred
+        # first response), give the build a short budget on the RAW
+        # interaction: if it finishes in time, send it directly and the
+        # modal option was never needed; if it's slow OR raises, fall back
+        # to the modal, which is always fast since it's just opening a text
+        # field. 2s leaves a buffer under the 3s cutoff for the fallback
+        # send_modal call itself.
+        try:
+            await self.cog.load_emoji_cache()
+            view = HandPlayView(self.cog, session, interaction.user.id)
+
+            async def _send():
                 if view.file:
                     await interaction.response.send_message(view=view, file=view.file, ephemeral=True)
                 else:
                     await interaction.response.send_message(view=view, ephemeral=True)
-        except Exception as e:
-            # Anything goes wrong building the button grid -> fall back to
-            # the modal, but LOG what actually broke instead of hiding it —
-            # a silent fallback here means the button grid is broken and
-            # nobody would ever find out why.
-            import traceback
-            print(f"[uno] HandPlayView build/send failed, falling back to modal: {e!r}")
-            traceback.print_exc()
+
+            await asyncio.wait_for(_send(), timeout=2.0)
+        except Exception:
+            # Covers build failures (missing card art, PIL errors, etc.) AND
+            # asyncio.TimeoutError from a slow build/send — in both cases we
+            # haven't responded yet, so the modal is still available.
+            log.exception("HandPlayView build/send failed or was too slow for user %s", interaction.user.id)
             try:
                 await interaction.response.send_modal(PlayCardModal(self.cog, session))
             except discord.InteractionResponded:
-                pass
+                # The send_message from _send() actually landed right as
+                # the timeout fired (a real race, not just slow) — nothing
+                # left to do, the player already got their hand view.
+                log.warning("uno_play: send succeeded right as the timeout fired for user %s", interaction.user.id)
+            except discord.HTTPException:
+                log.exception("uno_play: send_modal fallback also failed for user %s", interaction.user.id)
 
     async def _hand(self, interaction: discord.Interaction):
         session = self._guard()
@@ -948,9 +989,9 @@ class UnoGame(commands.Cog):
             try:
                 path = os.path.join(card_assets.CARDS_DIR, fname)
                 self._card_image_cache[name] = Image.open(path).convert("RGBA")
-            except Exception as e:
-                print(f"[uno] failed to load card image {fname}: {e}")
-        print(f"[uno] cached {len(self._card_image_cache)} card image(s) in memory")
+            except Exception:
+                log.exception("Failed to load card image %s", fname)
+        log.info("Cached %d card image(s) in memory", len(self._card_image_cache))
 
     uno = app_commands.Group(name="uno", description="UNO game commands")
 
@@ -964,7 +1005,11 @@ class UnoGame(commands.Cog):
             for e in app_emojis:
                 self._emoji_cache[e.name] = e
         except Exception:
-            pass
+            # Was a bare `except: pass` — silently leaves every card falling
+            # back to its plain-color emoji with zero trace of why. Not
+            # fatal (fallback emoji still works), so we don't re-raise, but
+            # it needs to be visible in logs.
+            log.exception("Failed to load application emojis — falling back to plain-color emoji for all cards")
         self._emoji_cache_loaded = True
 
     def emoji_for(self, card_name: str):
@@ -1275,40 +1320,38 @@ class UnoGame(commands.Cog):
 
         view = CallUnoToggleView(self, session, player_id) if len(hand) == 2 else None
 
+        # Image composition is real work (PIL, potentially large hands) —
+        # defer first so it can never blow the ack window, then follow up.
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.InteractionResponded:
+            log.warning("uno_hand: interaction already responded before defer (double-click?)")
+            return
+
+        kwargs = {"content": content, "ephemeral": True}
+        if view is not None:
+            kwargs["view"] = view
+
         try:
             img = compose_hand_image(hand, self._card_image_cache)
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-            file = discord.File(buf, filename="hand.png")
-            kwargs = {
-                "content": content,
-                "file": file,
-                "ephemeral": True,
-            }
-            if view is not None:
-                kwargs["view"] = view
-
-            await interaction.response.send_message(**kwargs)
+            kwargs["file"] = discord.File(buf, filename="hand.png")
         except FileNotFoundError:
-            kwargs = {
-                "content": content,
-                "ephemeral": True,
-            }
-            if view is not None:
-                kwargs["view"] = view
-
-            await interaction.response.send_message(**kwargs)
+            pass  # missing card art for something in hand — text list still works fine
         except ValueError:
-            # empty hand — compose_hand_image can't build an image for zero cards
-            kwargs = {
-                "content": content,
-                "ephemeral": True,
-            }
-            if view is not None:
-                kwargs["view"] = view
+            pass  # empty hand — compose_hand_image can't build an image for zero cards
+        except Exception:
+            # Anything else (corrupt image data, PIL error, etc.) — log it
+            # rather than letting the whole /uno hand call die silently;
+            # the text list is still a perfectly usable fallback.
+            log.exception("compose_hand_image failed for user %s", player_id)
 
-            await interaction.response.send_message(**kwargs)
+        try:
+            await interaction.followup.send(**kwargs)
+        except discord.HTTPException:
+            log.exception("Failed to send hand view followup for user %s", player_id)
 
     # ---------------- turn timer ----------------
 
@@ -1327,7 +1370,7 @@ class UnoGame(commands.Cog):
                     session.callout_balance[current_id] = 1
                     session._last_turn_player_id = current_id
 
-            session.timer_task = asyncio.create_task(self._timer_loop(session))
+            session.timer_task = safe_task(self._timer_loop(session), name=f"uno-timer-{session.channel_id}")
 
     async def _send_to_game_channel(self, session: GameSession, content: str):
         """
@@ -1696,6 +1739,30 @@ class UnoGame(commands.Cog):
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
         await self._remove_member_everywhere(guild.id, user.id, "was banned")
+
+    # ---------------- global slash-command error handler ----------------
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """
+        Catches anything raised inside any /uno command that wasn't already
+        handled locally (e.g. a stray UnoError/DeckExhausted, an AttributeError
+        from a coding bug, etc). Without this, discord.py's default behavior
+        is to log to console and leave the interaction un-acked entirely —
+        which is exactly what shows up client-side as "This interaction
+        failed". Every View/Modal already has its own on_error routed
+        through report_component_error; this is the equivalent for slash
+        commands specifically.
+        """
+        original = getattr(error, "original", error)
+        log.error("Slash command '%s' failed for user %s", getattr(interaction.command, "qualified_name", "?"),
+                  interaction.user.id, exc_info=original)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("⚠️ Something went wrong running that command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("⚠️ Something went wrong running that command.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 async def setup(bot: commands.Bot):

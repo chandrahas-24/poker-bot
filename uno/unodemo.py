@@ -1,4 +1,5 @@
 import os
+import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -8,6 +9,7 @@ from .hand_render import stitch_hand, CARDS_DIR
 from .cards import load_all_cards
 import random
 
+log = logging.getLogger("uno")
 
 FALLBACK_EMOJI_BY_COLOR = {
     "Blue": "🟦",
@@ -142,9 +144,9 @@ class UnoDemo(commands.Cog):
             app_emojis = await self.bot.fetch_application_emojis()
             for e in app_emojis:
                 self._emoji_cache[e.name] = e
-            print(f"[unodemo] loaded {len(app_emojis)} application emoji(s)")
-        except Exception as ex:
-            print(f"[unodemo] failed to load application emojis: {ex}")
+            log.info("unodemo: loaded %d application emoji(s)", len(app_emojis))
+        except Exception:
+            log.exception("unodemo: failed to load application emojis")
         self._emoji_cache_loaded = True
 
     def emoji_for(self, card_name: str):
@@ -157,10 +159,22 @@ class UnoDemo(commands.Cog):
     @app_commands.command(name="unodemo", description="Test the stitched-hand button UI")
     @app_commands.describe(n="Number of random cards to draw (default 20)")
     async def unodemo(self, interaction: discord.Interaction, n: int = 20):
+        # Emoji fetch (network, first call only) + disk-backed stitch_hand()
+        # (reads every card off disk and composites with PIL) both happen
+        # before we'd otherwise respond — either alone can eat into
+        # Discord's ~3s ack window, together it's a common source of
+        # "interaction failed". Defer immediately so the ack can never
+        # time out, then do all the slow work and follow up.
+        await interaction.response.defer(ephemeral=True)
         await self._load_emoji_cache()
 
         # Pull a random sample of N cards from every card image available in CARDS_DIR
         all_cards = list(load_all_cards().keys())
+        if not all_cards:
+            await interaction.followup.send(
+                f"⚠️ No card images found in `{CARDS_DIR}`.", ephemeral=True
+            )
+            return
         sample_size = max(1, min(n, len(all_cards)))
         hand = random.sample(all_cards, sample_size)
         hand = sort_hand(hand)
@@ -173,7 +187,8 @@ class UnoDemo(commands.Cog):
         try:
             image_path = stitch_hand(hand, out_path="./hand_preview_tmp.png")
         except FileNotFoundError as e:
-            await interaction.response.send_message(
+            log.exception("unodemo: stitch_hand failed")
+            await interaction.followup.send(
                 f"⚠️ {e}\nMake sure card images are unzipped into `{CARDS_DIR}`.",
                 ephemeral=True,
             )
@@ -211,7 +226,7 @@ class UnoDemo(commands.Cog):
         view = LayoutView()
         view.add_item(container)
 
-        await interaction.response.send_message(view=view, file=file, ephemeral=True)
+        await interaction.followup.send(view=view, file=file, ephemeral=True)
 
     @app_commands.command(name="unodemoall", description="Send a hand demo for every size from 1 to 25 cards")
     async def unodemoall(self, interaction: discord.Interaction):
@@ -233,6 +248,7 @@ class UnoDemo(commands.Cog):
             try:
                 image_path = stitch_hand(hand, out_path=f"./hand_preview_{size}.png")
             except FileNotFoundError:
+                log.warning("unodemoall: skipping size %d — missing card art", size)
                 continue
 
             filename = os.path.basename(image_path)
@@ -271,7 +287,26 @@ class UnoDemo(commands.Cog):
         custom_id = interaction.data.get("custom_id", "")
         if custom_id.startswith("unodemo_play_"):
             card = custom_id.removeprefix("unodemo_play_")
-            await interaction.response.send_message(f"You played: {card}", ephemeral=True)
+            try:
+                await interaction.response.send_message(f"You played: {card}", ephemeral=True)
+            except discord.HTTPException:
+                log.exception("unodemo: failed to ack unodemo_play_ button for %s", card)
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Same rationale as UnoGame.cog_app_command_error — without this,
+        an unhandled exception in /unodemo or /unodemoall just leaves the
+        interaction un-acked client-side ("This interaction failed")
+        instead of a clean error message."""
+        original = getattr(error, "original", error)
+        log.error("Slash command '%s' failed for user %s", getattr(interaction.command, "qualified_name", "?"),
+                  interaction.user.id, exc_info=original)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("⚠️ Something went wrong running that command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("⚠️ Something went wrong running that command.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 async def setup(bot: commands.Bot):

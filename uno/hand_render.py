@@ -2,7 +2,7 @@ from PIL import Image
 import os
 import math
 
-CARDS_DIR = "./uno"
+from .cards import CARDS_DIR
 
 CARD_HEIGHT = 300         # baseline card height used across all hand sizes
 OVERLAP = 40               # horizontal overlap between adjacent cards in a row

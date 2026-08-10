@@ -485,6 +485,9 @@ async def reload(ctx, cog_name: str = None):
     elif cog_name_lower in ("ai", "pokerai"):
         helpers_to_reload = ["config"]
         cogs_to_reload = ["poker.pokerai"]
+    elif cog_name_lower in ("uno"):
+        helpers_to_reload = ["config"]
+        cogs_to_reload = ["uno.uno"]
     elif cog_name_lower is None:
         helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
         cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai"]

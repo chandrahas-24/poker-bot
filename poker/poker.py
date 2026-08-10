@@ -963,8 +963,8 @@ class PreferencesModal(discord.ui.Modal):
         placeholder_str = "e.g. 1000"
 
         if pref_key == "default_buyin_amount":
-            label_str = "Default Stack (in BBs or 'max')"
-            placeholder_str = "e.g. 100, 100BB, or max"
+            label_str = "Default Stack (chips, BBs, or 'max')"
+            placeholder_str = "e.g. 500, 100BB, or max"
         elif pref_key == "auto_rebuy_amount":
             label_str = "Auto Rebuy Amount"
             placeholder_str = "e.g. 1000"
@@ -985,8 +985,26 @@ class PreferencesModal(discord.ui.Modal):
         if self.pref_key == "default_buyin_amount" and input_str in ["max", "full", "wallet", "all"]:
             val = -1
         else:
-            raw_val = input_str.replace("bb", "").strip()
-            val = parse_chips(raw_val)
+            if self.pref_key == "default_buyin_amount":
+                if input_str.endswith("bb"):
+                    raw_val = input_str[:-2].strip()
+                    bb_amount = parse_chips(raw_val)
+
+                    if bb_amount is None or bb_amount < 0:
+                        await interaction.response.send_message(
+                            "❌ Enter a valid amount like 100BB, 500, or max.",
+                            ephemeral=True
+                        )
+                        return
+
+                    # Store relative values as negative
+                    val = -bb_amount
+
+                else:
+                    val = parse_chips(input_str)
+
+            else:
+                val = parse_chips(input_str)
             if val is None or val < 0:
                 await interaction.response.send_message("❌ Enter a valid number greater than or equal to 0, or 'max'.", ephemeral=True)
                 return
@@ -1073,9 +1091,11 @@ class PreferencesView(discord.ui.View):
         if dbi_val == -1:
             self.btn_default_buyin.label = "Max Stack"
             self.btn_default_buyin.style = discord.ButtonStyle.green
+        elif dbi_val < -1:
+            self.btn_default_buyin.label = f"{abs(dbi_val)} BB"
         else:
-            self.btn_default_buyin.label = "Off" if dbi_val == 0 else f"{dbi_val:,} BB"
-            self.btn_default_buyin.style = discord.ButtonStyle.red if dbi_val == 0 else discord.ButtonStyle.green
+            self.btn_default_buyin.label = "Off" if dbi_val == 0 else f"{dbi_val:,}"
+        self.btn_default_buyin.style = discord.ButtonStyle.red if dbi_val == 0 else discord.ButtonStyle.green
 
         # Confirm All-In
         cai_mode = self.pref.get("confirm_all_in_mode", "always")
@@ -2647,12 +2667,20 @@ class GameView(discord.ui.View):
 
         pref = await db.get_player_preference(uid)
         default_bb = pref.get("default_buyin_amount", 0)
-        if default_bb > 0 or default_bb == -1:
+        if default_bb != 0:
+
             if default_bb == -1:
+                # Max wallet
                 default_stack = min(bal, max_w) if max_w > 0 else bal
-            else:
+
+            elif default_bb < 0:
+                # Relative BB amount
                 bb = self.t.game.BIG_BLIND
-                default_stack = default_bb * bb
+                default_stack = abs(default_bb) * bb
+
+            else:
+                # Absolute chip amount
+                default_stack = default_bb
 
             if default_stack >= min_w and (max_w == 0 or default_stack <= max_w) and default_stack <= bal:
                 await join_table_execute(interaction, self.t, default_stack, bal, rejoin_fee=0, min_w=min_w, max_w=max_w, is_deferred=False)

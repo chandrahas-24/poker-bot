@@ -398,9 +398,21 @@ class LobbyView(discord.ui.View):
             color=discord.Color.blurple(),
         )
         e.add_field(name="<:uno_host:1536135395933159556> Host", value=f"  {host_mention}", inline=False)
-        e.add_field(name="👥 Players", value=f"  {len(session.lobby_players)}/{session.max_players}", inline=True)
-        e.add_field(name="<:uno_deck:1536135257789829120> Decks", value="  "+str(session.num_decks), inline=True)
-        e.add_field(name="<:uno_trophy:1536135332863676548> Winners", value="  "+str(session.target_winners), inline=True)
+        e.add_field(
+            name="👥 Players",
+            value=f"{len(session.lobby_players)}/{session.max_players}",
+            inline=True
+        )
+        e.add_field(
+            name="<:uno_deck:1536135257789829120>  Decks",
+            value=f"\u200b\u200b{session.num_decks}",
+            inline=True
+        )
+        e.add_field(
+            name="<:uno_trophy:1536135332863676548>  Winners",
+            value=f"\u200b\u200b{session.target_winners}",
+            inline=True
+        )
         e.add_field(name="Joined", value=names, inline=False)
         e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
         return e

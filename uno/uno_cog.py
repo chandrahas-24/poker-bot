@@ -13,9 +13,11 @@ to the modal.
 
 Features implemented here:
   - Lobby (Join / Leave / Settings / Start / Cancel). The host is auto-
-    added as a player by default, but retains moderator powers
-    (settings/kick/start) independent of that — they can Leave and still
-    run/start the game.
+    added as a player by default. Moderator powers (settings/kick/start/
+    cancel) belong to event staff (see is_event_staff: admins, configured
+    staff roles, or developer IDs) — NOT to the host specifically. A host
+    who also happens to be event staff can Leave and still run/start the
+    game; a host who isn't staff has no special powers here.
   - "Winners" setting = how many players can finish (empty their hand,
     placing 1st/2nd/3rd/...) before the game ends — not a match-restart.
     The engine keeps finished players out of turn rotation and keeps the
@@ -55,16 +57,20 @@ Features implemented here:
     prevents repeat-farming the same target (a successful challenge takes
     their hand off exactly 1 card, so a second challenge against them
     fails until they're legitimately back down to 1 card).
-  - /uno kick <user> — host/mod can remove a player from lobby or game.
+  - /uno kick <user> — event staff can remove a player from lobby or game.
 """
 
 import asyncio
 import os
 import io
+import json
+import tempfile
 import time
 import random
 import discord
 import logging
+import config
+from pathlib import Path
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import (
@@ -86,6 +92,31 @@ from .unodemo import (
 
 log = logging.getLogger("uno")
 
+# Where in-progress games get checkpointed so a bot crash/restart mid-game
+# doesn't wipe out everyone's hands. One JSON file per active channel,
+# named by channel id. See UnoGame._save_session / resume_cmd.
+SAVE_DIR = Path(__file__).parent / "uno_saves"
+
+STAFF_ROLE_IDS = [1010238899320270999,833456633689669681]
+
+async def is_event_staff(interaction: discord.Interaction) -> bool:
+    """Checks if the user is a Dev, Admin, or has a specific staff role."""
+
+    if isinstance(interaction.user, discord.Member):
+        # 1. Admin Bypass
+        if interaction.user.guild_permissions.administrator:
+            return True
+
+        # 2. Check for specific roles
+        for role_id in STAFF_ROLE_IDS:
+            if interaction.user.get_role(role_id) is not None:
+                return True
+
+    # 3. Dev Bypass
+    if interaction.user.id in getattr(config, 'DEV_USER_IDS', []):
+        return True
+
+    return False
 
 def safe_task(coro, name: str | None = None) -> asyncio.Task:
     """
@@ -144,13 +175,6 @@ MIN_TARGET_WINNERS, MAX_TARGET_WINNERS = 1, 19
 MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT = 60, 600
 
 
-def is_moderator(session: "GameSession", user: discord.Member | discord.User) -> bool:
-    if user.id == session.host_id:
-        return True
-    perms = getattr(user, "guild_permissions", None)
-    return bool(perms and (perms.manage_guild or perms.kick_members))
-
-
 def _mention(player_id: int | None) -> str:
     return f"<@{player_id}>" if player_id is not None else "Someone"
 
@@ -183,7 +207,9 @@ def describe_last_action(session: "GameSession") -> str:
     """
     action = session.last_action
     if not action:
-        return "Game started!"
+        engine = session.engine
+        total = engine.num_decks * 108 if engine else 0
+        return f"Game started! ({engine.num_decks if engine else '?'} deck{'s' if engine and engine.num_decks != 1 else ''}, {total} cards)"
 
     t = action["type"]
     actor = _plain_name(session, action.get("actor_id"))
@@ -278,9 +304,15 @@ def _build_table_text(session: "GameSession") -> str:
     else:
         lines.append("Game over.")
 
-    total_cards = engine.num_decks * 108
     lines.append("")
-    lines.append(f"Decks: {engine.num_decks} ({total_cards} cards) | Remaining: {len(engine.draw_pile)} | Discarded: {len(engine.discard_pile)}")
+    # Was "Decks: N (X cards) | Remaining: Y | Discarded: Z" — deck count
+    # never changes turn to turn (it's a lobby setting), so it now only
+    # appears once, in the "Game started!" headline above. What's left
+    # here is just the two numbers that actually change every turn, kept
+    # short enough to survive mobile wrapping, and marked as Discord
+    # markdown subtext ("-# ") so it visually reads as a footnote rather
+    # than a stat line competing with the turn info above it.
+    lines.append(f"-# <:uno_back:1536699499295285260> {len(engine.draw_pile)} · <:uno_discard:1536699045970579536> {len(engine.discard_pile)}")
 
     if engine.finishers:
         placed = ", ".join(
@@ -305,10 +337,9 @@ class GameSession:
         self.channel_id = channel_id
         self.host_id = host_id
         self.host_name = host_name
-        # host is auto-added as a player (joinee) by default, but retains
-        # moderator powers (settings/kick/start) independent of whether
-        # they're actually in lobby_players — they can Leave and still
-        # run/start the game.
+        # host is auto-added as a player (joinee) by default. Event-staff
+        # permissions are checked independently of host/player status, so
+        # staff can manage the lobby/game even if they're not playing.
         self.lobby_players: dict[int, str] = {host_id: host_name}
         self.started = False
         self.engine: ue.GameState | None = None
@@ -321,7 +352,21 @@ class GameSession:
         self.callout_balance: dict[int, int] = {}  # player_id -> false-callouts remaining (missing = 1, default)
         self._last_turn_player_id: int | None = None  # tracks turn changes so callout_balance refreshes correctly
 
-        # configurable via the Settings button, host-only
+        # Serializes state-changing interaction handlers (play/draw/pass/
+        # wild color/WD4 accept/challenge/timeout/kick/leave/UNO toggle) so
+        # two near-simultaneous actions on the same session can't both read
+        # the pre-mutation engine state and then both mutate it. Not
+        # persisted — a resumed session just gets a fresh lock.
+        self.lock = asyncio.Lock()
+        # Bumped every time a new turn starts (see restart_timer). A timer
+        # task captures the generation it was started with and checks it
+        # again after waking up from sleep — if the number has moved on,
+        # some other action already resolved this turn (a manual play/draw/
+        # etc, or another timer), so the stale timer does nothing instead
+        # of double-acting on a turn that's already over.
+        self.turn_generation = 0
+
+        # configurable via the Settings button, event-staff-only
         self.max_players = 10
         self.num_decks = 1
         self.target_winners = 1  # how many players can finish before the game ends
@@ -332,6 +377,62 @@ class GameSession:
             self.timer_task.cancel()
         self.timer_task = None
 
+    # ---------- persistence ----------
+    # Only ever called for started games (see UnoGame.post_table) — an
+    # un-started lobby is cheap to just recreate with /uno start, so it's
+    # not worth the complexity of saving/restoring LobbyView state too.
+    # table_message/lobby_message (discord.Message objects) and timer_task
+    # (an asyncio.Task) aren't JSON-serializable and don't need to be —
+    # restore just posts a fresh table message and restarts the timer.
+
+    def to_dict(self):
+        return {
+            "guild_id": self.guild_id,
+            "channel_id": self.channel_id,
+            "host_id": self.host_id,
+            "host_name": self.host_name,
+            "lobby_players": {str(k): v for k, v in self.lobby_players.items()},
+            "started": self.started,
+            "engine": self.engine.to_dict() if self.engine else None,
+            "msg_count": self.msg_count,
+            "last_action": self.last_action,
+            "turn_started_at": self.turn_started_at,
+            "callout_balance": {str(k): v for k, v in self.callout_balance.items()},
+            "_last_turn_player_id": self._last_turn_player_id,
+            "max_players": self.max_players,
+            "num_decks": self.num_decks,
+            "target_winners": self.target_winners,
+            "turn_timeout": self.turn_timeout,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        self = cls.__new__(cls)
+        self.guild_id = d["guild_id"]
+        self.channel_id = d["channel_id"]
+        self.host_id = d["host_id"]
+        self.host_name = d["host_name"]
+        self.lobby_players = {int(k): v for k, v in d.get("lobby_players", {}).items()}
+        self.started = d.get("started", True)
+        self.engine = ue.GameState.from_dict(d["engine"]) if d.get("engine") else None
+        self.table_message = None
+        self.lobby_message = None
+        self.timer_task = None
+        self.msg_count = d.get("msg_count", 0)
+        self.last_action = d.get("last_action")
+        self.turn_started_at = d.get("turn_started_at", 0.0)
+        self.callout_balance = {int(k): v for k, v in d.get("callout_balance", {}).items()}
+        self._last_turn_player_id = d.get("_last_turn_player_id")
+        self.max_players = d.get("max_players", 10)
+        self.num_decks = d.get("num_decks", 1)
+        self.target_winners = d.get("target_winners", 1)
+        self.turn_timeout = d.get("turn_timeout", TURN_TIMEOUT_SECONDS)
+        # Fresh lock/generation counter for the resumed session — see the
+        # comments on these fields in __init__.
+        self.lock = asyncio.Lock()
+        self.turn_generation = 0
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Lobby view
@@ -341,7 +442,7 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
     max_players_input = discord.ui.TextInput(label="Max players (2–20)", max_length=2)
     decks_input = discord.ui.TextInput(label="Decks (1–6)", max_length=1)
     target_winners_input = discord.ui.TextInput(label="Winners before game ends (1–19)", max_length=2)
-    turn_timeout_input = discord.ui.TextInput(label="Turn timeout seconds (15–600)", max_length=3)
+    turn_timeout_input = discord.ui.TextInput(label="Turn timeout seconds (60–600)", max_length=3)
 
     def __init__(self, cog: "UnoGame", session: GameSession):
         super().__init__()
@@ -353,6 +454,12 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
         self.turn_timeout_input.default = str(session.turn_timeout)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if self.session.started:
+            await interaction.response.send_message(
+                "⚠️ The game has already started.", ephemeral=True,
+            )
+            return
+
         def parse(field, lo, hi, current):
             try:
                 v = int(field.value.strip())
@@ -404,6 +511,24 @@ class LobbyView(discord.ui.View):
         super().__init__(timeout=1800)
         self.cog = cog
         self.session = session
+
+    async def on_timeout(self):
+        # The lobby message itself just goes stale/uninteractable when a
+        # View times out — but the session was still sitting in
+        # self.cog.sessions, permanently blocking /uno start in this
+        # channel until someone noticed and ran /uno end. Only clean up if
+        # the game never actually started (a started game has its own
+        # lifecycle/timer and must not be touched here).
+        if not self.session.started:
+            self.cog.sessions.pop(self.session.channel_id, None)
+            if self.session.lobby_message:
+                try:
+                    await self.session.lobby_message.edit(
+                        content="Lobby expired.", embed=None, view=None
+                    )
+                except discord.HTTPException:
+                    pass
+        self.stop()
 
     @staticmethod
     def build_embed(session: GameSession) -> discord.Embed:
@@ -459,47 +584,67 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="Settings", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="uno_lobby_settings")
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_moderator(self.session, interaction.user):
-            await interaction.response.send_message("Only the host or a mod can change settings.", ephemeral=True)
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message("Only event staff can change settings.", ephemeral=True)
             return
         await interaction.response.send_modal(LobbySettingsModal(self.cog, self.session))
 
     @discord.ui.button(label="Start Game", style=discord.ButtonStyle.primary, custom_id="uno_lobby_start")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_moderator(self.session, interaction.user):
-            await interaction.response.send_message("Only the host or a mod can start the game.", ephemeral=True)
-            return
-        players = list(self.session.lobby_players.items())
-        if len(players) < 2:
-            await interaction.response.send_message("Need at least 2 players to start.", ephemeral=True)
-            return
-        if self.session.target_winners >= len(players):
-            await interaction.response.send_message(
-                "⚠️ Winners-before-game-ends must be less than the player count — adjust Settings first.",
-                ephemeral=True,
-            )
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message("Only event staff can start the game.", ephemeral=True)
             return
 
-        random.shuffle(players)  # turn order shouldn't depend on join order
-        self.session.engine = ue.GameState(players, num_decks=self.session.num_decks,
-                                            target_winners=self.session.target_winners)
-        self.session.started = True
-        self.stop()
+        async with self.session.lock:
+            if self.session.started:
+                await interaction.response.send_message("This game has already started.", ephemeral=True)
+                return
 
-        # Leave the original lobby embed exactly as it is — don't edit or clear
-        # it. Just disable its buttons (so Join/Leave/etc can't be clicked on a
-        # stale lobby) and post the table as a brand-new message.
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(view=self)
+            players = list(self.session.lobby_players.items())
+            if len(players) < 2:
+                await interaction.response.send_message("Need at least 2 players to start.", ephemeral=True)
+                return
+            if self.session.target_winners >= len(players):
+                await interaction.response.send_message(
+                    "⚠️ Winners-before-game-ends must be less than the player count — adjust Settings first.",
+                    ephemeral=True,
+                )
+                return
 
-        await self.cog.post_table(self.session, interaction.channel)
-        self.cog.restart_timer(self.session)
+            required_cards = len(players) * 7 + 1  # hand_size is always 7 here
+            available_cards = self.session.num_decks * 108
+            if required_cards > available_cards:
+                await interaction.response.send_message(
+                    f"⚠️ Not enough cards for {len(players)} players with "
+                    f"{self.session.num_decks} deck(s).",
+                    ephemeral=True,
+                )
+                return
+
+            random.shuffle(players)  # turn order shouldn't depend on join order
+            try:
+                self.session.engine = ue.GameState(players, num_decks=self.session.num_decks,
+                                                    target_winners=self.session.target_winners)
+            except ue.UnoError as e:
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                return
+            self.session.started = True
+            self.stop()
+
+            # Leave the original lobby embed exactly as it is — don't edit or clear
+            # it. Just disable its buttons (so Join/Leave/etc can't be clicked on a
+            # stale lobby) and post the table as a brand-new message.
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(view=self)
+
+            await self.cog.post_table(self.session, interaction.channel)
+            self.cog.restart_timer(self.session)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, custom_id="uno_lobby_cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_moderator(self.session, interaction.user):
-            await interaction.response.send_message("Only the host or a mod can cancel the lobby.", ephemeral=True)
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message("Only event staff can cancel the lobby.", ephemeral=True)
             return
         self.cog.sessions.pop(self.session.channel_id, None)
         self.stop()
@@ -519,17 +664,36 @@ class DrawFollowupView(discord.ui.View):
     draw always ending the turn outright. "Play this Card" plays it
     immediately (turn continues through the normal play flow, including
     any wild color follow-up); "No" keeps it and ends the turn, same as
-    before.
+    a timeout (see _keep_and_pass) — keeping an already-drawn card is a
+    normal, penalty-free outcome either way, never treated as an AFK
+    strike and never counted toward missed_turns.
     """
 
-    def __init__(self, cog: "UnoGame", session: GameSession, card: str):
+    def __init__(self, cog: "UnoGame", session: GameSession, card: str, player_id: int):
         super().__init__(timeout=60)
         self.cog = cog
         self.session = session
         self.card = card
+        self.player_id = player_id
+
+    async def _keep_and_pass(self, player_id: int):
+        """Ends the turn, keeping the already-drawn card. Shared by the
+        'No' button and on_timeout so the two paths can't diverge later.
+        Deliberately does NOT call engine.record_timeout() or touch
+        missed_turns — this is a normal turn-ending action, not an AFK
+        strike, even when reached via the timeout path."""
+        async with self.session.lock:
+            engine = self.session.engine
+            if not engine or engine.finished or engine.current_player().player_id != player_id:
+                return
+            engine.pass_turn(player_id)
+            self.session.last_action = {"type": "draw", "actor_id": player_id}
+            self.cog.restart_timer(self.session)
+            await self.cog.refresh_table(self.session)
 
     @discord.ui.button(label="Play this Card", style=discord.ButtonStyle.success)
     async def play_it(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
         await self.cog.handle_play_card(interaction, self.session, self.card, drew_first=True)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
@@ -538,11 +702,12 @@ class DrawFollowupView(discord.ui.View):
         if not engine or engine.finished or engine.current_player().player_id != interaction.user.id:
             await interaction.response.send_message("⚠️ Too late for that.", ephemeral=True)
             return
-        engine.pass_turn(interaction.user.id)
-        self.session.last_action = {"type": "draw", "actor_id": interaction.user.id}
+        self.stop()
         await interaction.response.edit_message(content=f"You drew **{self.card}** and kept it.", view=None)
-        self.cog.restart_timer(self.session)
-        await self.cog.refresh_table(self.session)
+        await self._keep_and_pass(interaction.user.id)
+
+    async def on_timeout(self):
+        await self._keep_and_pass(self.player_id)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         await report_component_error(interaction, error, item, "DrawFollowupView")
@@ -552,29 +717,39 @@ class ColorButtonsView(discord.ui.View):
     """
     Ephemeral 4-button color picker shown after any Wild is played —
     replaces the old text-entry modal since 4 fixed options fit buttons
-    perfectly and there's no parsing to get wrong.
+    perfectly and there's no parsing to get wrong. If nobody picks within
+    the timeout, on_timeout() randomly picks a color via the same
+    engine.choose_color() path as a manual pick, so all the Wild
+    resolution state stays centralized in the engine rather than being
+    special-cased here.
     """
 
-    def __init__(self, cog: "UnoGame", session: GameSession):
+    def __init__(self, cog: "UnoGame", session: GameSession, interaction: discord.Interaction | None = None):
         super().__init__(timeout=60)
         self.cog = cog
         self.session = session
+        # Stashed so on_timeout can edit the original ephemeral response —
+        # ephemeral messages don't give us a discord.Message to edit later,
+        # but the interaction token stays valid long enough for this.
+        self.interaction = interaction
 
     async def _choose(self, interaction: discord.Interaction, color: str):
-        engine = self.session.engine
-        try:
-            effects = engine.choose_color(interaction.user.id, color)
-        except ue.UnoError as e:
-            await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
-            return
+        async with self.session.lock:
+            engine = self.session.engine
+            try:
+                effects = engine.choose_color(interaction.user.id, color)
+            except ue.UnoError as e:
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                return
 
-        self.session.last_action = {"type": "color", "actor_id": interaction.user.id,
-                                     "color": color, "effects": effects}
-        await interaction.response.edit_message(content=f"Color set to **{color}**.", view=None)
-        await self.cog.refresh_table(self.session)
-        self.cog.restart_timer(self.session)
-        if engine.finished:
-            await self.cog.announce_and_cleanup(self.session)
+            self.session.last_action = {"type": "color", "actor_id": interaction.user.id,
+                                         "color": color, "effects": effects}
+            self.stop()
+            await interaction.response.edit_message(content=f"Color set to **{color}**.", view=None)
+            await self.cog.refresh_table(self.session)
+            self.cog.restart_timer(self.session)
+            if engine.finished:
+                await self.cog.announce_and_cleanup(self.session)
 
     @discord.ui.button(label="Red", style=discord.ButtonStyle.danger, emoji="🟥")
     async def red(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -591,6 +766,36 @@ class ColorButtonsView(discord.ui.View):
     @discord.ui.button(label="Blue", style=discord.ButtonStyle.primary, emoji="🟦")
     async def blue(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._choose(interaction, "Blue")
+
+    async def on_timeout(self):
+        async with self.session.lock:
+            engine = self.session.engine
+            if not engine or engine.finished or not engine.pending_wild:
+                return  # already resolved manually in the meantime
+
+            player_id = engine.current_player().player_id
+            color = random.choice(ue.COLORS)
+            try:
+                effects = engine.choose_color(player_id, color)
+            except ue.UnoError:
+                return
+
+            self.session.last_action = {"type": "color", "actor_id": player_id,
+                                         "color": color, "effects": effects}
+            self.stop()
+            for child in self.children:
+                child.disabled = True
+            if self.interaction is not None:
+                try:
+                    await self.interaction.edit_original_response(
+                        content=f"⏱️ No color chosen in time — randomly set to **{color}**.", view=None,
+                    )
+                except discord.HTTPException:
+                    pass
+            await self.cog.refresh_table(self.session)
+            self.cog.restart_timer(self.session)
+            if engine.finished:
+                await self.cog.announce_and_cleanup(self.session)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         await report_component_error(interaction, error, item, "ColorButtonsView")
@@ -697,8 +902,6 @@ class HandPlayView(discord.ui.LayoutView):
         container.add_item(Separator(spacing=discord.SeparatorSpacing.small))
 
         rows, used_fallback = build_rows_with_fallback(hand)
-        if used_fallback:
-            container.add_item(TextDisplay("_(flat layout — color grouping didn't fit in 5 rows)_"))
 
         for row_cards in rows:
             row = ActionRow()
@@ -752,11 +955,25 @@ class TableView(discord.ui.LayoutView):
     """
 
     def __init__(self, cog: "UnoGame", session: GameSession):
-        super().__init__(timeout=None)
+        # Old TableViews used to live forever (timeout=None), so every past
+        # turn's View stayed registered with discord.py indefinitely — a
+        # slow, unbounded memory leak over a long game. A bounded timeout
+        # lets discord.py release old View registrations once they're no
+        # longer useful, with zero visible change: old table messages and
+        # their buttons still look exactly the same, they just eventually
+        # stop responding. 720s (12 min) comfortably covers the max 600s
+        # turn timeout plus a buffer, so the CURRENT table's buttons are
+        # never at risk of expiring mid-turn — only genuinely old ones do.
+        super().__init__(timeout=720)
         self.cog = cog
         self.session = session
         self.file: discord.File | None = None
         self._build()
+
+    async def on_timeout(self):
+        # View.timeout already stops the View on its own; calling stop()
+        # explicitly here is harmless belt-and-suspenders, not essential.
+        self.stop()
 
     def _build(self):
         engine = self.session.engine
@@ -931,27 +1148,28 @@ class TableView(discord.ui.LayoutView):
 
         # If a Wild Draw Four is pending a decision, Callout doubles as "challenge it".
         if engine.pending_wd4_challenge:
-            pc = engine.pending_wd4_challenge
-            if interaction.user.id != pc["target_id"]:
-                await interaction.response.send_message(
-                    f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
-                    ephemeral=True,
-                )
-                return
-            result = engine.challenge_wild_draw4(interaction.user.id)
-            if result["success"]:
-                session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
-                                        "penalty_id": result["penalty_to"]}
-                await interaction.response.send_message(
-                    "✅ Challenge succeeded! They had a matching card, they draw 4 instead of you.", ephemeral=False
-                )
-            else:
-                session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
-                await interaction.response.send_message(
-                    "❌ Challenge failed, they really didn't have a match. You draw 6.", ephemeral=False
-                )
-            self.cog.restart_timer(session)
-            await self.cog.refresh_table(session)
+            async with session.lock:
+                pc = engine.pending_wd4_challenge
+                if not pc or interaction.user.id != pc["target_id"]:
+                    await interaction.response.send_message(
+                        f"⚠️ Waiting on {_mention(pc['target_id']) if pc else 'someone'} to accept or challenge the Wild Draw Four.",
+                        ephemeral=True,
+                    )
+                    return
+                result = engine.challenge_wild_draw4(interaction.user.id)
+                if result["success"]:
+                    session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
+                                            "penalty_id": result["penalty_to"]}
+                    await interaction.response.send_message(
+                        "✅ Challenge succeeded! They had a matching card, they draw 4 instead of you.", ephemeral=False
+                    )
+                else:
+                    session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
+                    await interaction.response.send_message(
+                        "❌ Challenge failed, they really didn't have a match. You draw 6.", ephemeral=False
+                    )
+                self.cog.restart_timer(session)
+                await self.cog.refresh_table(session)
             return
 
         await self.cog.handle_callout(interaction, session)
@@ -994,6 +1212,105 @@ class UnoGame(commands.Cog):
         log.info("Cached %d card image(s) in memory", len(self._card_image_cache))
 
     uno = app_commands.Group(name="uno", description="UNO game commands")
+
+    # ---------------- persistence ----------------
+
+    def _save_path(self, channel_id: int) -> Path:
+        return SAVE_DIR / f"{channel_id}.json"
+
+    def _save_session(self, session: GameSession):
+        """
+        Checkpoints a started game to disk. Best-effort: a disk/permission
+        problem here should never take down the actual game, so failures
+        are logged and swallowed rather than propagated. Writes to a temp
+        file and os.replace()s it into place so a crash mid-write can't
+        leave a half-written, unreadable save behind.
+        """
+        if not session.engine:
+            return
+        try:
+            SAVE_DIR.mkdir(parents=True, exist_ok=True)
+            data = json.dumps(session.to_dict())
+            fd, tmp_path = tempfile.mkstemp(dir=SAVE_DIR, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(data)
+                os.replace(tmp_path, self._save_path(session.channel_id))
+            except Exception:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            log.exception("Failed to save game state for channel %s", session.channel_id)
+
+    def _delete_save(self, channel_id: int):
+        try:
+            self._save_path(channel_id).unlink(missing_ok=True)
+        except Exception:
+            log.exception("Failed to delete save file for channel %s", channel_id)
+
+    @uno.command(name="resume", description="Resume this channel's game from its last saved checkpoint")
+    async def resume_cmd(self, interaction: discord.Interaction):
+        """
+        Deliberately manual, not automatic — a save on disk is a checkpoint
+        taken after every turn (see post_table), so if the bot crashed or a
+        bug corrupted state mid-game, the save file is the recovery point:
+        hand-fix the JSON if needed, then run this to pick back up from it.
+        No auto-restore-on-boot, on purpose — that would resume every saved
+        game unconditionally on every restart, with no chance to inspect or
+        fix a save first if the crash was caused by bad game state.
+        """
+        if interaction.channel_id in self.sessions:
+            await interaction.response.send_message(
+                "There's already a game or lobby active in this channel — end it first.", ephemeral=True
+            )
+            return
+
+        path = self._save_path(interaction.channel_id)
+        if not path.exists():
+            await interaction.response.send_message("No saved game found for this channel.", ephemeral=True)
+            return
+
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            session = GameSession.from_dict(data)
+        except Exception:
+            log.exception("Failed to parse save file for channel %s", interaction.channel_id)
+            await interaction.response.send_message(
+                "⚠️ That save file didn't load — check the logs for the exact error "
+                "(bad/edited JSON, wrong field, etc.), fix it, and try again.",
+                ephemeral=True,
+            )
+            return
+
+        if not session.engine:
+            await interaction.response.send_message("⚠️ That save has no game state to resume.", ephemeral=True)
+            return
+
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message(
+                "Only event staff can resume this save.", ephemeral=True
+            )
+            return
+
+        self.sessions[interaction.channel_id] = session
+        try:
+            await interaction.response.send_message("🔄 Resuming saved game — table posted below.", ephemeral=True)
+            await self.post_table(session, interaction.channel)
+            self.restart_timer(session)
+        except Exception:
+            log.exception("Failed to resume game for channel %s", interaction.channel_id)
+            self.sessions.pop(interaction.channel_id, None)
+            # Deliberately NOT deleting the save here — a failed resume
+            # (e.g. a bad emoji/image render) shouldn't destroy the one
+            # copy of the game state; leave it on disk so /uno resume can
+            # just be retried after whatever broke gets fixed.
+            await interaction.followup.send(
+                "⚠️ Resume failed partway through — the save file is untouched, you can try again.", ephemeral=True
+            )
 
     # ---------------- card emoji (shared with the button-grid hand UI) ----------------
 
@@ -1075,6 +1392,14 @@ class UnoGame(commands.Cog):
         session.table_message = msg
         session.msg_count = 0
 
+        # Every action that changes the table ends up here (see
+        # refresh_table + the direct callers below it) — this is the one
+        # choke point that covers every turn of an in-progress game, so
+        # it's the natural spot to checkpoint to disk. A save failure here
+        # must never break the game itself, hence the broad catch inside
+        # _save_session.
+        self._save_session(session)
+
     async def refresh_table(self, session: GameSession):
         """
         Resolves the right channel and delegates to post_table — kept as
@@ -1095,6 +1420,7 @@ class UnoGame(commands.Cog):
         engine = session.engine
         session.cancel_timer()
         self.sessions.pop(session.channel_id, None)
+        self._delete_save(session.channel_id)
 
         if not channel or not engine:
             return
@@ -1135,51 +1461,53 @@ class UnoGame(commands.Cog):
         if not engine:
             await interaction.response.send_message("No active game here.", ephemeral=True)
             return
-        if engine.current_player().player_id != interaction.user.id:
-            await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
-            return
 
-        try:
-            effects = engine.play_card(interaction.user.id, card)
-        except ue.IllegalCard as e:
-            await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
-            return
-        except ue.NotYourTurn:
-            await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
-            return
+        async with session.lock:
+            if engine.current_player().player_id != interaction.user.id:
+                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                return
 
-        engine.record_action(interaction.user.id)
+            try:
+                effects = engine.play_card(interaction.user.id, card)
+            except ue.IllegalCard as e:
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                return
+            except ue.NotYourTurn:
+                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                return
 
-        # Consume the Call UNO pre-arm (set via the Hand toggle at 2 cards):
-        # if it was armed and this play brought them down to exactly 1
-        # card, auto-declare it and fire the "UNO!" channel message. Either
-        # way the arm is spent once they're past the 2-card checkpoint.
-        player = engine.player_by_id(interaction.user.id)
-        fired_uno = False
-        if player and player.armed_uno:
-            if len(player.hand) == 1:
-                engine.call_uno(interaction.user.id)
-                fired_uno = True
-            player.armed_uno = False
+            engine.record_action(interaction.user.id)
 
-        if effects.get("color_pending"):
-            view = ColorButtonsView(self, session)
-            msg = "You drew and played a Wild — choose a color:" if drew_first else "Choose a color for your Wild:"
-            await interaction.response.send_message(msg, view=view, ephemeral=True)
+            # Consume the Call UNO pre-arm (set via the Hand toggle at 2 cards):
+            # if it was armed and this play brought them down to exactly 1
+            # card, auto-declare it and fire the "UNO!" channel message. Either
+            # way the arm is spent once they're past the 2-card checkpoint.
+            player = engine.player_by_id(interaction.user.id)
+            fired_uno = False
+            if player and player.armed_uno:
+                if len(player.hand) == 1:
+                    engine.call_uno(interaction.user.id)
+                    fired_uno = True
+                player.armed_uno = False
+
+            if effects.get("color_pending"):
+                view = ColorButtonsView(self, session, interaction)
+                msg = "You drew and played a Wild — choose a color:" if drew_first else "Choose a color for your Wild:"
+                await interaction.response.send_message(msg, view=view, ephemeral=True)
+                if fired_uno:
+                    await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
+                return
+
+            session.last_action = {"type": "play", "actor_id": interaction.user.id, "card": card,
+                                    "effects": effects, "drew_first": drew_first}
+            confirm = f"You drew and played **{card}**!" if drew_first else f"You played **{card}**."
+            await interaction.response.send_message(confirm, ephemeral=True)
+            self.restart_timer(session)
+            await self.refresh_table(session)
             if fired_uno:
                 await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
-            return
-
-        session.last_action = {"type": "play", "actor_id": interaction.user.id, "card": card,
-                                "effects": effects, "drew_first": drew_first}
-        confirm = f"You drew and played **{card}**!" if drew_first else f"You played **{card}**."
-        await interaction.response.send_message(confirm, ephemeral=True)
-        self.restart_timer(session)
-        await self.refresh_table(session)
-        if fired_uno:
-            await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
-        if engine.finished:
-            await self.announce_and_cleanup(session)
+            if engine.finished:
+                await self.announce_and_cleanup(session)
 
     async def handle_draw_card(self, interaction: discord.Interaction, session: GameSession):
         """Shared by the Draw button and /uno draw. If the drawn card can
@@ -1190,44 +1518,45 @@ class UnoGame(commands.Cog):
             await interaction.response.send_message("No active game here.", ephemeral=True)
             return
 
-        if engine.pending_wd4_challenge:
-            pc = engine.pending_wd4_challenge
-            if interaction.user.id != pc["target_id"]:
-                await interaction.response.send_message(
-                    f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
-                    ephemeral=True,
-                )
+        async with session.lock:
+            if engine.pending_wd4_challenge:
+                pc = engine.pending_wd4_challenge
+                if interaction.user.id != pc["target_id"]:
+                    await interaction.response.send_message(
+                        f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
+                        ephemeral=True,
+                    )
+                    return
+                engine.accept_wild_draw4(interaction.user.id)
+                session.last_action = {"type": "wd4_accept", "actor_id": interaction.user.id}
+                await interaction.response.send_message("You accepted the Wild Draw Four and drew 4 cards.", ephemeral=True)
+                self.restart_timer(session)
+                await self.refresh_table(session)
                 return
-            engine.accept_wild_draw4(interaction.user.id)
-            session.last_action = {"type": "wd4_accept", "actor_id": interaction.user.id}
-            await interaction.response.send_message("You accepted the Wild Draw Four and drew 4 cards.", ephemeral=True)
+
+            if engine.current_player().player_id != interaction.user.id:
+                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                return
+
+            result = engine.draw_card(interaction.user.id)
+            drawn = result["drawn"]
+
+            # Drawing moves hand size away from 2 either way -> any pre-armed
+            # Call UNO no longer applies to this checkpoint.
+            player = engine.player_by_id(interaction.user.id)
+            if player:
+                player.armed_uno = False
+
+            if result["still_playable"]:
+                view = DrawFollowupView(self, session, drawn, interaction.user.id)
+                await interaction.response.send_message(f"You drew **{drawn}**. Play it?", view=view, ephemeral=True)
+                return  # turn stays open until they pick Play/No — no refresh/restart yet
+
+            engine.pass_turn(interaction.user.id)
+            session.last_action = {"type": "draw", "actor_id": interaction.user.id}
+            await interaction.response.send_message(f"You drew **{drawn}**.", ephemeral=True)
             self.restart_timer(session)
             await self.refresh_table(session)
-            return
-
-        if engine.current_player().player_id != interaction.user.id:
-            await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
-            return
-
-        result = engine.draw_card(interaction.user.id)
-        drawn = result["drawn"]
-
-        # Drawing moves hand size away from 2 either way -> any pre-armed
-        # Call UNO no longer applies to this checkpoint.
-        player = engine.player_by_id(interaction.user.id)
-        if player:
-            player.armed_uno = False
-
-        if result["still_playable"]:
-            view = DrawFollowupView(self, session, drawn)
-            await interaction.response.send_message(f"You drew **{drawn}**. Play it?", view=view, ephemeral=True)
-            return  # turn stays open until they pick Play/No — no refresh/restart yet
-
-        engine.pass_turn(interaction.user.id)
-        session.last_action = {"type": "draw", "actor_id": interaction.user.id}
-        await interaction.response.send_message(f"You drew **{drawn}**.", ephemeral=True)
-        self.restart_timer(session)
-        await self.refresh_table(session)
 
     async def handle_callout(self, interaction: discord.Interaction, session: GameSession):
         """No-target callout: catches everyone currently vulnerable at once,
@@ -1250,34 +1579,39 @@ class UnoGame(commands.Cog):
             await interaction.response.send_message("Only active players can call someone out.", ephemeral=True)
             return
 
-        balance = session.callout_balance.get(interaction.user.id, 1)
-        if balance <= 0:
-            await interaction.response.send_message(
-                "⚠️ You're out of callout attempts until your turn comes back around.", ephemeral=True
-            )
-            return
+        async with session.lock:
+            balance = session.callout_balance.get(interaction.user.id, 1)
+            if balance <= 0:
+                await interaction.response.send_message(
+                    "⚠️ You're out of callout attempts until your turn comes back around.", ephemeral=True
+                )
+                return
 
-        try:
-            result = engine.challenge_uno_auto(interaction.user.id)
-        except ue.UnoError as e:
-            await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
-            return
+            try:
+                result = engine.challenge_uno_auto(interaction.user.id)
+            except ue.UnoError as e:
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                return
 
-        if result["penalty_to_accuser"]:
-            session.callout_balance[interaction.user.id] = balance - 1
-            session.last_action = {"type": "callout_miss", "actor_id": interaction.user.id, "n": result["n"]}
-            await interaction.response.send_message(
-                f"{_mention(interaction.user.id)} draws {result['n']} cards for a false callout.",
-                ephemeral=False,
-            )
-        else:
-            session.last_action = {"type": "callout", "actor_id": interaction.user.id,
-                                    "caught": result["caught"], "n": result["n"]}
-            caught_mentions = ", ".join(_mention(pid) for pid in result["caught"])
-            await interaction.response.send_message(
-                f"{caught_mentions} forgot to call UNO and draw {result['n']} cards each.",
-                ephemeral=False,
-            )
+            if result["penalty_to_accuser"]:
+                session.callout_balance[interaction.user.id] = balance - 1
+                # Not setting session.last_action here — this already gets its
+                # own public message right below, and (unlike kick/leave)
+                # handle_callout deliberately doesn't repost the table, so the
+                # old "callout_miss" last_action used to just sit there and
+                # surface later, out of context, on whatever refresh_table call
+                # happened to come next (e.g. the periodic chat-activity
+                # refresh) — restating a callout that already scrolled by.
+                await interaction.response.send_message(
+                    f"{_mention(interaction.user.id)} draws {result['n']} cards for a false callout.",
+                    ephemeral=False,
+                )
+            else:
+                caught_mentions = ", ".join(_mention(pid) for pid in result["caught"])
+                await interaction.response.send_message(
+                    f"{caught_mentions} forgot to call UNO and draw {result['n']} cards each.",
+                    ephemeral=False,
+                )
 
     async def handle_toggle_arm_uno(self, interaction: discord.Interaction, session: GameSession):
         """
@@ -1290,18 +1624,20 @@ class UnoGame(commands.Cog):
         if not engine:
             await interaction.response.send_message("No active game here.", ephemeral=True)
             return
-        player = engine.player_by_id(interaction.user.id)
-        if not player or len(player.hand) != 2:
-            await interaction.response.send_message("⚠️ You don't have exactly 2 cards left.", ephemeral=True)
-            return
 
-        player.armed_uno = not player.armed_uno
-        if player.armed_uno:
-            await interaction.response.send_message(
-                "✅ Armed — you'll auto-call UNO when you play down to 1 card.", ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("❌ Un-armed.", ephemeral=True)
+        async with session.lock:
+            player = engine.player_by_id(interaction.user.id)
+            if not player or len(player.hand) != 2:
+                await interaction.response.send_message("⚠️ You don't have exactly 2 cards left.", ephemeral=True)
+                return
+
+            player.armed_uno = not player.armed_uno
+            if player.armed_uno:
+                await interaction.response.send_message(
+                    "✅ Armed — you'll auto-call UNO when you play down to 1 card.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message("❌ Un-armed.", ephemeral=True)
 
     async def send_hand_view(self, interaction: discord.Interaction, session: GameSession, player_id: int):
         """View-only hand: stitched card images plus a plain text list as
@@ -1357,6 +1693,10 @@ class UnoGame(commands.Cog):
 
     def restart_timer(self, session: GameSession):
         session.cancel_timer()
+        # Bump the generation unconditionally (even if the game just ended)
+        # so any timer task still in flight from a previous turn recognizes
+        # itself as stale and no-ops instead of double-acting.
+        session.turn_generation += 1
         if session.engine and not session.engine.finished:
             session.turn_started_at = time.time()
 
@@ -1370,7 +1710,10 @@ class UnoGame(commands.Cog):
                     session.callout_balance[current_id] = 1
                     session._last_turn_player_id = current_id
 
-            session.timer_task = safe_task(self._timer_loop(session), name=f"uno-timer-{session.channel_id}")
+            generation = session.turn_generation
+            session.timer_task = safe_task(
+                self._timer_loop(session, generation), name=f"uno-timer-{session.channel_id}"
+            )
 
     async def _send_to_game_channel(self, session: GameSession, content: str):
         """
@@ -1386,40 +1729,79 @@ class UnoGame(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    async def _timer_loop(self, session: GameSession):
+    async def _timer_loop(self, session: GameSession, generation: int):
+        """
+        Per-turn AFK timer. `generation` is the value session.turn_generation
+        held when this timer was scheduled (see restart_timer) — any manual
+        action (play/draw/pass/kick/etc) bumps the counter, so if it's moved
+        on by the time this wakes up, some other action already resolved
+        this turn and this timer does nothing instead of double-acting.
+
+        Also resilient by construction: an unexpected error while
+        auto-acting on the AFK player is logged and still leads to a fresh
+        timer being scheduled (previously such an error would just kill
+        this task permanently, with nothing left to ever re-trigger a
+        timeout in this channel again), and finished-game cleanup always
+        happens even if the table re-render that follows it fails.
+        """
         try:
             await asyncio.sleep(session.turn_timeout)
         except asyncio.CancelledError:
             return
 
-        if session.channel_id not in self.sessions or not session.engine or session.engine.finished:
+        if session.channel_id not in self.sessions:
             return
 
         engine = session.engine
+        if not engine or engine.finished or session.turn_generation != generation:
+            return
 
-        if engine.pending_wd4_challenge:
-            # Special case: the "current player" right now is nominally
-            # still the person who played the Wild Draw Four — the actual
-            # pending decision belongs to the target. If they go AFK on
-            # that decision, default to auto-accepting on their behalf
-            # rather than running the normal timeout/kick logic against
-            # the wrong person.
-            target_id = engine.pending_wd4_challenge["target_id"]
-            engine.accept_wild_draw4(target_id)
-            session.last_action = {"type": "wd4_timeout_accept", "actor_id": target_id}
-        else:
-            result = engine.record_timeout()
-            if result["kicked"]:
-                session.last_action = {"type": "timeout_kick", "actor_id": result["player_id"]}
-            else:
-                session.last_action = {"type": "timeout_draw", "actor_id": result["player_id"]}
+        finished = False
+        try:
+            async with session.lock:
+                if session.turn_generation != generation or engine.finished:
+                    return  # resolved by something else while we waited on the lock
 
-        if engine.finished:
-            await self.refresh_table(session)
+                if engine.pending_wd4_challenge:
+                    # Special case: the "current player" right now is nominally
+                    # still the person who played the Wild Draw Four — the actual
+                    # pending decision belongs to the target. If they go AFK on
+                    # that decision, default to auto-accepting on their behalf
+                    # rather than running the normal timeout/kick logic against
+                    # the wrong person.
+                    target_id = engine.pending_wd4_challenge["target_id"]
+                    engine.accept_wild_draw4(target_id)
+                    session.last_action = {"type": "wd4_timeout_accept", "actor_id": target_id}
+                else:
+                    result = engine.record_timeout()
+                    if result["kicked"]:
+                        session.last_action = {"type": "timeout_kick", "actor_id": result["player_id"]}
+                    else:
+                        session.last_action = {"type": "timeout_draw", "actor_id": result["player_id"]}
+
+                finished = engine.finished
+        except Exception:
+            log.exception("Turn timeout auto-action failed for channel %s", session.channel_id)
+            if session.channel_id in self.sessions and engine and not engine.finished:
+                self.restart_timer(session)
+            return
+
+        if finished:
+            # Cleanup MUST happen regardless of whether this render succeeds
+            # — a finished game should never sit stuck in self.sessions just
+            # because a Discord API call failed.
+            try:
+                await self.refresh_table(session)
+            except Exception:
+                log.exception("Failed to render final table for channel %s", session.channel_id)
             await self.announce_and_cleanup(session)
-        else:
-            self.restart_timer(session)
+            return
+
+        self.restart_timer(session)
+        try:
             await self.refresh_table(session)
+        except Exception:
+            log.exception("Post-timeout table refresh failed for channel %s", session.channel_id)
 
     # ---------------- commands ----------------
 
@@ -1496,39 +1878,40 @@ class UnoGame(commands.Cog):
 
         if ue.is_wild(parsed) and color:
             engine = session.engine
-            if engine.current_player().player_id != interaction.user.id:
-                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
-                return
             color_norm = color.strip().capitalize()
             if color_norm not in ue.COLORS:
                 await interaction.response.send_message("⚠️ Color must be Red/Yellow/Green/Blue.", ephemeral=True)
                 return
-            try:
-                effects = engine.play_card(interaction.user.id, parsed, chosen_color=color_norm)
-            except ue.IllegalCard as e:
-                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
-                return
-            except ue.NotYourTurn:
-                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
-                return
-            engine.record_action(interaction.user.id)
+            async with session.lock:
+                if engine.current_player().player_id != interaction.user.id:
+                    await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                    return
+                try:
+                    effects = engine.play_card(interaction.user.id, parsed, chosen_color=color_norm)
+                except ue.IllegalCard as e:
+                    await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                    return
+                except ue.NotYourTurn:
+                    await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                    return
+                engine.record_action(interaction.user.id)
 
-            player = engine.player_by_id(interaction.user.id)
-            fired_uno = False
-            if player and player.armed_uno:
-                if len(player.hand) == 1:
-                    engine.call_uno(interaction.user.id)
-                    fired_uno = True
-                player.armed_uno = False
+                player = engine.player_by_id(interaction.user.id)
+                fired_uno = False
+                if player and player.armed_uno:
+                    if len(player.hand) == 1:
+                        engine.call_uno(interaction.user.id)
+                        fired_uno = True
+                    player.armed_uno = False
 
-            session.last_action = {"type": "play", "actor_id": interaction.user.id, "card": parsed, "effects": effects}
-            await interaction.response.send_message(f"You played **{parsed}** and chose **{color_norm}**.", ephemeral=True)
-            self.restart_timer(session)
-            await self.refresh_table(session)
-            if fired_uno:
-                await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
-            if engine.finished:
-                await self.announce_and_cleanup(session)
+                session.last_action = {"type": "play", "actor_id": interaction.user.id, "card": parsed, "effects": effects}
+                await interaction.response.send_message(f"You played **{parsed}** and chose **{color_norm}**.", ephemeral=True)
+                self.restart_timer(session)
+                await self.refresh_table(session)
+                if fired_uno:
+                    await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
+                if engine.finished:
+                    await self.announce_and_cleanup(session)
             return
 
         await self.handle_play_card(interaction, session, parsed)
@@ -1558,26 +1941,28 @@ class UnoGame(commands.Cog):
         engine = session.engine
 
         if engine.pending_wd4_challenge:
-            pc = engine.pending_wd4_challenge
-            if interaction.user.id != pc["target_id"]:
-                await interaction.response.send_message(
-                    f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.", ephemeral=True
-                )
-                return
-            result = engine.challenge_wild_draw4(interaction.user.id)
-            if result["success"]:
-                session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
-                                        "penalty_id": result["penalty_to"]}
-                await interaction.response.send_message(
-                    "✅ Challenge succeeded! They had a matching card — they draw 4 instead of you.", ephemeral=False
-                )
-            else:
-                session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
-                await interaction.response.send_message(
-                    "❌ Challenge failed — they really didn't have a match. You draw 6.", ephemeral=False
-                )
-            self.restart_timer(session)
-            await self.refresh_table(session)
+            async with session.lock:
+                pc = engine.pending_wd4_challenge
+                if not pc or interaction.user.id != pc["target_id"]:
+                    await interaction.response.send_message(
+                        f"⚠️ Waiting on {_mention(pc['target_id']) if pc else 'someone'} to accept or challenge the Wild Draw Four.",
+                        ephemeral=True,
+                    )
+                    return
+                result = engine.challenge_wild_draw4(interaction.user.id)
+                if result["success"]:
+                    session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
+                                            "penalty_id": result["penalty_to"]}
+                    await interaction.response.send_message(
+                        "✅ Challenge succeeded! They had a matching card — they draw 4 instead of you.", ephemeral=False
+                    )
+                else:
+                    session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
+                    await interaction.response.send_message(
+                        "❌ Challenge failed — they really didn't have a match. You draw 6.", ephemeral=False
+                    )
+                self.restart_timer(session)
+                await self.refresh_table(session)
             return
 
         await self.handle_callout(interaction, session)
@@ -1590,28 +1975,29 @@ class UnoGame(commands.Cog):
             return
         await self.handle_toggle_arm_uno(interaction, session)
 
-    @uno.command(name="end", description="End/cancel the game or lobby in this channel (host only)")
+    @uno.command(name="end", description="End/cancel the game or lobby in this channel (event staff only)")
     async def end(self, interaction: discord.Interaction):
         session = self.sessions.get(interaction.channel_id)
         if not session:
             await interaction.response.send_message("No active game or lobby here.", ephemeral=True)
             return
-        if not is_moderator(session, interaction.user):
-            await interaction.response.send_message("Only the host (or a mod) can end this.", ephemeral=True)
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message("Only event staff can end this.", ephemeral=True)
             return
         session.cancel_timer()
         self.sessions.pop(interaction.channel_id, None)
+        self._delete_save(interaction.channel_id)
         await interaction.response.send_message("Game ended.")
 
-    @uno.command(name="kick", description="Remove a player from the lobby or game (host/mod only)")
+    @uno.command(name="kick", description="Remove a player from the lobby or game (event staff only)")
     @app_commands.describe(user="The user to remove")
     async def kick(self, interaction: discord.Interaction, user: discord.User):
         session = self.sessions.get(interaction.channel_id)
         if not session:
             await interaction.response.send_message("No active game or lobby here.", ephemeral=True)
             return
-        if not is_moderator(session, interaction.user):
-            await interaction.response.send_message("Only the host or a mod can kick players.", ephemeral=True)
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message("Only event staff can kick players.", ephemeral=True)
             return
 
         target_id = user.id
@@ -1633,22 +2019,30 @@ class UnoGame(commands.Cog):
             await interaction.response.send_message("That user isn't an active player.", ephemeral=True)
             return
 
-        name = engine.player_by_id(target_id).name
-        engine.remove_player(target_id)
-        session.last_action = {"type": "kick", "actor_id": interaction.user.id, "target_id": target_id}
-        await interaction.response.send_message(f"Removed **{name}** from the game.", ephemeral=False)
+        async with session.lock:
+            player = engine.player_by_id(target_id)
+            if player is None:
+                await interaction.response.send_message("That user isn't an active player.", ephemeral=True)
+                return
+            name = player.name
+            engine.remove_player(target_id)
+            # Not setting session.last_action — the send_message right below
+            # is already the public announcement, and refresh_table (called
+            # a few lines down) used to repost a whole new table whose
+            # headline said the exact same thing a second time.
+            await interaction.response.send_message(f"Removed **{name}** from the game.", ephemeral=False)
 
-        if engine.finished:
-            await self.announce_and_cleanup(session)
-        else:
-            # Always restart the timer here, not just "if was_current" —
-            # remove_player's turn-advancement can change who's current in
-            # ways this simple pre-check can't detect (e.g. kicking the
-            # target of a pending Wild Draw Four while the WD4 player was
-            # still nominally "current"). Restarting unconditionally is
-            # cheap and always correct.
-            self.restart_timer(session)
-            await self.refresh_table(session)
+            if engine.finished:
+                await self.announce_and_cleanup(session)
+            else:
+                # Always restart the timer here, not just "if was_current" —
+                # remove_player's turn-advancement can change who's current in
+                # ways this simple pre-check can't detect (e.g. kicking the
+                # target of a pending Wild Draw Four while the WD4 player was
+                # still nominally "current"). Restarting unconditionally is
+                # cheap and always correct.
+                self.restart_timer(session)
+                await self.refresh_table(session)
 
     @uno.command(name="leave", description="Leave the game or lobby in this channel")
     async def leave_cmd(self, interaction: discord.Interaction):
@@ -1674,15 +2068,20 @@ class UnoGame(commands.Cog):
             await interaction.response.send_message("You're not an active player in this game.", ephemeral=True)
             return
 
-        engine.remove_player(target_id)
-        session.last_action = {"type": "leave", "actor_id": target_id, "target_id": target_id}
-        await interaction.response.send_message(f"{_mention(target_id)} left the game.", ephemeral=False)
+        async with session.lock:
+            if engine.player_by_id(target_id) is None:
+                await interaction.response.send_message("You're not an active player in this game.", ephemeral=True)
+                return
+            engine.remove_player(target_id)
+            # Same reasoning as /uno kick — don't duplicate the message below
+            # as the next table headline too.
+            await interaction.response.send_message(f"{_mention(target_id)} left the game.", ephemeral=False)
 
-        if engine.finished:
-            await self.announce_and_cleanup(session)
-        else:
-            self.restart_timer(session)
-            await self.refresh_table(session)
+            if engine.finished:
+                await self.announce_and_cleanup(session)
+            else:
+                self.restart_timer(session)
+                await self.refresh_table(session)
 
     # ---------------- listeners ----------------
 
@@ -1718,19 +2117,22 @@ class UnoGame(commands.Cog):
             if not session.engine or session.engine.player_by_id(user_id) is None:
                 continue
 
-            session.engine.remove_player(user_id)
+            async with session.lock:
+                if session.engine.player_by_id(user_id) is None:
+                    continue
+                session.engine.remove_player(user_id)
 
-            channel = self.bot.get_channel(session.channel_id)
-            if channel:
-                await channel.send(f"👋 A player {reason} and was removed from the game.")
+                channel = self.bot.get_channel(session.channel_id)
+                if channel:
+                    await channel.send(f"👋 A player {reason} and was removed from the game.")
 
-            if session.engine.finished:
-                await self.announce_and_cleanup(session)
-            else:
-                # Always restart, not just "if was_current" — see the
-                # matching comment in the /uno kick handler for why.
-                self.restart_timer(session)
-                await self.refresh_table(session)
+                if session.engine.finished:
+                    await self.announce_and_cleanup(session)
+                else:
+                    # Always restart, not just "if was_current" — see the
+                    # matching comment in the /uno kick handler for why.
+                    self.restart_timer(session)
+                    await self.refresh_table(session)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):

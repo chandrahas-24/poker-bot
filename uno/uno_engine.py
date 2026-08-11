@@ -85,6 +85,20 @@ def is_wild(card: str) -> bool:
     return card in WILD_CARDS
 
 
+def _valid_card(card) -> bool:
+    """True if `card` is a well-formed card id ("Red_4", "Blue_Skip",
+    "Wild", "Wild_Draw_4", ...) — used to validate untrusted save data."""
+    if not isinstance(card, str):
+        return False
+    if card in WILD_CARDS:
+        return True
+    parts = card.split("_", 1)
+    if len(parts) != 2:
+        return False
+    color, value = parts
+    return color in COLORS and (value in NUMBER_VALUES or value in ACTION_VALUES)
+
+
 _VALUE_ALIASES = {
     "skip": "Skip", "s": "Skip",
     "reverse": "Reverse", "r": "Reverse", "rev": "Reverse",
@@ -102,12 +116,28 @@ _COLOR_ALIASES = {
 def parse_card_input(text: str) -> Optional[str]:
     """
     Best-effort parse of free-text modal input into a canonical card id.
-    Accepts things like "red 4", "Red_4", "r 4", "wild +4", "wild draw 4",
-    "wild4", "blue skip", "b skip", "blue draw two". Returns None if it
-    can't confidently parse.
+
+    Colors: full name or single-letter alias ("red"/"r", "yellow"/"y",
+        "green"/"g", "blue"/"b").
+    Numbers: "Red_4", "Red 4", "r 4".
+    Draw Two: "Red +2", "Red Draw 2", "r +2", "r draw2".
+    Wild: "Wild", "Wild +4", "Wild Draw 4", "wild4" (also accepted as one
+        compact word, with or without a separator).
+
+    Returns None if it can't confidently parse.
     """
     if not text:
         return None
+
+    # Compact one-word spellings of Wild / Wild Draw Four (e.g. "wild4",
+    # "wilddraw4") won't tokenize into two pieces below, so normalize them
+    # up front before the regular tokenizer runs.
+    compact = re.sub(r"[\s_+]+", "", text.strip().lower())
+    if compact in ("wilddraw4", "wilddrawfour", "wild4"):
+        return "Wild_Draw_4"
+    if compact == "wild":
+        return "Wild"
+
     tokens = [t for t in re.split(r"[\s_]+", text.strip()) if t]
     if not tokens:
         return None
@@ -126,13 +156,21 @@ def parse_card_input(text: str) -> Optional[str]:
     if color is None:
         return None
 
-    value_raw = "".join(tokens[1:]).lower().replace("+", "")
+    # Check the raw joined value (with "+" intact) against the alias table
+    # FIRST — "+2" is itself a key there. Stripping "+" before this lookup
+    # would turn "+2" into "2" and silently misparse it as a plain Red_2
+    # instead of Red_Draw_2.
+    value_raw = "".join(tokens[1:]).lower()
     if value_raw in _VALUE_ALIASES:
         value = _VALUE_ALIASES[value_raw]
-    elif value_raw.isdigit() and 0 <= int(value_raw) <= 9:
-        value = value_raw
     else:
-        return None
+        stripped = value_raw.replace("+", "")
+        if stripped in _VALUE_ALIASES:
+            value = _VALUE_ALIASES[stripped]
+        elif stripped.isdigit() and 0 <= int(stripped) <= 9:
+            value = stripped
+        else:
+            return None
     return f"{color}_{value}"
 
 
@@ -188,6 +226,18 @@ class GameState:
                  target_winners: int = 1):
         if len(players) < 2:
             raise UnoError("Need at least 2 players")
+        pids = [pid for pid, _ in players]
+        if len(set(pids)) != len(pids):
+            raise UnoError("Player IDs must be unique")
+        if not (1 <= num_decks <= 6):
+            raise UnoError("num_decks must be between 1 and 6")
+        if hand_size < 1:
+            raise UnoError("hand_size must be positive")
+        required_cards = len(players) * hand_size + 1
+        if required_cards > num_decks * 108:
+            raise UnoError(
+                f"Not enough cards for {len(players)} players with {num_decks} deck(s)."
+            )
 
         self.num_decks = num_decks
         self.wild_draw4_challenge = wild_draw4_challenge
@@ -291,15 +341,62 @@ class GameState:
         if not self.discard_pile:
             raise UnoError("Corrupt save data — empty discard pile.")
 
-        self.all_names = dict(d.get("all_names", {p.player_id: p.name for p in self.players}))
+        pids = [p.player_id for p in self.players]
+        if len(set(pids)) != len(pids):
+            raise UnoError("Corrupt save data — duplicate player IDs.")
+        for p in self.players:
+            for c in p.hand:
+                if not _valid_card(c):
+                    raise UnoError(f"Corrupt save data — invalid card in hand: {c!r}")
+        for c in self.discard_pile:
+            if not _valid_card(c):
+                raise UnoError(f"Corrupt save data — invalid card in discard pile: {c!r}")
+
+        # Player ids are ints everywhere else in this codebase (Discord user
+        # ids), but JSON object keys are always strings — round-tripping
+        # through to_dict()/json.dumps()/json.loads() silently turns this
+        # into a dict with string keys, which then fails every int-keyed
+        # lookup (all_names[player_id]) without raising anything. Cast back
+        # explicitly rather than trusting the caller's key types.
+        raw_names = d.get("all_names") or {p.player_id: p.name for p in self.players}
+        self.all_names = {int(k): v for k, v in raw_names.items()}
+
         self.finishers = list(d.get("finishers", []))
-        self.target_winners = d.get("target_winners", 1)
+        for fid in self.finishers:
+            if fid not in self.all_names:
+                raise UnoError(f"Corrupt save data — finisher {fid!r} is not a known player.")
+
+        max_target = max(len(self.players) + len(self.finishers) - 1, 1)
+        target_winners = d.get("target_winners", 1)
+        if not isinstance(target_winners, int) or target_winners < 1:
+            target_winners = 1
+        self.target_winners = min(target_winners, max_target)
+
         self.pending_wild = d.get("pending_wild", False)
         self.pending_wild_card = d.get("pending_wild_card")
+        if self.pending_wild and not self.pending_wild_card:
+            raise UnoError("Corrupt save data — pending_wild set with no pending_wild_card.")
+        if self.pending_wild_card is not None and not _valid_card(self.pending_wild_card):
+            raise UnoError(f"Corrupt save data — invalid pending_wild_card: {self.pending_wild_card!r}")
+
         self.pending_wd4_challenge = d.get("pending_wd4_challenge")
+        if self.pending_wd4_challenge is not None:
+            pc = self.pending_wd4_challenge
+            if (not isinstance(pc, dict)
+                    or "wd4_player_id" not in pc or "target_id" not in pc or "prior_color" not in pc):
+                raise UnoError("Corrupt save data — malformed pending_wd4_challenge.")
+            if pc["wd4_player_id"] not in self.all_names or pc["target_id"] not in self.all_names:
+                raise UnoError("Corrupt save data — pending_wd4_challenge references an unknown player.")
+            if pc["prior_color"] not in COLORS:
+                raise UnoError("Corrupt save data — pending_wd4_challenge has an invalid prior_color.")
+
         self.last_wd4_by = d.get("last_wd4_by")
         self.draw2_chain_count = d.get("draw2_chain_count", 0)
+
         self.winner = d.get("winner")
+        if self.winner is not None and self.winner not in self.all_names:
+            raise UnoError(f"Corrupt save data — winner {self.winner!r} is not a known player.")
+
         self.callout_window = d.get("callout_window")
         self.num_decks = d.get("num_decks", 1)
         self.wild_draw4_challenge = d.get("wild_draw4_challenge", True)
@@ -334,10 +431,25 @@ class GameState:
         self._reshuffle_if_needed()
         return self.draw_pile.pop()
 
+    def _cards_available(self) -> int:
+        """Total cards that could still be drawn, counting a discard-pile
+        reshuffle (the top discard card is excluded since it must stay in
+        play)."""
+        return len(self.draw_pile) + max(0, len(self.discard_pile) - 1)
+
     def _force_draw(self, player: Player, n: int):
+        """
+        Transactional: either the player gets all n cards, or (if there
+        truly aren't n cards left to draw, even after reshuffling) none of
+        the player's hand is touched and DeckExhausted is raised instead.
+        Never leaves a player having drawn a partial amount.
+        """
+        if n > self._cards_available():
+            raise DeckExhausted(f"Not enough cards left to draw {n}.")
         for _ in range(n):
             player.hand.append(self._draw_raw())
         player.said_uno = False
+        player.armed_uno = False
 
     def current_player(self) -> Player:
         return self.players[self.current_index]
@@ -389,7 +501,7 @@ class GameState:
             self.remove_player(player.player_id)
             self.last_summary = f"{player.name} was AFK too long and was removed from the game."
         else:
-            self.current_index = self._offset(1) % max(len(self.players), 1)
+            self.current_index = self._offset(1)
             self.last_summary = f"{player.name} was AFK and auto-drew a card."
 
         self._check_win()

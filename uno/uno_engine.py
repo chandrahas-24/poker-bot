@@ -206,6 +206,13 @@ class Player:
         p.missed_turns = d.get("missed_turns", 0)
         p.said_uno = d.get("said_uno", False)
         p.armed_uno = d.get("armed_uno", False)
+        # Sanitize: armed_uno is only ever meaningful at exactly 2 cards.
+        # A save file could have this stale/corrupted (e.g. hand-edited,
+        # or written by a version with a bug) — silently drop the arm
+        # rather than let a player show up "UNO Armed" with the wrong
+        # hand size.
+        if p.armed_uno and len(p.hand) != 2:
+            p.armed_uno = False
         return p
 
 
@@ -490,6 +497,12 @@ class GameState:
         drawn = self._draw_raw()
         player.hand.append(drawn)
         player.said_uno = False
+        if len(player.hand) != 2:
+            # armed_uno only ever means anything at exactly 2 cards; this
+            # AFK auto-draw just moved them off that checkpoint (almost
+            # always upward, to 3+), so any pre-arm from before no longer
+            # applies.
+            player.armed_uno = False
         player.missed_turns += 1
         self.draw2_chain_count = 0  # AFK auto-draw doesn't continue a Draw_2 chain
 
@@ -793,6 +806,11 @@ class GameState:
         card = self._draw_raw()
         player.hand.append(card)
         player.said_uno = False
+        if len(player.hand) != 2:
+            # armed_uno only ever means anything at exactly 2 cards — this
+            # voluntary draw just moved them off that checkpoint, so any
+            # pre-arm from before no longer applies.
+            player.armed_uno = False
         self.record_action(player_id)
         self.draw2_chain_count = 0  # voluntarily drawing instead of playing a Draw_2 breaks the chain
         self.last_summary = f"{player.name} drew a card."

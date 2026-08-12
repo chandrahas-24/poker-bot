@@ -567,7 +567,7 @@ class LobbyView(discord.ui.View):
     async def _refresh(self, interaction: discord.Interaction):
         await interaction.response.edit_message(embed=self.build_embed(self.session), view=self)
 
-    @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="uno_lobby_join")
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="uno_lobby_join", row=0)
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self.session.lock:
             if interaction.user.id in self.session.lobby_players:
@@ -579,7 +579,7 @@ class LobbyView(discord.ui.View):
             self.session.lobby_players[interaction.user.id] = interaction.user.display_name
             await self._refresh(interaction)
 
-    @discord.ui.button(label="Leave", style=discord.ButtonStyle.secondary, custom_id="uno_lobby_leave")
+    @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger, custom_id="uno_lobby_leave", row=0)
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self.session.lock:
             if interaction.user.id not in self.session.lobby_players:
@@ -588,7 +588,11 @@ class LobbyView(discord.ui.View):
             del self.session.lobby_players[interaction.user.id]
             await self._refresh(interaction)
 
-    @discord.ui.button(label="Settings", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="uno_lobby_settings")
+    @discord.ui.button(label="Rules",style=discord.ButtonStyle.secondary,custom_id="uno_lobby_rules",row=0)
+    async def rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.rules_cmd.callback(self.cog, interaction)
+
+    @discord.ui.button(label="Settings", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="uno_lobby_settings", row=1)
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_event_staff(interaction):
             await interaction.response.send_message("Only event staff can change settings.", ephemeral=True)
@@ -599,7 +603,7 @@ class LobbyView(discord.ui.View):
         # against a stale modal being submitted after the game starts.
         await interaction.response.send_modal(LobbySettingsModal(self.cog, self.session))
 
-    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.primary, custom_id="uno_lobby_start")
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.primary, custom_id="uno_lobby_start", row=1)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_event_staff(interaction):
             await interaction.response.send_message("Only event staff can start the game.", ephemeral=True)
@@ -651,7 +655,7 @@ class LobbyView(discord.ui.View):
             await self.cog.post_table(self.session, interaction.channel)
             self.cog.restart_timer(self.session)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, custom_id="uno_lobby_cancel")
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, custom_id="uno_lobby_cancel",row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_event_staff(interaction):
             await interaction.response.send_message("Only event staff can cancel the lobby.", ephemeral=True)

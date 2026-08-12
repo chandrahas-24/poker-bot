@@ -2219,6 +2219,87 @@ class UnoGame(commands.Cog):
                 self.restart_timer(session)
                 await self.refresh_table(session)
 
+    @uno.command(name="rules", description="View the UNO rules and bot-specific rules.")
+    async def rules_cmd(self, interaction: discord.Interaction):
+        container = Container(
+            accent_colour=discord.Colour(0x2020D5)
+        )
+
+        container.add_item(
+            TextDisplay(
+                "# <:uno:1536135137232953451> UNO Rules\n"
+                "The bot follows standard UNO rules except those explicitly stated below.\n"
+                "[View Standard UNO Rules](https://en.wikipedia.org/wiki/Uno_(card_game)#Official_rules)"
+            )
+        )
+
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
+                "### <:uno_draw_2:1536919114247839815> Draw 2 Stacking\n"
+                "Each consecutive Draw 2 increases the penalty by 2.\n"
+                "Example: `+2 → +4 → +6 → +8`.\n"
+                "Playing anything other than a Draw 2, or drawing normally, resets the chain."
+            )
+        )
+
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
+                "### <:Wild_Draw_4:1536130674908594256> Wild Draw 4 Challenge\n"
+                "A Wild Draw 4 may be played regardless of your hand. "
+                "The targeted player may **Accept** or **Challenge**.\n\n"
+                "A **Challenge** checks whether the Wild Draw 4 player had a card "
+                "matching the previous color.\n\n"
+                "**Successful challenge:** Wild Draw 4 player draws 4.\n"
+                "**Failed challenge:** Challenger draws 6.\n"
+                "**No response:** Automatically accepted; challenger draws 4."
+            )
+        )
+
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
+                "### <:uno_call:1536919891075014787> Calling UNO\n"
+                "**At 2 cards:** You may toggle UNO in your play menu. "
+                "If you subsequently play down to 1 card, the bot automatically calls UNO for you.\n\n"
+                "**At 1 card:** You can immediately call UNO using the button or slash command."
+            )
+        )
+
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
+                "### ❗ Callouts\n"
+                "**Successful:** All players who did not call UNO at 1 card draw 2.\n"
+                "**Unsuccessful:** You draw 2 cards. You cannot call out again until it is your turn. "
+                "Staff may also take action if this is abused."
+            )
+        )
+
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
+                "### <a:bay_alarm:1536288829248512030>️ Turn Timer / AFK\n"
+                "Each turn has a configurable timeout. **120 seconds by default.**\n"
+                "If the timer expires, the bot automatically makes you draw a card.\n"
+                "Consecutive AFK timeouts can result in removal from the game."
+            )
+        )
+
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+
+        await interaction.response.send_message(
+            view=view,
+            ephemeral=True,
+        )
+
     # ---------------- listeners ----------------
 
     @commands.Cog.listener()
@@ -2278,6 +2359,7 @@ class UnoGame(commands.Cog):
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
         await self._remove_member_everywhere(guild.id, user.id, "was banned")
+
 
     # ---------------- global slash-command error handler ----------------
 

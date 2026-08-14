@@ -375,7 +375,19 @@ class GameSession:
         self.turn_timeout = TURN_TIMEOUT_SECONDS
 
     def cancel_timer(self):
-        if self.timer_task and not self.timer_task.done():
+        # Guard against self-cancellation: _timer_loop calls
+        # announce_and_cleanup() on itself when the game ends on an AFK
+        # timeout, which calls this. session.timer_task at that point is
+        # STILL the currently-running task (nothing reassigns it before
+        # this call), so cancelling it here would throw CancelledError
+        # into this same coroutine at its next `await` — aborting
+        # announce_and_cleanup before it ever sends the win message, with
+        # no error logged (safe_task's wrapper deliberately re-raises
+        # CancelledError rather than logging it). Cross-task cancels
+        # (e.g. from /uno kick or /uno leave, which run on the
+        # interaction-handler task, not the timer task) are unaffected
+        # and still cancel normally.
+        if self.timer_task and not self.timer_task.done() and self.timer_task is not asyncio.current_task():
             self.timer_task.cancel()
         self.timer_task = None
 
@@ -1074,6 +1086,13 @@ class TableView(discord.ui.LayoutView):
         session = self.session
         if not session or not session.engine or session.engine.finished:
             return None
+        if not self.cog._is_live(session):
+            # /uno end (or anything else that pops the channel out of
+            # self.sessions) doesn't touch this session/engine object —
+            # old TableViews kept a direct reference and every check
+            # above still passed, so their buttons kept working even
+            # after the game was "ended". Catch that here too.
+            return None
         return session
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
@@ -1108,37 +1127,42 @@ class TableView(discord.ui.LayoutView):
         # first use, PIL image composition) that risks blowing past
         # Discord's ~3s ack window. Rather than defer up front (which would
         # burn the modal fallback — a modal must be the raw, un-deferred
-        # first response), give the build a short budget on the RAW
-        # interaction: if it finishes in time, send it directly and the
-        # modal option was never needed; if it's slow OR raises, fall back
-        # to the modal, which is always fast since it's just opening a text
-        # field. 2s leaves a buffer under the 3s cutoff for the fallback
-        # send_modal call itself.
+        # first response), give the BUILD a short budget: if it finishes in
+        # time, send it directly and the modal option was never needed; if
+        # it's slow OR raises, fall back to the modal, which is always fast
+        # since it's just opening a text field.
+        #
+        # Crucially, the timeout only ever wraps the local/CPU build (image
+        # composition, emoji cache), never the actual
+        # interaction.response.send_message() call to Discord. Wrapping the
+        # live network call in wait_for() is what caused the 40060
+        # "already acknowledged" bug: cancelling that call locally on
+        # timeout doesn't mean the request didn't land — discord.py only
+        # marks the interaction responded AFTER the call returns, so a
+        # request that was cancelled mid-flight (already delivered to
+        # Discord, just still waiting on the response body) leaves us
+        # thinking we can still send_modal when Discord already considers
+        # the interaction acknowledged. Keeping the network call outside
+        # any wait_for/cancellation removes that race entirely.
         try:
             await self.cog.load_emoji_cache()
 
-            async def _build_and_send():
-                view = await HandPlayView.create(self.cog, session, interaction.user.id)
-                if view.file:
-                    await interaction.response.send_message(view=view, file=view.file, ephemeral=True)
-                else:
-                    await interaction.response.send_message(view=view, ephemeral=True)
-
-            await asyncio.wait_for(_build_and_send(), timeout=2.0)
-        except Exception:
-            # Covers build failures (missing card art, PIL errors, etc.) AND
-            # asyncio.TimeoutError from a slow build/send — in both cases we
-            # haven't responded yet, so the modal is still available.
-            log.exception("HandPlayView build/send failed or was too slow for user %s", interaction.user.id)
             try:
+                view = await asyncio.wait_for(
+                    HandPlayView.create(self.cog, session, interaction.user.id),
+                    timeout=2.0,
+                )
+            except Exception:
+                log.exception("HandPlayView build failed or was too slow for user %s", interaction.user.id)
                 await interaction.response.send_modal(PlayCardModal(self.cog, session))
-            except discord.InteractionResponded:
-                # The send_message from _send() actually landed right as
-                # the timeout fired (a real race, not just slow) — nothing
-                # left to do, the player already got their hand view.
-                log.warning("uno_play: send succeeded right as the timeout fired for user %s", interaction.user.id)
-            except discord.HTTPException:
-                log.exception("uno_play: send_modal fallback also failed for user %s", interaction.user.id)
+                return
+
+            if view.file:
+                await interaction.response.send_message(view=view, file=view.file, ephemeral=True)
+            else:
+                await interaction.response.send_message(view=view, ephemeral=True)
+        except discord.HTTPException:
+            log.exception("uno_play: send_message/send_modal failed for user %s", interaction.user.id)
 
     async def _hand(self, interaction: discord.Interaction):
         session = self._guard()
@@ -1266,6 +1290,33 @@ class UnoGame(commands.Cog):
 
     def _track_view(self, view: discord.ui.View):
         self._active_views.add(view)
+
+    def _is_live(self, session: GameSession) -> bool:
+        """True iff `session` is still THE registered session for its
+        channel. /uno end (and any other path that pops a channel out of
+        self.sessions) doesn't touch the session object itself or its
+        engine — old Views (TableView, HandPlayView) and modals
+        (PlayCardModal, DrawFollowupView) all hold a direct reference to
+        that same session object in their closures, so after /uno end
+        `session.engine` is still non-None/unfinished and every
+        engine-level check on it still passes. Without this identity
+        check, those stale components kept working — the game "kept
+        going" through old buttons even after /uno end said it ended.
+        Every shared action handler below checks this first."""
+        return self.sessions.get(session.channel_id) is session
+
+    def _stop_session_views(self, session: GameSession):
+        """Stops every tracked View belonging to this specific session
+        (its buttons show as disabled/dead on next interaction) — used by
+        /uno end so old table/hand messages don't just silently no-op,
+        they visibly stop responding. Narrower than cog_unload's
+        stop-everything sweep, which is for a full cog reload."""
+        for view in list(self._active_views):
+            if getattr(view, "session", None) is session:
+                try:
+                    view.stop()
+                except Exception:
+                    pass
 
     async def cog_unload(self):
         """
@@ -1573,6 +1624,10 @@ class UnoGame(commands.Cog):
         DrawFollowupView's "Play this Card" button — one code path so all
         four behave identically. drew_first just changes the wording to
         make clear this was a drew-then-played turn, not a plain play."""
+        if not self._is_live(session):
+            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            return
+
         engine = session.engine
         if not engine:
             await interaction.response.send_message("No active game here.", ephemeral=True)
@@ -1629,6 +1684,10 @@ class UnoGame(commands.Cog):
         """Shared by the Draw button and /uno draw. If the drawn card can
         legally be played, offers a Play-this-card/No follow-up instead of
         always ending the turn outright."""
+        if not self._is_live(session):
+            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            return
+
         engine = session.engine
         if not engine:
             await interaction.response.send_message("No active game here.", ephemeral=True)
@@ -1684,6 +1743,10 @@ class UnoGame(commands.Cog):
         repeatedly mashing Callout can't keep drawing cards/spamming
         messages.
         """
+        if not self._is_live(session):
+            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            return
+
         engine = session.engine
         if not engine:
             await interaction.response.send_message("No active game here.", ephemeral=True)
@@ -1738,6 +1801,10 @@ class UnoGame(commands.Cog):
             no future checkpoint left to arm for. Sends the public "UNO!"
             announcement right now.
         """
+        if not self._is_live(session):
+            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            return
+
         engine = session.engine
         if not engine:
             await interaction.response.send_message("No active game here.", ephemeral=True)
@@ -2124,6 +2191,12 @@ class UnoGame(commands.Cog):
             return
         session.cancel_timer()
         self.sessions.pop(interaction.channel_id, None)
+        # Old table/hand messages' buttons hold a direct reference to this
+        # session object, not a fresh lookup — popping it out of
+        # self.sessions above is what _is_live()/_guard() now check, but
+        # stopping the Views too makes it visible immediately (buttons
+        # show as dead) instead of only failing silently on next click.
+        self._stop_session_views(session)
         await asyncio.to_thread(self._delete_save, interaction.channel_id)
         await interaction.response.send_message("Game ended.")
 

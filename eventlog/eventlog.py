@@ -174,7 +174,7 @@ class EventLogsCog(commands.Cog):
         await interaction.response.defer(ephemeral=False)
 
         try:
-            db_uri = "file:eventlog_database.db?mode=ro"
+            db_uri = f"file:{config.EVENTLOG_DB_PATH}?mode=ro"
             async with aiosqlite.connect(db_uri, uri=True) as conn:
                 conn.row_factory = aiosqlite.Row
                 async with conn.execute(query) as cursor:

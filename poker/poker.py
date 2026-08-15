@@ -1442,7 +1442,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     def _title_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})
         tid = cos.get("active_title")
-        return f" {db.TITLES[tid]['display']}" if db.TITLES[tid]["display"].startswith("<:") else f" `{db.TITLES[tid]['display']}`"
+        return f" {db.TITLES[tid]['display']}" if tid and db.TITLES[tid]["display"].startswith("<:") else f" `{db.TITLES[tid]['display']}`" if tid else ""
 
     def _win_msg_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})

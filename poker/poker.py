@@ -1442,7 +1442,10 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     def _title_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})
         tid = cos.get("active_title")
-        return f" {db.TITLES[tid]['display']}" if tid and db.TITLES[tid]["display"].startswith("<:") else f" `{db.TITLES[tid]['display']}`" if tid else ""
+        if not tid or tid not in db.TITLES:
+            return ""
+        display = db.TITLES[tid]["display"]
+        return f" {display}" if display.startswith("<:") else f" `{display}`"
 
     def _win_msg_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})
@@ -2955,7 +2958,15 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
         t_lines = []
         for tid, info in visible_titles.items():
             rarity = db.RARITY_LABEL.get(info["rarity"], "")
-            display_str = f"`{info['display']}` - {rarity}" if rarity else f"`{info['display']}`"
+            display_str = (
+                f"{info['display']} - {rarity}"
+                if info["display"].startswith("<:")
+                else f"`{info['display']}` - {rarity}"
+            ) if rarity else (
+                f"{info['display']}"
+                if info["display"].startswith("<:")
+                else f"`{info['display']}`"
+            )
             if tid in owned_titles:
                 equipped = "  ◀ **equipped**" if tid == active_t else ""
                 desc = f" — *{info['description']}*" if info.get('description') else ""

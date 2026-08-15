@@ -671,7 +671,7 @@ STREET_LABEL = {
 
 def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
     tag = " 🔘" if idx == 0 else ""
-    title_str = f" {title}" if title.startswith("<:") else f" `{title}`"
+    title_str = f" {title}" if title and title.startswith("<:") else f" `{title}`" if title else ""
     mention   = f"<@{p.user_id}>"
     emoji     = get_chip_emoji(game)
     if p.folded:

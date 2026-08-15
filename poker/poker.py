@@ -671,7 +671,7 @@ STREET_LABEL = {
 
 def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
     tag = " 🔘" if idx == 0 else ""
-    title_str = f" `{title}`" if title else ""
+    title_str = f" {title}" if title.startswith("<:") else f" `{title}`"
     mention   = f"<@{p.user_id}>"
     emoji     = get_chip_emoji(game)
     if p.folded:
@@ -1442,7 +1442,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     def _title_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})
         tid = cos.get("active_title")
-        return f" `{db.TITLES[tid]['display']}`" if tid and tid in db.TITLES else ""
+        return f" {db.TITLES[tid]['display']}" if db.TITLES[tid]["display"].startswith("<:") else f" `{db.TITLES[tid]['display']}`"
 
     def _win_msg_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})

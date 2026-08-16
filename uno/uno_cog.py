@@ -1200,7 +1200,7 @@ class TableView(discord.ui.LayoutView):
         lines = []
         for p in order:
             marker = "<:uno_arrow:1536135499566157956>" if p.player_id == current_id else "・"
-            uno_tag = " <:uno:1536135137232953451>" if len(p.hand) == 1 and not p.said_uno else ""
+            uno_tag = " <:uno:1536135137232953451>" if len(p.hand) == 1 and p.said_uno else ""
             lines.append(f"{marker} {_mention(p.player_id)} — {len(p.hand)} card{'s' if len(p.hand) != 1 else ''}{uno_tag}")
 
         if engine.finishers:
@@ -2051,7 +2051,7 @@ class UnoGame(commands.Cog):
         lines = []
         for p in order:
             marker = "<:uno_arrow:1536135499566157956>" if p.player_id == current_id else "・"
-            uno_tag = " <:uno:1536135137232953451>" if len(p.hand) == 1 and not p.said_uno else ""
+            uno_tag = " <:uno:1536135137232953451>" if len(p.hand) == 1 and p.said_uno else ""
             lines.append(f"{marker} {_mention(p.player_id)} — {len(p.hand)} card{'s' if len(p.hand) != 1 else ''}{uno_tag}")
 
         if engine.finishers:

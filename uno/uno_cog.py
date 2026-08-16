@@ -174,7 +174,7 @@ PLACEMENT_EMOJI = {0: "<:uno_1:1536286536218443837>", 1: "<:uno_2:15362866417681
 MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT = 2, 20
 MIN_DECKS, MAX_DECKS = 1, 6
 MIN_TARGET_WINNERS, MAX_TARGET_WINNERS = 1, 19
-MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT = 60, 600
+MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT = 30, 600
 
 
 def _mention(player_id: int | None) -> str:
@@ -456,7 +456,7 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
     max_players_input = discord.ui.TextInput(label="Max players (2–20)", max_length=2)
     decks_input = discord.ui.TextInput(label="Decks (1–6)", max_length=1)
     target_winners_input = discord.ui.TextInput(label="Winners before game ends (1–19)", max_length=2)
-    turn_timeout_input = discord.ui.TextInput(label="Turn timeout seconds (60–600)", max_length=3)
+    turn_timeout_input = discord.ui.TextInput(label="Turn timeout seconds (30–600)", max_length=3)
 
     def __init__(self, cog: "UnoGame", session: GameSession):
         super().__init__()
@@ -2297,6 +2297,49 @@ class UnoGame(commands.Cog):
             else:
                 self.restart_timer(session)
                 await self.refresh_table(session)
+
+    @uno.command(
+        name="timeout",
+        description="Change the turn timeout for the current UNO game (event staff only)",
+    )
+    @app_commands.describe(seconds="Turn timeout in seconds (30–600)")
+    async def timeout_cmd(self, interaction: discord.Interaction, seconds: int):
+        session = self.sessions.get(interaction.channel_id)
+
+        if not session or not session.engine:
+            await interaction.response.send_message(
+                "No active game here.", ephemeral=True
+            )
+            return
+
+        if not await is_event_staff(interaction):
+            await interaction.response.send_message(
+                "Only event staff can change the turn timeout.", ephemeral=True
+            )
+            return
+
+        if not MIN_TURN_TIMEOUT <= seconds <= MAX_TURN_TIMEOUT:
+            await interaction.response.send_message(
+                f"Turn timeout must be between {MIN_TURN_TIMEOUT} and {MAX_TURN_TIMEOUT} seconds.",
+                ephemeral=True,
+            )
+            return
+
+        async with session.lock:
+            if not self._is_live(session):
+                await interaction.response.send_message(
+                    "This game has ended.", ephemeral=True
+                )
+                return
+
+            old_timeout = session.turn_timeout
+            session.turn_timeout = seconds
+
+        await interaction.response.send_message(
+            f"✅ Turn timeout changed from **{old_timeout}s** to **{seconds}s**. "
+            f"It will apply starting with the next turn.",
+            ephemeral=True,
+        )
 
     @uno.command(name="rules", description="View the UNO rules and bot-specific rules.")
     async def rules_cmd(self, interaction: discord.Interaction):

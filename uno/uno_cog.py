@@ -1056,22 +1056,24 @@ class TableView(discord.ui.LayoutView):
 
         container.add_item(Separator(spacing=discord.SeparatorSpacing.small))
 
+        # All 5 buttons fit in a single ActionRow (Discord's cap is 5 per
+        # row) — no reason to split them across two.
         row = ActionRow()
-        play_btn = Button(label="Play", style=discord.ButtonStyle.primary, custom_id="uno_play", row=0)
+        play_btn = Button(label="Play", style=discord.ButtonStyle.primary, custom_id="uno_play")
         play_btn.callback = self._play
         row.add_item(play_btn)
-        hand_btn = Button(label="Hand", style=discord.ButtonStyle.secondary, custom_id="uno_hand", row=0)
-        hand_btn.callback = self._hand
-        row.add_item(hand_btn)
-        draw_btn = Button(label="Draw", style=discord.ButtonStyle.secondary, custom_id="uno_draw", row=0)
+        draw_btn = Button(label="Draw", style=discord.ButtonStyle.secondary, custom_id="uno_draw")
         draw_btn.callback = self._draw
         row.add_item(draw_btn)
-        table_btn = Button(label="Table", style=discord.ButtonStyle.secondary, custom_id="uno_table",row=1)
-        table_btn.callback = self._table
-        row.add_item(table_btn)
-        callout_btn = Button(label="Callout", style=discord.ButtonStyle.danger, custom_id="uno_callout", row=1)
+        callout_btn = Button(label="Callout", style=discord.ButtonStyle.danger, custom_id="uno_callout")
         callout_btn.callback = self._callout
         row.add_item(callout_btn)
+        hand_btn = Button(label="Hand", style=discord.ButtonStyle.secondary, custom_id="uno_hand")
+        hand_btn.callback = self._hand
+        row.add_item(hand_btn)
+        table_btn = Button(label="Table", style=discord.ButtonStyle.secondary, custom_id="uno_table")
+        table_btn.callback = self._table
+        row.add_item(table_btn)
         container.add_item(row)
 
         self.add_item(container)

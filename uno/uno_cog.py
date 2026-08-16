@@ -1662,7 +1662,7 @@ class UnoGame(commands.Cog):
                 player.armed_uno = False
 
             if effects.get("color_pending"):
-                self.cancel_timer(session)
+                session.cancel_timer()
                 view = ColorButtonsView(self, session, interaction)
                 msg = "You drew and played a Wild — choose a color:" if drew_first else "Choose a color for your Wild:"
                 await interaction.response.send_message(msg, view=view, ephemeral=True)
@@ -1721,7 +1721,7 @@ class UnoGame(commands.Cog):
             # armed_uno invariant note in uno_engine.py.
 
             if result["still_playable"]:
-                self.cancel_timer(session)
+                session.cancel_timer()
                 view = DrawFollowupView(self, session, drawn, interaction.user.id)
                 await interaction.response.send_message(f"You drew **{drawn}**. Play it?", view=view, ephemeral=True)
                 return  # turn stays open until they pick Play/No — no refresh/restart yet

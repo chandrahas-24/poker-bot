@@ -437,16 +437,15 @@ class PokerGame:
         p.total_bet += total_needed
         self.pot += total_needed
 
-        # FIX: Only update the table's bet if they actually raised it!
         if p.bet > self.current_bet:
             self.current_bet = p.bet
             self.last_raiser = user_id
+            for other in self.active_players:
+                if other.user_id != user_id:
+                    other.acted = False
 
         if p.chips == 0:
             p.all_in = True
-        for other in self.active_players:
-            if other.user_id != user_id:
-                other.acted = False
         p.acted = True
         msg = f"📈 **{p.display_name}** raises to {self.current_bet}. (Pot: {self.pot})"
         end = self._advance()

@@ -19,6 +19,8 @@ from . import card_images
 from tournament import tournament_db as tdb
 import dateparser
 
+from .leaderboard_image import generate_leaderboard_image
+
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
 
@@ -3807,57 +3809,50 @@ class PokerCog(commands.Cog):
         rows = await db.get_leaderboard(10)
         caller_id = interaction.user.id
         caller_row = await db.get_player_stats(caller_id)
+
         if not rows:
-            await interaction.followup.send("No stats yet!", ephemeral=True)
+            await interaction.followup.send(
+                "No stats yet!",
+                ephemeral=True
+            )
             return
 
-        MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
-        top_ids = {r['user_id'] for r in rows}
+        top_ids = {r["user_id"] for r in rows}
 
-        table_lines = ["```"]
-        # Reduced width to 30 chars to prevent mobile line-wrapping
-        table_lines.append(f"{'':3}{'Player':<18} {'Win%':>4} {'Net':>6}")
-        table_lines.append("─" * 34)
-        for i, r in enumerate(rows):
-            rank = i + 1
-            wp = f"{r['hands_won'] / r['hands_played'] * 100:.0f}%" if r['hands_played'] else "—"
-            net = r['net_chips']
-            sign = "+" if net >= 0 else ""
-            uname = r['username'][:16]  # Truncate name heavily for mobile
-            medal = MEDALS.get(rank, f"{rank}. ")
-            you_tag = "<" if r['user_id'] == caller_id else ""
-            table_lines.append(f"{medal:<3}{uname:<16} {wp:>4} {sign + str(net):>8} {you_tag}")
-        table_lines.append("```")
-
-        embed = discord.Embed(
-            title="🏆 Poker Leaderboard",
-            description="\n".join(table_lines),
-            color=0xF1C40F
-        )
-
-        # Caller's stats — shown at the bottom whether or not they're in the top 10
+        caller_rank = None
         if caller_row:
             caller_rank = await db.get_player_rank(caller_id)
-            caller_net = caller_row['net_chips']
-            caller_wp = f"{caller_row['hands_won'] / caller_row['hands_played'] * 100:.1f}%" if caller_row[
-                'hands_played'] else "—"
-            caller_sign = "+" if caller_net >= 0 else ""
-            in_top = caller_id in top_ids
-            rank_str = f"#{caller_rank}" if caller_rank else "—"
-            label = f"📊 Your Stats  ·  {rank_str}" + (" *(in top 10)*" if in_top else "")
-            embed.add_field(
-                name=label,
-                value=(
-                    f"Win% **{caller_wp}**  ·  "
-                    f"Net **{caller_sign}{caller_net}** <:poker_chip:1490458259855773707>  ·  "
-                    f"Wallet **{caller_row['wallet']}** <:poker_chip:1490458259855773707>"
-                ),
-                inline=False
-            )
-        else:
-            embed.add_field(name="📊 Your Stats", value="No hands played yet.", inline=False)
 
-        await interaction.followup.send(embed=embed)
+        # Generate PNG
+        image_data = generate_leaderboard_image(
+            rows=rows,
+            caller_id=caller_id,
+            caller_row=caller_row,
+            caller_rank=caller_rank,
+        )
+
+        file = discord.File(
+            image_data,
+            filename="poker_leaderboard.png",
+        )
+
+        # Components V2
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(
+                    "attachment://poker_leaderboard.png"
+                )
+            ),
+            accent_color=0xF1C40F,
+        )
+
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+
+        await interaction.followup.send(
+            file=file,
+            view=view,
+        )
 
     @pokermgr.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")

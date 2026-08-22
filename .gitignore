@@ -3,6 +3,7 @@
 .env*
 data/
 __pycache__/
+poker/assets/
 *.pyc
 *.pyo
 config.py

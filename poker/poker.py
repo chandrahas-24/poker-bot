@@ -5411,6 +5411,22 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send("\n".join(lines))
 
+    @app_commands.command(name="changelog",description="View the poker bot's Git changelog",)
+    @app_commands.describe(search="Only show commits matching this term",)
+    async def changelog(self,interaction: discord.Interaction,search: str | None = None,):
+        await interaction.response.defer(ephemeral=True)
+
+        commits = await asyncio.to_thread(get_git_changelog)
+
+        if not commits:
+            await interaction.followup.send("❌ Unable to read the Git changelog.",ephemeral=True,)
+            return
+
+        view = ChangelogView(caller=interaction.user,commits=commits,search=search,)
+
+        await interaction.followup.send(view=view,ephemeral=True,)
+
+
 class StatsView(discord.ui.View):
     def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
         super().__init__(timeout=120)

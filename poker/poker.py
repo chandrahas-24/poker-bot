@@ -673,7 +673,7 @@ STREET_LABEL = {
 
 def player_line(p, game: PokerGame, idx: int, title: str | None = None) -> str:
     tag = " 🔘" if idx == 0 else ""
-    title_str = f" {title}" if title and title.startswith("<:") else f" `{title}`" if title else ""
+    title_str = f" {title}" if title and title.startswith("<") else f" `{title}`" if title else ""
     mention   = f"<@{p.user_id}>"
     emoji     = get_chip_emoji(game)
     if p.folded:
@@ -1447,7 +1447,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
         if not tid or tid not in db.TITLES:
             return ""
         display = db.TITLES[tid]["display"]
-        return f" {display}" if display.startswith("<:") else f" `{display}`"
+        return f" {display}" if display.startswith("<") else f" `{display}`"
 
     def _win_msg_str(uid: int) -> str:
         cos = _cos_cache.get(uid, {})
@@ -2962,11 +2962,11 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
             rarity = db.RARITY_LABEL.get(info["rarity"], "")
             display_str = (
                 f"{info['display']} - {rarity}"
-                if info["display"].startswith("<:")
+                if info["display"].startswith("<")
                 else f"`{info['display']}` - {rarity}"
             ) if rarity else (
                 f"{info['display']}"
-                if info["display"].startswith("<:")
+                if info["display"].startswith("<")
                 else f"`{info['display']}`"
             )
             if tid in owned_titles:
@@ -2975,7 +2975,7 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 t_lines.append(f"✅ {display_str}{desc}{equipped}")
             else:
                 desc = info['description'] if info['rarity'] != 'legendary' else "???"
-                t_lines.append(f"🔒 ~{display_str}~ — *{desc}*")
+                t_lines.append(f"🔒 {display_str} — *{desc}*")
 
         # Group exactly 10 items per field
         chunk_size = 10
@@ -3001,7 +3001,7 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 m_lines.append(f"✅ {display_str}{desc}{equipped}")
             else:
                 desc = info['description'] if info['rarity'] != 'legendary' else "???"
-                m_lines.append(f"🔒 ~{display_str}~ — *{desc}*")
+                m_lines.append(f"🔒 {display_str} — *{desc}*")
 
         # Group exactly 10 items per field
         chunk_size = 10

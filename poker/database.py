@@ -1114,6 +1114,20 @@ TITLES: dict[str, dict] = {
         "hidden": False,
     },
 
+    "flopeless": {
+        "display": "<:NOOOO:1540528227049537616>`Flopeless`",
+        "description": "Net loss of 30,000 chips all-time",
+        "rarity": "epic",
+        "hidden": False,
+    },
+
+    "not_my_turn": {
+        "display": "<a:scuba:1535581104927670383>`Not My Turn`",
+        "description": "Net loss of 40,000 chips all-time",
+        "rarity": "epic",
+        "hidden": False,
+    },
+
     # ── Legendary rare drops ────────────────────────────────────────────────
     "wind_walker": {
         "display": "𝒲𝒾𝓃𝒹 𝒲𝒶𝓁𝓀𝑒𝓇 🍃",
@@ -1241,7 +1255,7 @@ WIN_MESSAGES: dict[str, dict] = {
         "rarity": "epic",
         "hidden": False,
     },
-    # ── Legendary rare drop ─────────────────────────────────────────────────
+
     "egirl_ace_winmsg": {
         "display": "uhh... congrats! you can now defile the server owner",
         "description": "yeah.",
@@ -1266,6 +1280,20 @@ WIN_MESSAGES: dict[str, dict] = {
     "blown_away": {
         "display": "🌬 Blown Away",
         "description": "Net loss of 10,000 all-time",
+        "rarity": "legendary",
+        "hidden": False,
+    },
+
+    "all_in_vain": {
+        "display": "<:aquaDed:1540527540819599410> All In Vain",
+        "description": "Net loss of 20,000 chips all-time",
+        "rarity": "epic",
+        "hidden": False,
+    },
+
+    "cry_me_a_river": {
+        "display": "<:skymax_cry:1540526933656477828> Cry Me a River",
+        "description": "Net loss of 50,000 chips all-time",
         "rarity": "legendary",
         "hidden": False,
     },
@@ -1572,6 +1600,8 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         "quads_4": quads_wins >= 4,
         "suited_up": sf_wins >= 1,
         "rf_win": rf_wins >= 1,
+        "flopeless": net <= -30000,
+        "not_my_turn": net <= -40000,
     }
     for tid, condition in title_checks.items():
         if condition and tid not in owned_titles:
@@ -1609,6 +1639,8 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         "straight_shit": sf_wins >= 1,
         "rf_winmsg": rf_wins >= 1,
         "blown_away": net <= -10000,
+        "all_in_vain": net <= -20000,
+        "cry_me_a_river": net <= -50000,
     }
     for mid, condition in msg_checks.items():
         if condition and mid not in owned_msgs:

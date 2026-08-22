@@ -10,6 +10,7 @@ import time
 import math
 import sys
 import config
+import subprocess
 
 from .engine import PokerGame, Street, hand_str
 from . import database as db
@@ -824,22 +825,22 @@ async def send_turn_ping(channel, t: TableState):
 async def run_table_action(guild: discord.Guild, channel, t: TableState, interaction: discord.Interaction, fn, *args):
     if not interaction.response.is_done():
         await interaction.response.defer()
-    
+
     uid = interaction.user.id
     ok, msg = fn(*args)
     if not ok:
         await interaction.followup.send(msg, ephemeral=True)
         return
-        
+
     parts = msg.split("\n")
     street_markers = ["🌊", "↩️", "🏁"]
     if any(m in msg for m in street_markers + ["Showdown"]):
         slog_clear(t)
-        
+
     for part in parts:
         if part.strip():
             slog(t, part)
-            
+
     if t.game._hand_result:
         await _process_result(guild, channel, t)
     else:
@@ -861,7 +862,7 @@ class ActionConfirmView(discord.ui.View):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ This confirmation is not for you.", ephemeral=True)
             return
-        
+
         await run_table_action(self.guild, self.channel, self.t, interaction, self.action_fn, *self.action_args)
         try:
             await interaction.edit_original_response(content="✅ Action confirmed.", view=None)
@@ -880,9 +881,9 @@ class ActionConfirmView(discord.ui.View):
 async def leave_table_execute(guild: discord.Guild, channel, t: TableState, interaction: discord.Interaction):
     if t.closing:
         return "❌ Table is closing anyway."
-        
+
     chips_back, msg = t.game.remove_player(interaction.user.id)
-    
+
     if t.is_tournament:
         if chips_back > 0:
             await tdb.return_chips(interaction.user.id, chips_back)
@@ -891,7 +892,7 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
         if chips_back > 0:
             await db.return_chips(interaction.user.id, chips_back)
         await db.clear_chips_in_play(interaction.user.id)
-        
+
     if "will leave" in msg:
         t.leave_cooldown_pending.add(interaction.user.id)
         await channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
@@ -900,7 +901,7 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
         t.rejoin_cooldowns[interaction.user.id] = time.time() + cooldown
         await channel.send(
             f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
-            
+
     await refresh(channel, t)
     return "✅ You left the table."
 
@@ -3259,7 +3260,7 @@ class PokerCog(commands.Cog):
             # Force SQLite to flush the WAL to the main DB safely for the main poker DB
             async with db._write_lock:
                 conn = await db._get_db()
-                await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                await conn.execute("PRAGMA wal_checkpoint(RESTART)")
 
             try:
                 from tournament import tournament_db
@@ -4502,12 +4503,12 @@ class PokerCog(commands.Cog):
         card_w = 115
         card_h = 95
         gap = 10
-        
+
         header_h = 90
         weekdays_h = 45
         grid_h = card_h * num_weeks + gap * (num_weeks - 1)
         footer_h = 70
-        
+
         img_w = padding * 2 + card_w * 7 + gap * 6
         img_h = padding + header_h + weekdays_h + grid_h + footer_h + padding
 
@@ -4537,7 +4538,7 @@ class PokerCog(commands.Cog):
             y = start_grid_y + row_idx * (card_h + gap)
             for col_idx, day in enumerate(week):
                 x = padding + col_idx * (card_w + gap)
-                
+
                 if day == 0:
                     draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=empty_card_bg)
                     try:
@@ -4550,11 +4551,11 @@ class PokerCog(commands.Cog):
                 else:
                     draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=card_bg)
                     draw.text((x + 10, y + 8), f"{day:02d}", font=font_date, fill=cyan_color)
-                    
+
                     rev_val = daily_totals.get(day, 0)
                     rev_str = format_revenue(rev_val)
                     color = green_color if rev_val > 0 else grey_color
-                    
+
                     try:
                         bbox = draw.textbbox((0, 0), rev_str, font=font_rev)
                         text_w = bbox[2] - bbox[0]
@@ -4567,7 +4568,7 @@ class PokerCog(commands.Cog):
         total_rev = sum(daily_totals.values())
         footer_y = start_grid_y + grid_h + 20
         draw.line([padding, footer_y, img_w - padding, footer_y], fill=(40, 40, 60), width=1)
-        
+
         total_text = f"Total Monthly Revenue: {total_rev:,} Chips"
         draw.text((padding, footer_y + 20), total_text, font=font_total, fill=green_color)
 
@@ -5181,24 +5182,22 @@ class PokerCog(commands.Cog):
         try:
             import aiosqlite
             # Force SQLite into strict Read-Only mode using URI parameters
-            db_uri = f"file:{db.DB_PATH}?mode=ro"
+            conn = await db._get_db()
 
-            async with aiosqlite.connect(db_uri, uri=True) as conn:
-                conn.row_factory = aiosqlite.Row
-                async with conn.execute(query) as cursor:
-                    rows = await cursor.fetchall()
+            async with conn.execute(query) as cursor:
+                rows = await cursor.fetchall()
 
-                    if not rows:
-                        await interaction.followup.send("✅ Query executed successfully. No rows returned.",
-                                                        ephemeral=False)
-                        return
+                if not rows:
+                    await interaction.followup.send("✅ Query executed successfully. No rows returned.",
+                                                    ephemeral=False)
+                    return
 
-                    columns = list(rows[0].keys())
+                columns = list(rows[0].keys())
 
-                    # Pass to Paginator (15 rows per page, Max 20 pages)
-                    view = RawSQLPaginationView(columns=columns, rows=rows, title="Main DB Query", items_per_page=15,
-                                                max_pages_limit=20)
-                    await interaction.followup.send(embed=view.format_page(), view=view, ephemeral=False)
+                # Pass to Paginator (15 rows per page, Max 20 pages)
+                view = RawSQLPaginationView(columns=columns, rows=rows, title="Main DB Query", items_per_page=15,
+                                            max_pages_limit=20)
+                await interaction.followup.send(embed=view.format_page(), view=view, ephemeral=False)
 
         except Exception as e:
             traceback.print_exc()
@@ -5487,10 +5486,10 @@ async def should_confirm_premove_all_in(t: TableState, user_id: int, move: dict)
     p = t.game.get_player(user_id)
     if not p:
         return False
-        
+
     is_all_in = False
     action = move["action"]
-    
+
     if action == "raise_all_in":
         is_all_in = True
     elif action == "call_upto":
@@ -5503,20 +5502,20 @@ async def should_confirm_premove_all_in(t: TableState, user_id: int, move: dict)
         call_needed = t.game.current_bet - p.bet
         if call_needed + move["amount"] >= p.chips:
             is_all_in = True
-            
+
     if not is_all_in:
         return False
-        
+
     pref = await db.get_player_preference(user_id)
     cai_mode = pref.get("confirm_all_in_mode", "always")
     cai_thresh = pref.get("confirm_all_in_threshold", 0)
-    
+
     if cai_mode == "never":
         return False
     elif cai_mode == "threshold":
         if p.chips <= cai_thresh:
             return False
-            
+
     return True
 
 class PremoveConfirmAllInView(discord.ui.View):
@@ -5563,7 +5562,7 @@ class PremoveView(discord.ui.View):
         p = self.t.game.get_player(self.user_id)
         if not p or not p.premove:
             return "None"
-        
+
         labels = []
         moves = p.premove if isinstance(p.premove, list) else [p.premove]
         for m in moves:
@@ -5915,6 +5914,431 @@ class RawSQLPaginationView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.format_page(), view=self)
 
+
+class ChangelogView(discord.ui.LayoutView):
+    PER_PAGE = 5
+    MAX_FILES_SHOWN = 8
+
+    def __init__(
+        self,
+        caller: discord.User | discord.Member,
+        commits: list[dict],
+        search: str | None = None,
+    ):
+        super().__init__(timeout=300)
+
+        self.caller = caller
+        self.all_commits = commits
+        self.search = search.strip() if search and search.strip() else None
+        self.page = 0
+
+        self._build()
+
+    # =========================================================
+    # DATA / PAGINATION
+    # =========================================================
+
+    def _filtered_commits(self) -> list[dict]:
+        if not self.search:
+            return self.all_commits
+
+        term = self.search.casefold()
+
+        return [
+            commit
+            for commit in self.all_commits
+            if (
+                term in commit["subject"].casefold()
+                or any(
+                    term in file["path"].casefold()
+                    for file in commit["files"]
+                )
+            )
+        ]
+
+    def _page_count(self) -> int:
+        count = len(self._filtered_commits())
+
+        return max(
+            1,
+            math.ceil(count / self.PER_PAGE),
+        )
+
+    def _current_commits(self) -> list[dict]:
+        commits = self._filtered_commits()
+
+        start = self.page * self.PER_PAGE
+        end = start + self.PER_PAGE
+
+        return commits[start:end]
+
+    # =========================================================
+    # SANITIZATION
+    # =========================================================
+
+    @staticmethod
+    def _sanitize_text(
+        text: str,
+        max_length: int = 500,
+    ) -> str:
+        """
+        Prevent accidental Discord mentions and excessive text.
+        """
+
+        text = str(text)
+        text = text.replace("@", "@\u200b")
+        text = text.replace("`", "'")
+
+        return text[:max_length]
+
+    @staticmethod
+    def _sanitize_subject(
+        subject: str,
+    ) -> str:
+        return ChangelogView._sanitize_text(
+            subject,
+            500,
+        )
+
+    @staticmethod
+    def _sanitize_path(
+        path: str,
+    ) -> str:
+        """
+        Git gives us repository-relative paths.
+
+        Only display the relative path. Never expose the local
+        repository directory or machine username.
+        """
+
+        path = str(path)
+
+        # Extra safety in case Git ever returns an absolute path.
+        path = path.replace("\\", "/")
+
+        if path.startswith("/"):
+            path = path.lstrip("/")
+
+        path = path.replace("@", "@\u200b")
+        path = path.replace("`", "'")
+
+        return path[:200]
+
+    # =========================================================
+    # COMPONENTS V2 RENDERING
+    # =========================================================
+
+    def _build(self):
+        self.clear_items()
+
+        commits = self._filtered_commits()
+        page_count = self._page_count()
+
+        # Keep the page valid.
+        if self.page >= page_count:
+            self.page = page_count - 1
+
+        if self.page < 0:
+            self.page = 0
+
+        page_commits = self._current_commits()
+
+        container = discord.ui.Container(
+            accent_colour=discord.Colour(0x36393F)
+        )
+
+        # -----------------------------------------------------
+        # HEADER
+        # -----------------------------------------------------
+
+        title = "# 📝 Poker Bot Changelog"
+
+        if self.search:
+            safe_search = self._sanitize_text(
+                self.search,
+                100,
+            )
+
+            title += f"\n-# Search: `{safe_search}`"
+
+        container.add_item(
+            discord.ui.TextDisplay(title)
+        )
+
+        container.add_item(
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small
+            )
+        )
+
+        # -----------------------------------------------------
+        # COMMITS
+        # -----------------------------------------------------
+
+        if not page_commits:
+
+            container.add_item(
+                discord.ui.TextDisplay(
+                    "No commits found matching that search."
+                )
+            )
+
+        else:
+
+            for commit_index, commit in enumerate(page_commits):
+
+                short_hash = commit["hash"][:7]
+
+                subject = self._sanitize_subject(
+                    commit["subject"]
+                )
+
+                timestamp = commit["timestamp"]
+
+                files = commit.get("files", [])
+
+                added = commit.get("added", 0)
+                deleted = commit.get("deleted", 0)
+
+                file_count = len(files)
+
+                # ---------------------------------------------
+                # Commit header
+                # ---------------------------------------------
+
+                commit_text = (
+                    f"### `{short_hash}` {subject}\n"
+                    f"-# <t:{timestamp}:F> · "
+                    f"<t:{timestamp}:R>\n"
+                    f"📁 **{file_count} "
+                    f"file{'s' if file_count != 1 else ''}** · "
+                    f"**+{added:,} −{deleted:,}**"
+                )
+
+                container.add_item(
+                    discord.ui.TextDisplay(
+                        commit_text
+                    )
+                )
+
+                # ---------------------------------------------
+                # Changed files
+                # ---------------------------------------------
+
+                if files:
+
+                    file_lines = []
+
+                    shown_files = files[
+                        :self.MAX_FILES_SHOWN
+                    ]
+
+                    for file in shown_files:
+
+                        path = self._sanitize_path(
+                            file.get("path", "unknown")
+                        )
+
+                        file_added = file.get(
+                            "added",
+                            0,
+                        )
+
+                        file_deleted = file.get(
+                            "deleted",
+                            0,
+                        )
+
+                        file_lines.append(
+                            f"`{path}` "
+                            f"`+{file_added:,}` "
+                            f"`−{file_deleted:,}`"
+                        )
+
+                    remaining = (
+                        len(files)
+                        - len(shown_files)
+                    )
+
+                    if remaining > 0:
+
+                        file_lines.append(
+                            f"-# + {remaining} more "
+                            f"file"
+                            f"{'s' if remaining != 1 else ''}"
+                        )
+
+                    container.add_item(
+                        discord.ui.TextDisplay(
+                            "\n".join(file_lines)
+                        )
+                    )
+
+                # ---------------------------------------------
+                # Separator between commits
+                # ---------------------------------------------
+
+                if commit_index < len(page_commits) - 1:
+
+                    container.add_item(
+                        discord.ui.Separator(
+                            spacing=discord.SeparatorSpacing.small
+                        )
+                    )
+
+        # -----------------------------------------------------
+        # FOOTER
+        # -----------------------------------------------------
+
+        container.add_item(
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small
+            )
+        )
+
+        footer = (
+            f"-# Page {self.page + 1} of {page_count}"
+            f" · {len(commits)} commit"
+            f"{'s' if len(commits) != 1 else ''}"
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                footer
+            )
+        )
+
+        # -----------------------------------------------------
+        # PAGINATION
+        # -----------------------------------------------------
+
+        row = discord.ui.ActionRow()
+
+        first = discord.ui.Button(
+            emoji="⏪",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0,
+        )
+        first.callback = self._first_page
+
+        previous = discord.ui.Button(
+            emoji="◀️",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0,
+        )
+        previous.callback = self._previous_page
+
+        next_button = discord.ui.Button(
+            emoji="▶️",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= page_count - 1,
+        )
+        next_button.callback = self._next_page
+
+        last = discord.ui.Button(
+            emoji="⏩",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= page_count - 1,
+        )
+        last.callback = self._last_page
+
+        row.add_item(first)
+        row.add_item(previous)
+        row.add_item(next_button)
+        row.add_item(last)
+
+        container.add_item(row)
+
+        # Add the complete Components V2 container.
+        self.add_item(container)
+
+    # =========================================================
+    # INTERACTION
+    # =========================================================
+
+    async def _check_caller(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+
+        if interaction.user.id != self.caller.id:
+
+            await interaction.response.send_message(
+                "❌ This isn't your changelog menu.",
+                ephemeral=True,
+            )
+
+            return False
+
+        return True
+
+    async def _refresh(
+        self,
+        interaction: discord.Interaction,
+    ):
+        self._build()
+
+        await interaction.response.edit_message(
+            view=self
+        )
+
+    # =========================================================
+    # PAGINATION CALLBACKS
+    # =========================================================
+
+    async def _first_page(
+        self,
+        interaction: discord.Interaction,
+    ):
+        if not await self._check_caller(interaction):
+            return
+
+        self.page = 0
+
+        await self._refresh(interaction)
+
+    async def _previous_page(
+        self,
+        interaction: discord.Interaction,
+    ):
+        if not await self._check_caller(interaction):
+            return
+
+        self.page = max(
+            0,
+            self.page - 1,
+        )
+
+        await self._refresh(interaction)
+
+    async def _next_page(
+        self,
+        interaction: discord.Interaction,
+    ):
+        if not await self._check_caller(interaction):
+            return
+
+        self.page = min(
+            self._page_count() - 1,
+            self.page + 1,
+        )
+
+        await self._refresh(interaction)
+
+    async def _last_page(
+        self,
+        interaction: discord.Interaction,
+    ):
+        if not await self._check_caller(interaction):
+            return
+
+        self.page = self._page_count() - 1
+
+        await self._refresh(interaction)
+
+    async def on_timeout(self):
+        self.stop()
+
 async def _migrate_active_tables(bot):
     await asyncio.sleep(1)
     for key, t in list(tables.items()):
@@ -5944,6 +6368,148 @@ async def _migrate_active_tables(bot):
                 schedule_next_hand(t, channel)
             except Exception as e:
                 print(f"Error migrating between-hand table {t.id}: {e}")
+
+
+def get_git_changelog() -> list[dict]:
+    """
+    Read Git history for the public changelog.
+
+    Exposes only:
+      - commit hash
+      - commit timestamp
+      - commit subject
+      - changed file paths
+      - additions
+      - deletions
+
+    Never retrieves Git author/committer names or emails.
+    """
+
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # ---------------------------------------------------------
+    # Get commits
+    # ---------------------------------------------------------
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_dir,
+                "log",
+                "--format=%H%x1f%ct%x1f%s%x1e",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"[changelog] git log failed: {e}")
+        return []
+
+    commits = []
+
+    for raw in result.stdout.split("\x1e"):
+        raw = raw.strip()
+
+        if not raw:
+            continue
+
+        parts = raw.split("\x1f", 2)
+
+        if len(parts) != 3:
+            continue
+
+        commit_hash, timestamp_raw, subject = parts
+
+        try:
+            timestamp = int(timestamp_raw)
+        except ValueError:
+            continue
+
+        commits.append(
+            {
+                "hash": commit_hash,
+                "timestamp": timestamp,
+                "subject": subject,
+                "files": [],
+                "added": 0,
+                "deleted": 0,
+            }
+        )
+
+    # ---------------------------------------------------------
+    # Get changed files for every commit
+    # ---------------------------------------------------------
+
+    for commit in commits:
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo_dir,
+                    "show",
+                    "--format=",
+                    "--numstat",
+                    "--root",
+                    "--no-renames",
+                    commit["hash"],
+                    "--",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            print(
+                f"[changelog] git show failed for "
+                f"{commit['hash'][:7]}: {e}"
+            )
+            continue
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+
+            if not line:
+                continue
+
+            parts = line.split("\t", 2)
+
+            if len(parts) != 3:
+                continue
+
+            added_raw, deleted_raw, path = parts
+
+            # Binary files are represented by "-"
+            added = int(added_raw) if added_raw.isdigit() else 0
+            deleted = int(deleted_raw) if deleted_raw.isdigit() else 0
+
+            path = path.strip()
+
+            if not path:
+                continue
+
+            commit["files"].append(
+                {
+                    "path": path,
+                    "added": added,
+                    "deleted": deleted,
+                }
+            )
+
+            commit["added"] += added
+            commit["deleted"] += deleted
+
+    print(
+        f"[changelog] Loaded {len(commits)} commits "
+        f"with file statistics"
+    )
+
+    return commits
 
 async def setup(bot):
     if not hasattr(bot, "poker_tables"):

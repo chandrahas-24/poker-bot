@@ -21,6 +21,7 @@ from tournament import tournament_db as tdb
 import dateparser
 
 from .leaderboard_image import generate_leaderboard_image
+from .jackpot_image import generate_jackpot_image
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -3226,6 +3227,10 @@ class PokerCog(commands.Cog):
         self.bot = bot
         self.daily_backup.start()
 
+    async def cog_load(self):
+        # Reload custom cosmetics from the database whenever the poker cog is loaded/reloaded.
+        await db.load_custom_cosmetics()
+
     def cog_unload(self):
         self.daily_backup.cancel()
 
@@ -4685,28 +4690,39 @@ class PokerCog(commands.Cog):
     @poker.command(name="jackpot", description="View the current casino jackpot!")
     async def jackpot_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=False)
-        jp, egirl_cut, rf_cut, sf_cut, quads_cut = await jackpot.get_jackpot_display_cuts()
 
-        desc = (
-            "_ _\n"
-            f"**Total:  {jp:,} <:poker_chip:1490458259855773707>**\n\n"
-            f"- **Quads** : {quads_cut:,} <:poker_chip:1490458259855773707>\n\n"
-            f"- **Straight Flush** : {sf_cut:,} <:poker_chip:1490458259855773707>\n\n"
-            f"- **Royal Flush** : {rf_cut:,} <:poker_chip:1490458259855773707>\n\n"
-            f"- **Shiny Card Win** : {egirl_cut:,} <:poker_chip:1490458259855773707>\n\n"
-            "_ _"
+        # Get live jackpot values
+        jp, egirl_cut, rf_cut, sf_cut, quads_cut = (
+            await jackpot.get_jackpot_display_cuts()
         )
 
-        embed = discord.Embed(
-            title="<a:md_den:996127219019690034> Jackpot",
-            description=desc,
-            color=0xFFD700  # Decimal 16766720
+        # Generate the finished jackpot image off the event loop
+        image_data = await asyncio.to_thread(
+            generate_jackpot_image,
+            jp,
+            quads_cut,
+            sf_cut,
+            rf_cut,
+            egirl_cut,
         )
-        embed.set_thumbnail(
-            url="https://media.discordapp.net/attachments/1478125269285081211/1488098208986038282/3d-casino-poker-cards-and-playing-chips-on-black-background-illustration-free-vector.png?ex=69cb8af4&is=69ca3974&hm=58f")
-        embed.set_footer(text="• 5% Q, 20% SF, 60% RF, 80% Shiny")
 
-        await interaction.followup.send(embed=embed)
+        file = discord.File(image_data, filename="jackpot.png")
+
+        # Components V2 layout
+        view = discord.ui.LayoutView()
+
+        container = discord.ui.Container(
+            discord.ui.MediaGallery().add_item(
+                media="attachment://jackpot.png"
+            ),
+        )
+
+        view.add_item(container)
+
+        await interaction.followup.send(
+            view=view,
+            file=file,
+        )
 
     @pokeradmin.command(name="check_inactive", description="[Admin] Check who will be wiped soon")
     async def check_inactive(self, interaction: discord.Interaction):

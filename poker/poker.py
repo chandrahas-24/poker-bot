@@ -4412,7 +4412,7 @@ class PokerCog(commands.Cog):
                 or interaction.user.id in self.DEV_USER_IDS
                 or interaction.guild.get_role(1010238899320270999) in interaction.user.roles
         ):
-            await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True)
+            await interaction.followup.send("❌ Server Administrators only.", ephemeral=True)
             return
 
         # 1. Parse Year & Month

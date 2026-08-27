@@ -64,15 +64,18 @@ import asyncio
 import os
 import io
 import json
+import math
 import tempfile
 import time
 import random
 import collections
 import weakref
+import zipfile
 import discord
 import logging
 import config
 from pathlib import Path
+from datetime import datetime, timezone as _tz
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import (
@@ -83,6 +86,7 @@ from PIL import Image
 from . import uno_engine as ue
 from . import cards as card_assets
 from .hand_render import compose_hand_image
+from . import database as db
 from .unodemo import (
     sort_hand,
     display_label,
@@ -93,6 +97,17 @@ from .unodemo import (
 )
 
 log = logging.getLogger("uno")
+
+
+def _parse_chips(value: str) -> int | None:
+    """Parse chip amounts like 500, 2k, 1.5k, 2000."""
+    try:
+        v = value.strip().lower().replace(",", "")
+        if v.endswith("k"):
+            return int(float(v[:-1]) * 1000)
+        return int(float(v))
+    except (ValueError, TypeError):
+        return None
 
 # Where in-progress games get checkpointed so a bot crash/restart mid-game
 # doesn't wipe out everyone's hands. One JSON file per active channel,
@@ -119,6 +134,21 @@ async def is_event_staff(interaction: discord.Interaction) -> bool:
         return True
 
     return False
+
+
+async def is_uno_manager(interaction: discord.Interaction) -> bool:
+    """Gates /unomgr (economy) commands — a per-guild configurable role
+    (set via /unoset managerrole) or Administrator. Same shape as poker's
+    is_manager, kept deliberately separate from is_event_staff: game-
+    moderation (kick/cancel/timeout) and economy management (addchips,
+    ban, cashouts) are different responsibilities in poker too."""
+    settings = await db.get_settings(interaction.guild_id)
+    role_id = settings.get("manager_role_id")
+    if role_id:
+        role = interaction.guild.get_role(int(role_id))
+        if role and role in interaction.user.roles:
+            return True
+    return interaction.user.guild_permissions.administrator
 
 def safe_task(coro, name: str | None = None) -> asyncio.Task:
     """
@@ -321,7 +351,16 @@ def _build_table_text(session: "GameSession") -> str:
             f"{PLACEMENT_EMOJI.get(i, f'{i+1}.')} {_plain_name(session, pid)}"
             for i, pid in enumerate(engine.finishers)
         )
-        lines.append(f"<:uno_trophy:1536135332863676548> Finished ({len(engine.finishers)}/{engine.target_winners}): {placed}")
+        if engine.bets:
+            # target_winners isn't what ends an economy round — pots
+            # settling is — so drop the "/N" that implies a fixed target.
+            lines.append(f"<:uno_trophy:1536135332863676548> Finished: {placed}")
+        else:
+            lines.append(f"<:uno_trophy:1536135332863676548> Finished ({len(engine.finishers)}/{engine.target_winners}): {placed}")
+
+    if engine.bets:
+        pot_total = sum(engine.bets.values())
+        lines.append(f"{config.UNO_CHIP_EMOJI} Pot: **{pot_total}**")
 
     lines.append("")
     if session.turn_started_at:
@@ -339,10 +378,13 @@ class GameSession:
         self.channel_id = channel_id
         self.host_id = host_id
         self.host_name = host_name
-        # host is auto-added as a player (joinee) by default. Event-staff
-        # permissions are checked independently of host/player status, so
-        # staff can manage the lobby/game even if they're not playing.
-        self.lobby_players: dict[int, str] = {host_id: host_name}
+        # Host does NOT auto-join — they show up in the lobby list only
+        # once they click Join and submit a bet, exactly like anyone else.
+        # host_id/host_name are kept purely for the "Host" embed field and
+        # don't imply they're playing.
+        self.lobby_players: dict[int, str] = {}
+        self.lobby_bets: dict[int, int] = {}  # pid -> chips wagered — a pid only ever appears in lobby_players once it's also here
+        self.min_bet = config.UNO_MIN_BET
         self.started = False
         self.engine: ue.GameState | None = None
         self.table_message: discord.Message | None = None
@@ -371,8 +413,13 @@ class GameSession:
         # configurable via the Settings button, event-staff-only
         self.max_players = 10
         self.num_decks = 1
-        self.target_winners = 1  # how many players can finish before the game ends
         self.turn_timeout = TURN_TIMEOUT_SECONDS
+        # NOT configurable — economy rounds end dynamically once every side
+        # pot already has a determined winner (see GameState._pots_resolved),
+        # not at a fixed "N players finished" target. Passed to GameState
+        # purely for its non-economy fallback code path, which UNO never
+        # actually takes now that every table requires bets to join.
+        self.target_winners = 1
 
     def cancel_timer(self):
         # Guard against self-cancellation: _timer_loop calls
@@ -455,7 +502,6 @@ class GameSession:
 class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
     max_players_input = discord.ui.TextInput(label="Max players (2–20)", max_length=2)
     decks_input = discord.ui.TextInput(label="Decks (1–6)", max_length=1)
-    target_winners_input = discord.ui.TextInput(label="Winners before game ends (1–19)", max_length=2)
     turn_timeout_input = discord.ui.TextInput(label="Turn timeout seconds (30–600)", max_length=3)
 
     def __init__(self, cog: "UnoGame", session: GameSession):
@@ -464,7 +510,6 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
         self.session = session
         self.max_players_input.default = str(session.max_players)
         self.decks_input.default = str(session.num_decks)
-        self.target_winners_input.default = str(session.target_winners)
         self.turn_timeout_input.default = str(session.turn_timeout)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -486,10 +531,9 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
 
             max_players, ok1 = parse(self.max_players_input, MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT, self.session.max_players)
             decks, ok2 = parse(self.decks_input, MIN_DECKS, MAX_DECKS, self.session.num_decks)
-            target_winners, ok3 = parse(self.target_winners_input, MIN_TARGET_WINNERS, MAX_TARGET_WINNERS, self.session.target_winners)
-            turn_timeout, ok4 = parse(self.turn_timeout_input, MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT, self.session.turn_timeout)
+            turn_timeout, ok3 = parse(self.turn_timeout_input, MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT, self.session.turn_timeout)
 
-            if not (ok1 and ok2 and ok3 and ok4):
+            if not (ok1 and ok2 and ok3):
                 await interaction.response.send_message(
                     "⚠️ One or more values were out of range — settings left unchanged.", ephemeral=True
                 )
@@ -501,16 +545,9 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
                     ephemeral=True,
                 )
                 return
-            if target_winners >= max_players:
-                await interaction.response.send_message(
-                    "⚠️ Winners-before-game-ends must be less than max players (someone has to be left playing).",
-                    ephemeral=True,
-                )
-                return
 
             self.session.max_players = max_players
             self.session.num_decks = decks
-            self.session.target_winners = target_winners
             self.session.turn_timeout = turn_timeout
 
             await interaction.response.send_message("✅ Settings updated.", ephemeral=True)
@@ -519,6 +556,245 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await report_component_error(interaction, error, None, "LobbySettingsModal")
+
+
+class RawSQLPaginationView(discord.ui.View):
+    def __init__(self, columns: list, rows: list, title: str, items_per_page: int = 15, max_pages_limit: int = 20):
+        super().__init__(timeout=300)
+        self.columns = columns
+        self.rows = rows
+        self.title = title
+        self.items_per_page = items_per_page
+        self.current_page = 0
+
+        calculated_pages = math.ceil(len(rows) / items_per_page) if rows else 1
+        self.max_pages = min(calculated_pages, max_pages_limit)
+        self.update_buttons()
+
+    def update_buttons(self):
+        is_first_page = self.current_page == 0
+        is_last_page = self.current_page >= self.max_pages - 1
+        self.btn_first.disabled = is_first_page
+        self.btn_prev.disabled = is_first_page
+        self.btn_next.disabled = is_last_page
+        self.btn_last.disabled = is_last_page
+
+    def format_page(self):
+        start_idx = self.current_page * self.items_per_page
+        end_idx = start_idx + self.items_per_page
+        page_rows = self.rows[start_idx:end_idx]
+
+        embed = discord.Embed(title=self.title, color=discord.Color.dark_theme())
+        header = " | ".join(str(c) for c in self.columns)
+        separator = "-" * len(header)
+        lines = [header, separator]
+        for r in page_rows:
+            row_str = " | ".join(str(r[col])[:40] for col in self.columns)
+            lines.append(row_str)
+
+        description = "\n" + "\n".join(lines) + "\n"
+        if len(description) > 4000:
+            description = description[:4000] + "\n...[Truncated]"
+
+        embed.description = description
+        embed.set_footer(text=f"Page {self.current_page + 1} of {self.max_pages} | Total Rows: {len(self.rows)}")
+        return embed
+
+    @discord.ui.button(label="⏪", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+    @discord.ui.button(label="⏩", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = self.max_pages - 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+
+class UnoCurrencyLogView(discord.ui.View):
+    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member,
+                 logs: list[dict], minimum=None):
+        super().__init__(timeout=120)
+        self.caller = caller
+        self.target = target
+        self.all_logs = logs
+        self.minimum = minimum
+
+        if minimum is not None:
+            logs = [log for log in logs if abs(log["amount"]) >= minimum]
+        self.logs = logs
+        self.page = 0
+        self.per_page = 5
+        self.filter = "All"
+        self.update_buttons()
+
+    def update_buttons(self):
+        max_pages = max(1, math.ceil(len(self.logs) / self.per_page))
+        self.btn_first.disabled = self.page == 0
+        self.btn_prev.disabled = self.page == 0
+        self.btn_next.disabled = self.page >= max_pages - 1
+        self.btn_last.disabled = self.page >= max_pages - 1
+
+    def build_embed(self):
+        embed = discord.Embed(title="UNO Currency Log", color=0xF1C40F)
+        embed.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
+
+        if not self.logs:
+            embed.description = "No transactions found for this filter."
+            return embed
+
+        start = self.page * self.per_page
+        page_logs = self.logs[start:start + self.per_page]
+
+        desc_lines = []
+        for entry in page_logs:
+            dt = datetime.fromisoformat(entry["ts"]).replace(tzinfo=_tz.utc)
+            unix_ts = int(dt.timestamp())
+            sign = "+" if entry["amount"] > 0 else ""
+            desc_lines.append(f"**{entry['description']}**")
+            desc_lines.append(f"└ <t:{unix_ts}:R>")
+            desc_lines.append(f"└ {sign}{entry['amount']:,}{config.UNO_CHIP_EMOJI}")
+            desc_lines.append("\u200b")
+
+        embed.description = "\n".join(desc_lines)
+        max_pages = max(1, math.ceil(len(self.logs) / self.per_page))
+        embed.set_footer(text=f"Page {self.page + 1} of {max_pages}  •  Filter: {self.filter}")
+        return embed
+
+    @discord.ui.select(
+        placeholder="Filter by type...",
+        options=[
+            discord.SelectOption(label="All", value="All", emoji="📋"),
+            discord.SelectOption(label="Rounds", value="Round", emoji="🃏"),
+            discord.SelectOption(label="Cash Ins", value="Cash In", emoji="📥"),
+            discord.SelectOption(label="Cash Outs", value="Cash Out", emoji="📤"),
+            discord.SelectOption(label="Wipes", value="Wipe", emoji="🧹"),
+        ],
+        row=0
+    )
+    async def filter_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if interaction.user.id != self.caller.id:
+            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
+            return
+        self.filter = select.values[0]
+        self.logs = self.all_logs if self.filter == "All" else [
+            log for log in self.all_logs if log["event_type"] == self.filter
+        ]
+        self.page = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            return
+        self.page = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            return
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            return
+        max_pages = max(1, math.ceil(len(self.logs) / self.per_page))
+        self.page = min(max_pages - 1, self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            return
+        max_pages = max(1, math.ceil(len(self.logs) / self.per_page))
+        self.page = max_pages - 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+class BetModal(discord.ui.Modal, title="UNO — Place Your Bet"):
+    def __init__(self, cog: "UnoGame", session: GameSession, balance: int):
+        super().__init__()
+        self.cog = cog
+        self.session = session
+        self.balance = balance
+        self.bet_input = discord.ui.TextInput(
+            label="How many chips to bet?",
+            placeholder=f"min {session.min_bet}  (wallet: {balance}{config.UNO_CHIP_EMOJI})",
+            min_length=1, max_length=8,
+        )
+        self.add_item(self.bet_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        async with self.session.lock:
+            if self.session.started:
+                await interaction.response.send_message("⚠️ The game has already started.", ephemeral=True)
+                return
+            if interaction.user.id in self.session.lobby_bets:
+                await interaction.response.send_message("You're already in with a bet placed.", ephemeral=True)
+                return
+            if await db.is_banned(interaction.guild_id, interaction.user.id):
+                await interaction.response.send_message("🚫 You're banned from UNO in this server.", ephemeral=True)
+                return
+            if len(self.session.lobby_players) >= self.session.max_players:
+                await interaction.response.send_message("Lobby is full.", ephemeral=True)
+                return
+
+            bet = _parse_chips(self.bet_input.value)
+            if bet is None:
+                await interaction.response.send_message("⚠️ Enter a valid amount (e.g. 500, 2k).", ephemeral=True)
+                return
+            if bet < self.session.min_bet:
+                await interaction.response.send_message(
+                    f"⚠️ Minimum bet is **{self.session.min_bet}**{config.UNO_CHIP_EMOJI}.", ephemeral=True
+                )
+                return
+            if bet > self.balance:
+                await interaction.response.send_message(
+                    f"⚠️ You only have **{self.balance}**{config.UNO_CHIP_EMOJI} available.", ephemeral=True
+                )
+                return
+
+            await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
+            ok = await db.deduct_chips(interaction.user.id, bet)
+            if not ok:
+                # balance moved between opening the modal and submitting it — the
+                # cached self.balance we validated against above is now stale
+                await interaction.response.send_message(
+                    "⚠️ Insufficient balance for that bet — your wallet may have changed since you opened this. "
+                    "Hit Join again to try with your current balance.", ephemeral=True
+                )
+                return
+            await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, bet)
+
+            self.session.lobby_players[interaction.user.id] = interaction.user.display_name
+            self.session.lobby_bets[interaction.user.id] = bet
+
+            await interaction.response.edit_message(embed=LobbyView.build_embed(self.session))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await report_component_error(interaction, error, None, "BetModal")
 
 
 class LobbyView(discord.ui.View):
@@ -537,10 +813,13 @@ class LobbyView(discord.ui.View):
         # lifecycle/timer and must not be touched here).
         if not self.session.started:
             self.cog.sessions.pop(self.session.channel_id, None)
+            for pid, bet in self.session.lobby_bets.items():
+                await db.return_chips(pid, bet)
+                await db.clear_chips_in_play(pid)
             if self.session.lobby_message:
                 try:
                     await self.session.lobby_message.edit(
-                        content="Lobby expired.", embed=None, view=None
+                        content="Lobby expired. Any bets placed have been refunded.", embed=None, view=None
                     )
                 except discord.HTTPException:
                     pass
@@ -549,7 +828,10 @@ class LobbyView(discord.ui.View):
     @staticmethod
     def build_embed(session: GameSession) -> discord.Embed:
         host_mention = f"<@{session.host_id}>"
-        names = ", ".join(f"<@{pid}>" for pid in session.lobby_players) or "_nobody yet_"
+        names = "\n".join(
+            f"<@{pid}> — **{session.lobby_bets[pid]}**{config.UNO_CHIP_EMOJI}"
+            for pid in session.lobby_players
+        ) or "_nobody yet_"
 
         e = discord.Embed(
             title="<:uno:1536135137232953451> UNO",
@@ -567,12 +849,7 @@ class LobbyView(discord.ui.View):
             value=f"\u200b\u200b{session.num_decks}",
             inline=True
         )
-        e.add_field(
-            name="<:uno_trophy:1536135332863676548>  Winners",
-            value=f"\u200b\u200b{session.target_winners}",
-            inline=True
-        )
-        e.add_field(name="Joined", value=names, inline=False)
+        e.add_field(name=f"Minimum bet — {session.min_bet}{config.UNO_CHIP_EMOJI}", value=names, inline=False)
         e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
         return e
 
@@ -582,14 +859,14 @@ class LobbyView(discord.ui.View):
     @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="uno_lobby_join", row=0)
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self.session.lock:
-            if interaction.user.id in self.session.lobby_players:
-                await interaction.response.send_message("You're already in.", ephemeral=True)
+            if interaction.user.id in self.session.lobby_bets:
+                await interaction.response.send_message("You're already in with a bet placed.", ephemeral=True)
                 return
             if len(self.session.lobby_players) >= self.session.max_players:
                 await interaction.response.send_message("Lobby is full.", ephemeral=True)
                 return
-            self.session.lobby_players[interaction.user.id] = interaction.user.display_name
-            await self._refresh(interaction)
+        balance = await db.get_balance(interaction.user.id)
+        await interaction.response.send_modal(BetModal(self.cog, self.session, balance))
 
     @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger, custom_id="uno_lobby_leave", row=0)
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -598,6 +875,10 @@ class LobbyView(discord.ui.View):
                 await interaction.response.send_message("You're not in this lobby.", ephemeral=True)
                 return
             del self.session.lobby_players[interaction.user.id]
+            bet = self.session.lobby_bets.pop(interaction.user.id, None)
+            if bet is not None:
+                await db.return_chips(interaction.user.id, bet)
+                await db.clear_chips_in_play(interaction.user.id)
             await self._refresh(interaction)
 
     @discord.ui.button(label="Rules",style=discord.ButtonStyle.secondary,custom_id="uno_lobby_rules",row=0)
@@ -630,12 +911,10 @@ class LobbyView(discord.ui.View):
             if len(players) < 2:
                 await interaction.response.send_message("Need at least 2 players to start.", ephemeral=True)
                 return
-            if self.session.target_winners >= len(players):
-                await interaction.response.send_message(
-                    "⚠️ Winners-before-game-ends must be less than the player count — adjust Settings first.",
-                    ephemeral=True,
-                )
-                return
+            # No unbetted-player check needed here: a pid only ever enters
+            # lobby_players once BetModal has already collected a bet for
+            # it (see the Join button below) — there's no path to a lobby
+            # member without one.
 
             required_cards = len(players) * 7 + 1  # hand_size is always 7 here
             available_cards = self.session.num_decks * 108
@@ -650,10 +929,19 @@ class LobbyView(discord.ui.View):
             random.shuffle(players)  # turn order shouldn't depend on join order
             try:
                 self.session.engine = ue.GameState(players, num_decks=self.session.num_decks,
-                                                    target_winners=self.session.target_winners)
+                                                    target_winners=self.session.target_winners,
+                                                    bets=dict(self.session.lobby_bets))
             except ue.UnoError as e:
                 await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
                 return
+
+            # Refund anyone whose buy-in was uncontested from the start
+            # (see GameState._trim_uncontested_excess) — right back to
+            # their wallet now, before a single card is played.
+            for pid, excess in self.session.engine.starting_refunds.items():
+                await db.return_chips(pid, excess)
+                await db.update_chips_in_play(pid, self.session.engine.bets[pid])
+
             self.session.started = True
             self.stop()
 
@@ -674,6 +962,9 @@ class LobbyView(discord.ui.View):
             return
         async with self.session.lock:
             self.cog.sessions.pop(self.session.channel_id, None)
+            for pid, bet in self.session.lobby_bets.items():
+                await db.return_chips(pid, bet)
+                await db.clear_chips_in_play(pid)
             self.stop()
             await interaction.response.edit_message(content="Lobby cancelled.", embed=None, view=None)
 
@@ -1370,6 +1661,9 @@ class UnoGame(commands.Cog):
         log.info("Cached %d card image(s) in memory", len(self._card_image_cache))
 
     uno = app_commands.Group(name="uno", description="UNO game commands")
+    unomgr = app_commands.Group(name="unomgr", description="UNO manager commands (economy)")
+    unoadmin = app_commands.Group(name="unoadmin", description="UNO admin/dev commands")
+    unoset = app_commands.Group(name="unoset", description="Configure UNO settings")
 
     # ---------------- persistence ----------------
 
@@ -1592,8 +1886,54 @@ class UnoGame(commands.Cog):
         if not channel or not engine:
             return
 
+        pot_lines = []
+        if engine.bets:
+            # Every original bettor's buy-in is done being "in play" the
+            # moment the round ends, win or lose — pay out winners, then
+            # clear chips_in_play for everyone who put money in.
+            net_payout: dict[int, int] = collections.defaultdict(int)
+            for sp in engine.side_pots:
+                payouts = sp.get("payouts") or {}
+                if payouts:
+                    for pid, amount in payouts.items():
+                        await db.add_chips(
+                            self.bot.user.id, "UNO Pot", pid, engine.all_names.get(pid, str(pid)),
+                            amount, note="UNO pot win",
+                        )
+                        net_payout[pid] += amount
+                    label = ", ".join(f"{_mention(pid)} **+{amount}**{config.UNO_CHIP_EMOJI}"
+                                       for pid, amount in payouts.items())
+                    pot_lines.append(f"**{sp['amount']}**{config.UNO_CHIP_EMOJI} pot → {label}")
+                else:
+                    # Shouldn't normally happen (_pots_resolved() guarantees
+                    # a winner before the round ends) — defensive fallback
+                    # for the one edge case that can still reach here (every
+                    # remaining player got removed simultaneously). Split
+                    # the pot evenly across its eligible contributors rather
+                    # than returning each of them their FULL bet (which
+                    # would double-pay anyone eligible for more than one pot).
+                    eligible = sp["eligible"] or list(engine.bets)
+                    share, remainder = divmod(sp["amount"], len(eligible))
+                    for i, pid in enumerate(eligible):
+                        amt = share + (remainder if i == 0 else 0)
+                        if amt:
+                            await db.return_chips(pid, amt)
+                            net_payout[pid] += amt
+                    pot_lines.append(f"**{sp['amount']}**{config.UNO_CHIP_EMOJI} pot → refunded (uncontested)")
+            for pid in engine.bets:
+                await db.clear_chips_in_play(pid)
+                net = net_payout.get(pid, 0) - engine.bets[pid]
+                await db.record_round_result(
+                    pid, engine.all_names.get(pid, str(pid)), won=net > 0,
+                    net_chips=net, chips_wagered=engine.bets[pid],
+                )
+                await db.log_currency_event(pid, "Round", net, f"UNO round in #{channel.name if hasattr(channel, 'name') else session.channel_id}")
+
         if not engine.finishers:
-            await channel.send("Game ended — no one finished (not enough players remaining).")
+            await channel.send(
+                "Game ended — no one finished (not enough players remaining)."
+                + ("\n" + "\n".join(pot_lines) if pot_lines else "")
+            )
             return
 
         winner_id = engine.finishers[0]
@@ -1612,6 +1952,9 @@ class UnoGame(commands.Cog):
         if engine.players:
             still_in = ", ".join(_mention(p.player_id) for p in engine.players)
             embed.add_field(name="Still had cards left", value=still_in, inline=False)
+
+        if pot_lines:
+            embed.add_field(name="Payouts", value="\n".join(pot_lines), inline=False)
 
         embed.set_footer(text=f"{len(engine.finishers)} finisher(s) • {engine.num_decks} deck(s)")
         await channel.send(embed=embed)
@@ -2220,6 +2563,10 @@ class UnoGame(commands.Cog):
             async with session.lock:
                 if target_id in session.lobby_players:
                     name = session.lobby_players.pop(target_id)
+                    bet = session.lobby_bets.pop(target_id, None)
+                    if bet is not None:
+                        await db.return_chips(target_id, bet)
+                        await db.clear_chips_in_play(target_id)
                     await interaction.response.send_message(f"Removed **{name}** from the lobby.", ephemeral=False)
                     if session.lobby_message:
                         await session.lobby_message.edit(embed=LobbyView.build_embed(session))
@@ -2271,6 +2618,10 @@ class UnoGame(commands.Cog):
             async with session.lock:
                 if target_id in session.lobby_players:
                     session.lobby_players.pop(target_id)
+                    bet = session.lobby_bets.pop(target_id, None)
+                    if bet is not None:
+                        await db.return_chips(target_id, bet)
+                        await db.clear_chips_in_play(target_id)
                     await interaction.response.send_message("You left the lobby.", ephemeral=True)
                     if session.lobby_message:
                         await session.lobby_message.edit(embed=LobbyView.build_embed(session))
@@ -2297,6 +2648,550 @@ class UnoGame(commands.Cog):
             else:
                 self.restart_timer(session)
                 await self.refresh_table(session)
+
+    @unomgr.command(name="addchips", description="[Manager] Add chips to a player's UNO wallet")
+    @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
+    async def addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_uno_manager(interaction):
+            await interaction.followup.send("❌ UNO Managers only.", ephemeral=True)
+            return
+        if config.UNO_ADD_CHIPS_CHANNELS and interaction.channel_id not in config.UNO_ADD_CHIPS_CHANNELS:
+            await interaction.followup.send("❌ This command can't be used in this channel.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
+            return
+
+        new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
+                                      user.id, user.display_name, amount, note)
+        desc = f"Staff Add: {note}" if note else "Staff Add"
+        await db.log_currency_event(user.id, "Cash In", amount, desc)
+
+        await interaction.followup.send(
+            f"✅ **+{amount}** chips → **{user.mention}** | Balance: **{new_bal}**{config.UNO_CHIP_EMOJI}"
+            + (f"\n> {note}" if note else ""), allowed_mentions=discord.AllowedMentions(users=True))
+
+    @unomgr.command(name="removechips", description="[Manager] Remove chips from a player's UNO wallet")
+    @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
+    async def removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_uno_manager(interaction):
+            await interaction.followup.send("❌ UNO Managers only.", ephemeral=True)
+            return
+        if config.UNO_REMOVE_CHIPS_CHANNELS and interaction.channel_id not in config.UNO_REMOVE_CHIPS_CHANNELS:
+            await interaction.followup.send("❌ This command can't be used in this channel.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
+            return
+
+        bal_before = await db.get_balance(user.id)
+        if amount > bal_before:
+            await interaction.followup.send(
+                f"❌ **{user.display_name}** only has **{bal_before}**{config.UNO_CHIP_EMOJI} — cannot remove **{amount}**.",
+                ephemeral=True)
+            return
+
+        new_bal = await db.add_chips(interaction.user.id, interaction.user.display_name,
+                                      user.id, user.display_name, -amount, note)
+        desc = f"Staff Remove: {note}" if note else "Staff Remove"
+        await db.log_currency_event(user.id, "Cash Out", -amount, desc)
+
+        await interaction.followup.send(
+            f"✅ **-{amount}** chips from **{user.mention}** | Balance: **{new_bal}**{config.UNO_CHIP_EMOJI}"
+            + (f"\n> {note}" if note else ""), allowed_mentions=discord.AllowedMentions(users=True))
+
+    @unomgr.command(name="ban", description="[Manager] Ban a user from joining UNO tables in this server")
+    @app_commands.describe(user="Player to ban", reason="Optional reason")
+    async def ban_cmd(self, interaction: discord.Interaction, user: discord.Member, reason: str = ""):
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("❌ UNO Managers only.", ephemeral=True)
+            return
+        ok = await db.ban_player(interaction.guild_id, user.id, user.display_name, interaction.user.id)
+        if not ok:
+            await interaction.response.send_message(f"**{user.display_name}** is already banned.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"🚫 Banned **{user.mention}** from UNO." + (f"\n> {reason}" if reason else ""),
+            allowed_mentions=discord.AllowedMentions(users=True))
+
+    @unomgr.command(name="unban", description="[Manager] Unban a user from UNO")
+    @app_commands.describe(user="Player to unban")
+    async def unban_cmd(self, interaction: discord.Interaction, user: discord.Member):
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("❌ UNO Managers only.", ephemeral=True)
+            return
+        existed = await db.unban_player(interaction.guild_id, user.id)
+        if not existed:
+            await interaction.response.send_message(f"**{user.display_name}** wasn't banned.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"✅ Unbanned **{user.mention}**.",
+                                                  allowed_mentions=discord.AllowedMentions(users=True))
+
+    @unomgr.command(name="bans", description="[Manager] List all currently banned UNO players")
+    async def bans_cmd(self, interaction: discord.Interaction):
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("❌ UNO Managers only.", ephemeral=True)
+            return
+        bans = await db.get_all_bans(interaction.guild_id)
+        if not bans:
+            await interaction.response.send_message("No one is currently banned from UNO.", ephemeral=True)
+            return
+        lines = [f"• <@{b['user_id']}> — banned by <@{b['banned_by']}> ({b['ts']})" for b in bans[:25]]
+        await interaction.response.send_message(
+            "**UNO bans:**\n" + "\n".join(lines), ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
+
+    @unomgr.command(name="removestats", description="[Manager] Remove a player from the UNO leaderboard")
+    @app_commands.describe(user="Player to remove from leaderboard")
+    async def removestats(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_uno_manager(interaction):
+            await interaction.followup.send("❌ UNO Managers only.", ephemeral=True)
+            return
+        removed = await db.delete_player_stats(user.id)
+        if removed:
+            await interaction.followup.send(f"✅ Removed **{user.name}** ({user.id}) from the UNO leaderboard.")
+        else:
+            await interaction.followup.send(f"ℹ️ **{user.name}** has no UNO stats on record.", ephemeral=True)
+
+    @unomgr.command(name="pay_cashout", description="[Manager] Deduct a paid cashout from a player's pending balance")
+    @app_commands.describe(user="Player who was paid", amount="Amount of chips paid")
+    async def pay_cashout(self, interaction: discord.Interaction, user: discord.Member, amount: int):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_uno_manager(interaction):
+            await interaction.followup.send("❌ UNO Managers only.", ephemeral=True)
+            return
+        if config.UNO_CASHOUT_CHANNEL_ID and interaction.channel_id != config.UNO_CASHOUT_CHANNEL_ID:
+            await interaction.followup.send(f"❌ This can only be used in <#{config.UNO_CASHOUT_CHANNEL_ID}>.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
+            return
+
+        ok = await db.pay_cashout(user.id, amount)
+        if not ok:
+            _, pending = await db.get_wallet(user.id)
+            await interaction.followup.send(
+                f"❌ **{user.display_name}** only has **{pending}**{config.UNO_CHIP_EMOJI} pending — cannot deduct {amount}.",
+                ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"✅ Deducted **{amount}**{config.UNO_CHIP_EMOJI} from **{user.mention}**'s pending cashouts.",
+            allowed_mentions=discord.AllowedMentions(users=True))
+
+    @unoset.command(name="managerrole", description="[Admin] Set the UNO Manager role")
+    @app_commands.describe(role="Role that gets UNO manager access (addchips, ban, cashouts, etc.)")
+    async def set_manager_role(self, interaction: discord.Interaction, role: discord.Role):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        await db.set_settings(interaction.guild_id, manager_role_id=role.id)
+        await interaction.followup.send(f"✅ UNO Manager role: **{role.name}**")
+
+    # ── Admin/dev economy commands ──────────────────────────────────────────
+
+    @unoadmin.command(name="economy", description="[Admin] View total UNO chips in circulation")
+    async def economy(self, interaction: discord.Interaction):
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        avail, pending = await db.get_economy_totals()
+        in_play = await db.get_total_chips_in_play()
+        total = avail + pending + in_play
+
+        embed = discord.Embed(title="🃏 UNO Economy Dashboard", color=0x2ecc71)
+        embed.add_field(name="Available in Wallets", value=f"{avail:,}{config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Locked Pending Cashouts", value=f"{pending:,}{config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Currently at Tables", value=f"{in_play:,}{config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Total Circulation", value=f"**{total:,}**{config.UNO_CHIP_EMOJI}", inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+    @unoadmin.command(name="revenue", description="[Admin] View projected UNO house profits")
+    async def revenue(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=False)
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+            await interaction.followup.send("❌ Server Administrators only.", ephemeral=True)
+            return
+
+        stats = await db.get_revenue_stats()
+
+        embed = discord.Embed(title="📈 UNO House Revenue (Inactivity Tax)", color=0xf1c40f)
+        embed.add_field(name="Past 24 Hours", value=f"{stats['daily']:,}{config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Past 7 Days", value=f"{stats['weekly']:,}{config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Past 30 Days", value=f"{stats['monthly']:,}{config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="All-Time Profit", value=f"**{stats['all_time']:,}**{config.UNO_CHIP_EMOJI}", inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+    @unoadmin.command(name="adjustrevenue", description="[Admin] Manually adjust the all-time UNO revenue tracker")
+    @app_commands.describe(amount="Amount to add (or negative to subtract)")
+    async def adjustrevenue(self, interaction: discord.Interaction, amount: int):
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Server Administrators only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        await db.log_house_revenue(amount, source="adjustment")
+        await interaction.followup.send(f"✅ Adjusted all-time UNO revenue by **{amount:+,}**{config.UNO_CHIP_EMOJI}.")
+
+    @unoadmin.command(name="salt", description="[Admin] View daily UNO house profits in a monthly calendar layout")
+    @app_commands.describe(month="YYYY-MM format (e.g. 2026-07) - defaults to current month")
+    async def salt(self, interaction: discord.Interaction, month: str = None):
+        await interaction.response.defer(ephemeral=False)
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+            await interaction.followup.send("❌ Server Administrators only.", ephemeral=True)
+            return
+
+        import re
+        if month:
+            if not re.match(r"^\d{4}-\d{2}$", month):
+                await interaction.followup.send("❌ Invalid month format. Use YYYY-MM (e.g. 2026-07).")
+                return
+            target_year_month = month
+        else:
+            target_year_month = datetime.utcnow().strftime("%Y-%m")
+
+        year_str, month_str = target_year_month.split("-")
+        y_val, m_val = int(year_str), int(month_str)
+
+        db_conn = await db._get_db()
+        daily_totals = {}
+        try:
+            async with db_conn.execute(
+                "SELECT ts, amount FROM house_revenue WHERE ts LIKE ?", (f"{target_year_month}%",)
+            ) as c:
+                rows = await c.fetchall()
+                for ts_str, amt in rows:
+                    try:
+                        day = int(ts_str.split("T")[0].split("-")[2])
+                        daily_totals[day] = daily_totals.get(day, 0) + amt
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.exception(f"Error querying UNO house revenue: {e}")
+
+        import calendar
+        from PIL import Image, ImageDraw, ImageFont
+
+        try:
+            cal = calendar.Calendar(firstweekday=6)
+            weeks = cal.monthdayscalendar(y_val, m_val)
+        except Exception:
+            await interaction.followup.send("❌ Invalid year or month values.")
+            return
+
+        month_name = calendar.month_name[m_val]
+
+        def format_revenue(val: int) -> str:
+            if val == 0:
+                return "0"
+            if val >= 1_000_000:
+                val_m = val / 1_000_000
+                return f"{int(val_m)}M" if val_m == int(val_m) else f"{val_m:.1f}M"
+            elif val >= 100_000:
+                val_k = val / 1_000
+                return f"{int(val_k)}K" if val_k == int(val_k) else f"{val_k:.1f}K"
+            return str(val)
+
+        bg_color = (19, 19, 26)
+        card_bg = (33, 33, 47)
+        empty_card_bg = (24, 24, 33)
+        header_color = (255, 255, 255)
+        text_muted = (130, 130, 160)
+        cyan_color = (56, 189, 248)
+        green_color = (74, 222, 128)
+        grey_color = (110, 120, 140)
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        font_path_bold = os.path.join(base_dir, "..", "poker", "assets", "Roboto-Bold.ttf")
+        font_path_medium = os.path.join(base_dir, "..", "poker", "assets", "Roboto-Medium.ttf")
+        try:
+            font_title = ImageFont.truetype(font_path_bold, 34)
+            font_header = ImageFont.truetype(font_path_bold, 22)
+            font_date = ImageFont.truetype(font_path_medium, 18)
+            font_rev = ImageFont.truetype(font_path_bold, 24)
+            font_total = ImageFont.truetype(font_path_bold, 26)
+        except Exception:
+            font_title = font_header = font_date = font_rev = font_total = ImageFont.load_default()
+
+        num_weeks = len(weeks)
+        padding, card_w, card_h, gap = 20, 115, 95, 10
+        header_h, weekdays_h = 90, 45
+        grid_h = card_h * num_weeks + gap * (num_weeks - 1)
+        footer_h = 70
+
+        img_w = padding * 2 + card_w * 7 + gap * 6
+        img_h = padding + header_h + weekdays_h + grid_h + footer_h + padding
+
+        img = Image.new("RGB", (img_w, img_h), bg_color)
+        draw = ImageDraw.Draw(img)
+
+        draw.text((padding, padding + 15), f"UNO Revenue — {month_name} {y_val}", font=font_title, fill=header_color)
+
+        weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+        start_y = padding + header_h
+        for idx, day_lbl in enumerate(weekdays):
+            x = padding + idx * (card_w + gap)
+            try:
+                bbox = draw.textbbox((0, 0), day_lbl, font=font_header)
+                text_w = bbox[2] - bbox[0]
+            except Exception:
+                text_w = len(day_lbl) * 12
+            draw.text((x + (card_w - text_w) // 2, start_y), day_lbl, font=font_header, fill=text_muted)
+
+        start_grid_y = start_y + weekdays_h
+        for row_idx, week in enumerate(weeks):
+            y = start_grid_y + row_idx * (card_h + gap)
+            for col_idx, day in enumerate(week):
+                x = padding + col_idx * (card_w + gap)
+                if day == 0:
+                    draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=empty_card_bg)
+                else:
+                    draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=6, fill=card_bg)
+                    draw.text((x + 10, y + 8), f"{day:02d}", font=font_date, fill=cyan_color)
+                    rev_val = daily_totals.get(day, 0)
+                    rev_str = format_revenue(rev_val)
+                    color = green_color if rev_val > 0 else grey_color
+                    try:
+                        bbox = draw.textbbox((0, 0), rev_str, font=font_rev)
+                        text_w = bbox[2] - bbox[0]
+                    except Exception:
+                        text_w = len(rev_str) * 12
+                    draw.text((x + (card_w - text_w) // 2, y + 48), rev_str, font=font_rev, fill=color)
+
+        total_rev = sum(daily_totals.values())
+        footer_y = start_grid_y + grid_h + 20
+        draw.line([padding, footer_y, img_w - padding, footer_y], fill=(40, 40, 60), width=1)
+        draw.text((padding, footer_y + 20), f"Total Monthly Revenue: {total_rev:,} UNO Chips", font=font_total, fill=green_color)
+
+        temp_img_path = f"uno_revenue_{target_year_month}.png"
+        img.save(temp_img_path)
+        try:
+            file = discord.File(temp_img_path, filename=f"uno_revenue_{target_year_month}.png")
+            await interaction.followup.send(file=file)
+        finally:
+            if os.path.exists(temp_img_path):
+                os.remove(temp_img_path)
+
+    @unoadmin.command(name="sql", description="[Dev] Run a read-only SQL query against the UNO database")
+    @app_commands.describe(query="SELECT statement only")
+    async def sql_query(self, interaction: discord.Interaction, query: str):
+        if interaction.user.id not in config.DEV_USER_IDS:
+            await interaction.response.send_message("❌ Restricted to the bot developer.", ephemeral=True)
+            return
+        stripped = query.strip().rstrip(";")
+        if not stripped.lower().startswith("select"):
+            await interaction.response.send_message("❌ Only SELECT queries are allowed.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=False)
+        try:
+            conn = await db._get_db()
+            async with conn.execute(stripped) as c:
+                rows = await c.fetchall()
+                columns = [d[0] for d in c.description] if c.description else []
+        except Exception as e:
+            await interaction.followup.send(f"❌ Query error: {e}", ephemeral=True)
+            return
+
+        row_dicts = [dict(r) for r in rows]
+        if not row_dicts:
+            await interaction.followup.send("✅ Query ran successfully — 0 rows returned.")
+            return
+
+        view = RawSQLPaginationView(columns, row_dicts, title=f"UNO SQL: {stripped[:60]}")
+        await interaction.followup.send(embed=view.format_page(), view=view)
+
+    @unoadmin.command(name="setstat", description="[Dev] Modify a player's UNO statistics")
+    @app_commands.describe(user="The player whose stats you want to change",
+                            stat="The specific statistic to modify",
+                            value="The new integer value for this stat")
+    @app_commands.choices(stat=[
+        app_commands.Choice(name="Rounds Played", value="rounds_played"),
+        app_commands.Choice(name="Rounds Won", value="rounds_won"),
+        app_commands.Choice(name="Chips Won", value="chips_won"),
+        app_commands.Choice(name="Chips Lost", value="chips_lost"),
+        app_commands.Choice(name="Times Wiped (Inactivity)", value="times_wiped"),
+    ])
+    async def setstat(self, interaction: discord.Interaction, user: discord.Member,
+                       stat: app_commands.Choice[str], value: int):
+        if interaction.user.id not in config.DEV_USER_IDS:
+            await interaction.response.send_message("❌ Access Denied.", ephemeral=True)
+            return
+        try:
+            conn = await db._get_db()
+            async with db._write_lock:
+                await conn.execute(f"UPDATE stats SET {stat.value} = ? WHERE user_id = ?", (value, user.id))
+                await conn.commit()
+            await interaction.response.send_message(
+                f"✅ Successfully updated **{stat.name}** to `{value:,}` for **{user.display_name}**!")
+        except Exception as e:
+            log.exception("setstat failed")
+            await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
+
+    async def _send_uno_backup(self, user: discord.User):
+        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        clean_zip_name = f"uno_data_backup_{date_str}.zip"
+        zip_path = clean_zip_name
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "uno")
+
+        try:
+            async with db._write_lock:
+                conn = await db._get_db()
+                await conn.execute("PRAGMA wal_checkpoint(RESTART)")
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, _, files in os.walk(data_dir):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        zipf.write(full_path, arcname=os.path.relpath(full_path, data_dir))
+
+            with open(zip_path, 'rb') as f:
+                await user.send(f"📦 **UNO Database Backup** ({date_str})", file=discord.File(f, filename=clean_zip_name))
+        finally:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+    @unoadmin.command(name="backup", description="[Dev] Force a UNO database backup to your DMs")
+    async def force_backup(self, interaction: discord.Interaction):
+        if interaction.user.id not in config.DEV_USER_IDS:
+            await interaction.response.send_message("❌ This command is restricted to the bot developer.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self._send_uno_backup(interaction.user)
+            await interaction.followup.send("✅ Backup sent directly to your DMs!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Failed to send DM. Please check your Discord privacy settings to allow messages from server members.",
+                ephemeral=True)
+        except Exception as e:
+            log.exception("UNO backup failed")
+            await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
+
+    # ── Player-facing stats/leaderboard ─────────────────────────────────────
+    # Note: poker's /poker leaderboard renders a PIL/Twemoji graphic
+    # (poker/leaderboard_image.py) that depends on bundled font + emoji PNG
+    # assets. Those assets aren't part of this port, so these render as
+    # plain embeds instead — same underlying data/ranking, simpler display.
+
+    @uno.command(name="stats", description="View your UNO stats")
+    @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
+    async def stats(self, interaction: discord.Interaction, hidden: bool = False):
+        await interaction.response.defer(ephemeral=hidden)
+        row = await db.get_player_stats(interaction.user.id)
+        if not row:
+            await interaction.followup.send("No UNO stats yet!", ephemeral=hidden)
+            return
+
+        rank = await db.get_player_rank(interaction.user.id)
+        rank_str = f"#{rank}" if rank else "Unranked"
+
+        net = row["net_chips"]
+        wp = f"{row['rounds_won'] / row['rounds_played'] * 100:.1f}%" if row["rounds_played"] else "—"
+
+        embed = discord.Embed(
+            title=f"UNO Stats — {row['username']}",
+            color=0x2ecc71 if net > 0 else (0xe74c3c if net < 0 else 0xFFFFFF),
+        )
+        embed.add_field(name="Rank", value=rank_str, inline=True)
+        embed.add_field(name="Rounds Played", value=str(row["rounds_played"]), inline=True)
+        embed.add_field(name="Win %", value=wp, inline=True)
+        embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,}{config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Wallet Balance", value=f"{row['wallet']:,}{config.UNO_CHIP_EMOJI}", inline=True)
+        if row.get("times_wiped", 0) > 0:
+            embed.add_field(name="Times Wiped", value=str(row["times_wiped"]), inline=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=hidden)
+
+    @uno.command(name="leaderboard", description="Top UNO players by net chips")
+    async def leaderboard(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        rows = await db.get_leaderboard(10)
+        if not rows:
+            await interaction.followup.send("No UNO stats yet!", ephemeral=True)
+            return
+
+        caller_row = await db.get_player_stats(interaction.user.id)
+        caller_rank = await db.get_player_rank(interaction.user.id) if caller_row else None
+
+        lines = []
+        for i, r in enumerate(rows):
+            net = r["net_chips"]
+            lines.append(
+                f"{PLACEMENT_EMOJI.get(i, f'`#{i+1}`')} <@{r['user_id']}> — "
+                f"**{'+' if net >= 0 else ''}{net:,}**{config.UNO_CHIP_EMOJI}"
+            )
+        embed = discord.Embed(title="🃏 UNO Leaderboard", description="\n".join(lines), color=0xF1C40F)
+        if caller_row and caller_rank and caller_rank > 10:
+            net = caller_row["net_chips"]
+            embed.set_footer(text=f"Your rank: #{caller_rank} ({'+' if net >= 0 else ''}{net:,} net)")
+
+        await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @uno.command(name="request_cashout", description="Lock UNO chips for withdrawal and notify staff")
+    @app_commands.describe(amount="Chips to cash out (e.g. 500, 2k)", note="Optional notes")
+    async def request_cashout(self, interaction: discord.Interaction, amount: str,
+                               note: app_commands.Range[str, 0, 50] = ""):
+        await interaction.response.defer(ephemeral=True)
+        chips = _parse_chips(amount)
+        if chips is None or chips <= 0:
+            await interaction.followup.send("❌ Enter a valid amount (e.g. 500, 2k).", ephemeral=True)
+            return
+
+        bal, _ = await db.get_wallet(interaction.user.id)
+        if chips > bal:
+            await interaction.followup.send(
+                f"❌ You only have **{bal}**{config.UNO_CHIP_EMOJI} available. "
+                f"(Chips currently on a table aren't cashable until it settles.)", ephemeral=True)
+            return
+
+        ok = await db.request_cashout(interaction.user.id, chips)
+        if not ok:
+            await interaction.followup.send("❌ Failed to process cashout.", ephemeral=True)
+            return
+
+        desc = f"Requested Cashout: {note}" if note else "Requested Cashout"
+        await db.log_currency_event(interaction.user.id, "Cash Out", -chips, desc)
+
+        if config.UNO_CASHOUT_CHANNEL_ID:
+            try:
+                ch = interaction.guild.get_channel(config.UNO_CASHOUT_CHANNEL_ID)
+                if ch:
+                    # Format mirrors poker's cashout ticket exactly — same
+                    # regex-based ✅-reaction payout handler in bot.py reads
+                    # both, keyed only by which channel the reaction fired in.
+                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips}{config.UNO_CHIP_EMOJI}"
+                    if note:
+                        ticket_msg += f"\n**Notes:** {note}"
+                    ticket = await ch.send(ticket_msg)
+                    await ticket.add_reaction("✅")
+            except Exception:
+                log.exception("Failed to post UNO cashout ticket")
+
+        await interaction.followup.send(
+            f"✅ Locked **{chips}**{config.UNO_CHIP_EMOJI} for cashout. Staff have been notified — "
+            f"react ✅ on the ticket to mark it paid.", ephemeral=True)
+
+    @uno.command(name="currencylog", description="View recent UNO chip transactions")
+    @app_commands.describe(user="Player to check (managers only, leave blank for yourself)",
+                            minimum="Only show transactions with this many chips or more")
+    async def currencylog(self, interaction: discord.Interaction, user: discord.Member = None, minimum: int = None):
+        target = user or interaction.user
+        if target.id != interaction.user.id and not await is_uno_manager(interaction):
+            await interaction.response.send_message("❌ UNO Managers only.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        logs = await db.get_currency_logs(target.id)
+        view = UnoCurrencyLogView(caller=interaction.user, target=target, logs=logs, minimum=minimum)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     @uno.command(
         name="timeout",
@@ -2447,6 +3342,10 @@ class UnoGame(commands.Cog):
                 async with session.lock:
                     if user_id in session.lobby_players:
                         del session.lobby_players[user_id]
+                        bet = session.lobby_bets.pop(user_id, None)
+                        if bet is not None:
+                            await db.return_chips(user_id, bet)
+                            await db.clear_chips_in_play(user_id)
                         if session.lobby_message:
                             try:
                                 await session.lobby_message.edit(embed=LobbyView.build_embed(session))

@@ -5,7 +5,9 @@ from dotenv import load_dotenv
 import traceback
 
 from poker.database import init_db, recover_chips_in_play, close_unclosed_dealer_sessions
+from uno.database import init_db as init_uno_db, recover_chips_in_play as recover_uno_chips_in_play
 from poker import database as db
+from uno import database as uno_db
 from poker.tutorial_db import init_db as init_tutorial_db
 from eventlog import eventlog_database
 from discord.ext import tasks
@@ -155,6 +157,94 @@ async def daily_inactive_wipe():
     except Exception:
         traceback.print_exc()
 
+# ── Daily UNO inactivity wipe (03:45 UTC — offset from poker's so they don't overlap) ──
+uno_wipe_time = datetime.time(hour=3, minute=45, tzinfo=datetime.timezone.utc)
+
+@tasks.loop(time=uno_wipe_time)
+async def daily_uno_inactive_wipe():
+    """Same shape as daily_inactive_wipe, but against uno/database.py's
+    separate wallets — a player's UNO activity/balance is tracked
+    independently of their poker one."""
+    from uno import database as uno_db
+
+    try:
+        at_risk = await uno_db.get_players_at_risk()
+        dm_warned = 0
+        for player in at_risk:
+            embed = discord.Embed(
+                title="⚠️ UNO Inactivity Warning — You're at risk of being wiped!",
+                color=0xf39c12,
+            )
+            embed.description = (
+                f"Hey **{player['username']}**! Your UNO chips are scheduled to be wiped "
+                f"in approximately **24 hours** because you haven't met the activity requirements.\n\n"
+                f"**Your balance:** {player['balance']:,} chips\n"
+                f"**Rounds played:** {player['recent_rounds']} / {uno_db.MIN_ROUNDS_PER_PERIOD} required\n"
+                f"**Chips wagered:** {player['recent_chips_wagered']:,} / {uno_db.MIN_CHIPS_WAGERED:,} required\n\n"
+                f"**Play {uno_db.MIN_ROUNDS_PER_PERIOD - player['recent_rounds']} more round(s) "
+                f"before the wipe to keep your chips!**"
+            )
+            embed.set_footer(text="UNO wipe runs daily at 03:45 UTC")
+            if await _try_dm(player["user_id"], embed=embed):
+                dm_warned += 1
+        if at_risk:
+            print(f"[Daily UNO Wipe] Sent 24h warning DMs to {dm_warned}/{len(at_risk)} at-risk player(s)")
+    except Exception:
+        traceback.print_exc()
+
+    try:
+        wiped = await uno_db.wipe_inactive_players()
+        dm_sent = 0
+        for w in wiped:
+            tax_pct = int(config.UNO_WIPE_TAX_RATE * 100)
+            embed = discord.Embed(
+                title="🧹 Your UNO chips have been wiped due to inactivity",
+                color=0xe74c3c,
+            )
+            embed.description = (
+                f"Hey **{w['username']}**, you didn't meet the activity requirements "
+                f"and your UNO chips have been wiped.\n\n"
+                f"**Chips wiped:** {w['amount_wiped']:,}\n"
+                f"**Inactivity tax ({tax_pct}%):** -{w['tax_amount']:,} chips\n"
+                f"**Auto-queued cashout (80%):** {w['cashout_amount']:,} chips\n\n"
+                f"**Rounds played:** {w['recent_rounds']} / {uno_db.MIN_ROUNDS_PER_PERIOD} required\n"
+                f"**Chips wagered:** {w['recent_chips_wagered']:,} / {uno_db.MIN_CHIPS_WAGERED:,} required"
+            )
+            if await _try_dm(w["user_id"], embed=embed):
+                dm_sent += 1
+
+        if wiped:
+            channel_id = config.UNO_INACTIVITY_CHANNEL_ID
+            if channel_id:
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                    tax_total = sum(w["tax_amount"] for w in wiped)
+                    cashout_total = sum(w["cashout_amount"] for w in wiped)
+                    summary_lines = [
+                        f"• **{w['username']}**: {w['amount_wiped']:,} wiped "
+                        f"(tax: {w['tax_amount']:,} | cashout queued: {w['cashout_amount']:,}, "
+                        f"{w['recent_rounds']} rounds)"
+                        for w in wiped[:10]
+                    ]
+                    summary = "\n".join(summary_lines)
+                    await channel.send(
+                        f"🧹 **[UNO] Wiped {len(wiped)} inactive player(s):**\n{summary}\n\n"
+                        f"**Total tax collected:** {tax_total:,} chips\n"
+                        f"**Total cashouts queued:** {cashout_total:,} chips\n"
+                        f"*(DMs sent: {dm_sent}/{len(wiped)})*"
+                    )
+                except Exception:
+                    traceback.print_exc()
+
+            print(
+                f"[Daily UNO Wipe] Wiped {len(wiped)} player(s) | "
+                f"tax: {sum(w['tax_amount'] for w in wiped):,} | "
+                f"cashouts queued: {sum(w['cashout_amount'] for w in wiped):,} | "
+                f"DMs sent: {dm_sent}/{len(wiped)}"
+            )
+    except Exception:
+        traceback.print_exc()
+
 @bot.event
 async def on_ready():
     if bot.startup_complete:
@@ -163,6 +253,7 @@ async def on_ready():
 
     bot.startup_complete = True
     await init_db()
+    await init_uno_db()
     await init_tutorial_db()
     await eventlog_database.init_log_db()
     # await tournament_db.init_db()
@@ -173,6 +264,12 @@ async def on_ready():
         print(f"⚠️  Recovered chips for {len(recovered)} player(s) after restart:")
         for r in recovered:
             print(f"   {r['username']}: +{r['amount']} chips returned to wallet")
+
+    uno_recovered = await recover_uno_chips_in_play()
+    if uno_recovered:
+        print(f"⚠️  Recovered UNO chips for {len(uno_recovered)} player(s) after restart:")
+        for r in uno_recovered:
+            print(f"   {r['username']}: +{r['amount']} UNO chips returned to wallet")
 
     # tourney_recovered = await tournament_db.recover_chips_in_play()
     # if tourney_recovered:
@@ -203,6 +300,7 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     daily_inactive_wipe.start()
+    daily_uno_inactive_wipe.start()
     clear_donation_cache.start()
 
 
@@ -220,8 +318,11 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         return
 
     # ── 1. Channel filter — cheapest check, drop everything else immediately ──
-    if payload.channel_id not in config.ADD_CHIPS_CHANNELS:
+    is_uno = payload.channel_id in config.UNO_DONATION_CHANNELS
+    if payload.channel_id not in config.ADD_CHIPS_CHANNELS and not is_uno:
         return
+    target_db = uno_db if is_uno else db
+    chip_emoji = config.UNO_CHIP_EMOJI if is_uno else "<:poker_chip:1490458259855773707>"
 
     # ── 2. Author filter — check raw payload before fetching the full message ──
     author_id = int((payload.data.get("author") or {}).get("id", 0))
@@ -315,7 +416,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     # ── 7. Credit chips ───────────────────────────────────────────────────────
     try:
-        new_bal = await db.add_chips(
+        new_bal = await target_db.add_chips(
             bot.user.id,
             bot.user.display_name,
             user.id,
@@ -323,12 +424,12 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
             chips,
             "Dank Memer Donation Exchange",
         )
-        await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+        await target_db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
 
-        print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
+        print(f"[Donation{'/UNO' if is_uno else ''}] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
 
         await message.reply(
-            f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+            f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** {chip_emoji}"
         )
         await message.add_reaction("✅")
     except Exception as e:
@@ -343,9 +444,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == bot.user.id:
         return
 
-    # 2. Restrict to the Cashout channel
-    if payload.channel_id != getattr(config, "CASHOUT_CHANNEL_ID", 0):
+    # 2. Restrict to a Cashout channel (poker or UNO)
+    is_uno = payload.channel_id == getattr(config, "UNO_CASHOUT_CHANNEL_ID", 0) and config.UNO_CASHOUT_CHANNEL_ID
+    if payload.channel_id != getattr(config, "CASHOUT_CHANNEL_ID", 0) and not is_uno:
         return
+    target_db = uno_db if is_uno else db
+    payout_manager_role_id = config.UNO_PAYOUT_MANAGER_ROLE if is_uno else config.PAYOUT_MANAGER_ROLE
 
     # 3. Trigger on standard ✅ OR any custom emoji with "check" or "tick" in the name
     emoji_name = str(payload.emoji.name).lower()
@@ -387,7 +491,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if "**PAID**" in message.content:
             return
 
-        # 7. Extract the User ID and Amount from your exact ticket format
+        # 7. Extract the User ID and Amount from the ticket format (same
+        # shape for poker and UNO — /uno request_cashout posts identically)
         user_match = re.search(r"\*\*Username:\*\* <@!?(\d+)>", message.content)
         amount_match = re.search(r"\*\*Amount:\*\* ([\d,]+)", message.content)
 
@@ -398,7 +503,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         amount = int(amount_match.group(1).replace(",", ""))
 
         # 8. Attempt to process the payment in the database
-        ok = await db.pay_cashout(target_user_id, amount)
+        ok = await target_db.pay_cashout(target_user_id, amount)
         if not ok:
             await channel.send(
                 f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "

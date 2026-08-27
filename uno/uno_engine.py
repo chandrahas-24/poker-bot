@@ -187,6 +187,7 @@ class Player:
     missed_turns: int = 0          # consecutive auto-draw timeouts
     said_uno: bool = False         # true once they've called uno at 1 card
     armed_uno: bool = False        # pre-armed via the Hand toggle at 2 cards; consumed on their next play
+    bet: int = 0                   # chips wagered to join the table — fixed for the round, no raises
 
     def to_dict(self):
         return {
@@ -197,6 +198,7 @@ class Player:
             "missed_turns": self.missed_turns,
             "said_uno": self.said_uno,
             "armed_uno": self.armed_uno,
+            "bet": self.bet,
         }
 
     @classmethod
@@ -206,6 +208,7 @@ class Player:
         p.missed_turns = d.get("missed_turns", 0)
         p.said_uno = d.get("said_uno", False)
         p.armed_uno = d.get("armed_uno", False)
+        p.bet = d.get("bet", 0)
         # Sanitize: armed_uno is only ever meaningful at exactly 2 cards.
         # A save file could have this stale/corrupted (e.g. hand-edited,
         # or written by a version with a bug) — silently drop the arm
@@ -230,7 +233,7 @@ class GameState:
 
     def __init__(self, players: list[tuple[int, str]], num_decks: int = 1,
                  hand_size: int = 7, wild_draw4_challenge: bool = True,
-                 target_winners: int = 1):
+                 target_winners: int = 1, bets: Optional[dict[int, int]] = None):
         if len(players) < 2:
             raise UnoError("Need at least 2 players")
         pids = [pid for pid, _ in players]
@@ -250,9 +253,19 @@ class GameState:
         self.wild_draw4_challenge = wild_draw4_challenge
         self.target_winners = max(1, min(target_winners, len(players) - 1))
 
-        self.players: list[Player] = [Player(pid, name) for pid, name in players]
+        bets = bets or {}
+        adjusted_bets, self.starting_refunds = self._trim_uncontested_excess(dict(bets))
+        # starting_refunds: {pid: amount} — the caller (cog layer) is
+        # responsible for actually crediting these back to the wallet
+        # (this class never touches the DB); self.bets already reflects
+        # the trimmed amount, so nothing else needs to treat this specially.
+        self.players: list[Player] = [Player(pid, name, bet=adjusted_bets.get(pid, 0)) for pid, name in players]
         self.all_names: dict[int, str] = {pid: name for pid, name in players}  # survives players leaving/finishing
+        self.bets: dict[int, int] = adjusted_bets  # pid -> chips wagered to join; persists after they leave/finish, same as poker's total_bet counting toward the pot after a fold
+        self.left_early: set[int] = set()  # player_ids removed mid-round (AFK kick/left) — money stays in the pot, but not eligible to win any of it, same as a poker fold
         self.finishers: list[int] = []  # player_ids in the order they emptied their hand (placement order)
+        self.side_pots: list[dict] = []       # filled in once the round ends — [{"amount": int, "eligible": [pid,...]}]
+        self.pot_results: list[tuple[int, list[int]]] = []  # [(amount, [winner_pid,...]), ...] one entry per pot, filled once the round ends
         self.draw_pile: list[str] = build_deck(num_decks)
         self.discard_pile: list[str] = []
 
@@ -313,6 +326,10 @@ class GameState:
             "num_decks": self.num_decks,
             "wild_draw4_challenge": self.wild_draw4_challenge,
             "last_summary": self.last_summary,
+            "bets": dict(self.bets),
+            "left_early": list(self.left_early),
+            "side_pots": [dict(sp) for sp in self.side_pots],
+            "pot_results": [[amt, list(winners)] for amt, winners in self.pot_results],
         }
 
     @classmethod
@@ -408,6 +425,19 @@ class GameState:
         self.num_decks = d.get("num_decks", 1)
         self.wild_draw4_challenge = d.get("wild_draw4_challenge", True)
         self.last_summary = d.get("last_summary", "")
+
+        # Same string-keys-from-JSON hazard as all_names above.
+        raw_bets = d.get("bets") or {}
+        self.bets = {int(k): v for k, v in raw_bets.items()}
+        self.left_early = set(int(pid) for pid in d.get("left_early", []))
+        self.side_pots = []
+        for sp in d.get("side_pots", []):
+            sp = dict(sp)
+            if "payouts" in sp:
+                sp["payouts"] = {int(k): v for k, v in sp["payouts"].items()}
+            self.side_pots.append(sp)
+        self.pot_results = [(amt, list(winners)) for amt, winners in d.get("pot_results", [])]
+        self.starting_refunds = {}  # one-time construction artifact — already processed by the cog layer, nothing to redo on reload
         return self
 
     # ---------- helpers ----------
@@ -544,6 +574,10 @@ class GameState:
         self.draw_pile.extend(leaving.hand)
         random.shuffle(self.draw_pile)
 
+        # Their bet stays in the pot (self.bets is untouched) — same as a
+        # poker fold. They're just no longer eligible to win any of it.
+        self.left_early.add(player_id)
+
         was_current = idx == self.current_index
         wd4_involved = self.pending_wd4_challenge is not None and player_id in (
             self.pending_wd4_challenge["wd4_player_id"], self.pending_wd4_challenge["target_id"]
@@ -580,6 +614,8 @@ class GameState:
         if not self.players:
             self.finished = True
             self.winner = None
+            if self.bets:
+                self._settle_pots()  # everyone left_early — no eligible winners, pots refund below
             return
 
         if next_player_id is not None:
@@ -964,13 +1000,26 @@ class GameState:
                     progressed = True
                     break
 
-        if len(self.finishers) >= self.target_winners:
-            self.finished = True
-        elif len(self.players) <= 1:
-            # everyone else finished or left — whoever's left "wins" by attrition
-            if len(self.players) == 1 and self.players[0].player_id not in self.finishers:
+        if self.bets:
+            # Economy mode: don't force play until everyone's finished.
+            # Each pot's winner is simply whichever eligible player
+            # finishes first (finish order == best rank) — so a pot is
+            # "settled" the moment either (a) one of its eligible players
+            # has already finished, or (b) it's down to a single eligible
+            # player left playing (wins by attrition, same as poker
+            # winning an uncontested pot). Stop as soon as every pot is
+            # settled — no need to play out the whole table.
+            self.finished = self._pots_resolved()
+            if self.finished and len(self.players) == 1 and self.players[0].player_id not in self.finishers:
                 self.finishers.append(self.players[0].player_id)
-            self.finished = True
+        else:
+            if len(self.finishers) >= self.target_winners:
+                self.finished = True
+            elif len(self.players) <= 1:
+                # everyone else finished or left — whoever's left "wins" by attrition
+                if len(self.players) == 1 and self.players[0].player_id not in self.finishers:
+                    self.finishers.append(self.players[0].player_id)
+                self.finished = True
 
         if self.finished:
             self.winner = self.finishers[0] if self.finishers else None
@@ -981,3 +1030,108 @@ class GameState:
                 )
             else:
                 self.last_summary = "Game over."
+
+            if self.bets:
+                self._settle_pots()
+
+    def _pots_resolved(self) -> bool:
+        """True once every side pot already has a determined winner —
+        i.e. further play can't change who wins any money. Used instead
+        of target_winners in economy mode so the round doesn't have to
+        run until every single player empties their hand."""
+        finished_set = set(self.finishers)
+        for sp in self._compute_side_pots():
+            eligible = set(sp["eligible"])
+            if eligible & finished_set:
+                continue  # someone eligible already finished — they lock in this pot, later finishers can't beat them
+            still_playing = eligible - finished_set
+            if len(still_playing) > 1:
+                return False  # still genuinely contested
+        return True
+
+    # ---------- economy: side pots ----------
+    #
+    # Direct port of poker's engine.py:_compute_side_pots / _showdown.
+    # Poker keys pots off `total_bet` (varies within a hand via streets/
+    # all-ins); UNO has no raises, so the equivalent is each player's
+    # fixed table buy-in (`self.bets`). Eligibility for a pot ("did they
+    # make it to showdown") is poker's `players_in_hand` (not folded);
+    # here it's "finished normally or was still seated when the round
+    # ended" — i.e. everyone except `self.left_early`. Poker's hand-rank
+    # (lower score = better) becomes UNO's finish order — whoever in a
+    # pot's eligible set finished earliest wins it; a pot decided early
+    # by attrition (only one eligible player left playing) goes to them.
+
+    @staticmethod
+    def _trim_uncontested_excess(bets: dict[int, int]) -> tuple[dict[int, int], dict[int, int]]:
+        """If the single highest bettor's amount is above everyone else's,
+        the portion above the next-highest bet can never be contested by
+        anyone — it would just sit in its own side pot and get handed
+        straight back to them at settlement anyway. Trim it off and refund
+        it immediately at game start instead. Only the very top tier can
+        ever be a lone singleton this way: the next-highest value by
+        definition already has at least one other bettor at it, so once
+        the top player is brought down to that level they're tied with
+        someone — a single pass is always enough, no loop needed."""
+        if len(bets) < 2:
+            return dict(bets), {}
+        values = sorted(set(bets.values()), reverse=True)
+        top = values[0]
+        top_players = [pid for pid, b in bets.items() if b == top]
+        if len(top_players) != 1 or len(values) < 2:
+            return dict(bets), {}
+        pid = top_players[0]
+        second = values[1]
+        excess = top - second
+        adjusted = dict(bets)
+        adjusted[pid] = second
+        return adjusted, ({pid: excess} if excess > 0 else {})
+
+    def _pot_winner(self, eligible: list[int]) -> Optional[int]:
+        """Winner for one pot: the earliest (best-ranked) eligible player
+        who's already finished, or — if none has — the sole eligible
+        player still playing (attrition). Returns None only if a pot
+        somehow has zero eligible players still in the running (shouldn't
+        happen once _pots_resolved() is true, but handled defensively)."""
+        finisher_rank = {pid: i for i, pid in enumerate(self.finishers)}
+        finished_eligible = [pid for pid in eligible if pid in finisher_rank]
+        if finished_eligible:
+            return min(finished_eligible, key=lambda pid: finisher_rank[pid])
+        still_playing = [pid for pid in eligible if pid not in finisher_rank]
+        if len(still_playing) == 1:
+            return still_playing[0]
+        return None
+
+    def _compute_side_pots(self) -> list[dict]:
+        eligible_ids = set(self.bets) - self.left_early
+        levels = sorted(set(b for pid, b in self.bets.items() if b > 0))
+        pots: list[dict] = []
+        prev = 0
+        for level in levels:
+            amount = sum(min(b, level) - min(b, prev) for b in self.bets.values())
+            eligible = [pid for pid in eligible_ids if self.bets.get(pid, 0) >= level]
+            if amount > 0 and eligible:
+                pots.append({"amount": amount, "eligible": eligible})
+            prev = level
+        return pots
+
+    def _settle_pots(self):
+        pots = self._compute_side_pots()
+        results: list[tuple[int, list[int]]] = []
+        for sp in pots:
+            eligible = sp["eligible"]
+            winner = self._pot_winner(eligible) if eligible else None
+            if winner is None:
+                # Nobody who contributed to this level is still eligible
+                # (e.g. everyone at the table left_early before the round
+                # ended) — no winner to declare. Leave it as an empty
+                # result; the caller (cog layer) should treat any pot with
+                # no winners as a straight refund of each contributor's own
+                # bet rather than the engine guessing at a split.
+                sp["payouts"] = {}
+                results.append((sp["amount"], []))
+                continue
+            sp["payouts"] = {winner: sp["amount"]}
+            results.append((sp["amount"], [winner]))
+        self.side_pots = pots
+        self.pot_results = results

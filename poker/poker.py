@@ -30,6 +30,12 @@ TURN_TIMEOUT_DEFAULT    = config.TURN_TIMEOUT_DEFAULT
 NEXT_HAND_DELAY_DEFAULT = config.NEXT_HAND_DELAY_DEFAULT
 TABLE_RESEND_MSGS       = config.TABLE_RESEND_MSGS
 
+# ── AFK / decision-timeout system ───────────────────────────────
+LARGE_POT_THRESHOLD   = config.LARGE_POT_THRESHOLD
+LARGE_POT_EXTRA_TIME  = config.LARGE_POT_EXTRA_TIME
+DAILY_AFK_LIMIT        = config.DAILY_AFK_LIMIT
+CONSECUTIVE_AFK_LIMIT  = config.CONSECUTIVE_AFK_LIMIT
+
 # ── TableState ────────────────────────────────────────────────────────────────
 
 def parse_chips(value: str) -> int | None:
@@ -203,6 +209,12 @@ def cancel_timer(t: TableState):
     t.turn_deadline = 0.0
 
 def start_timer(t: TableState, channel):
+    # Always (re)bind the callback to the currently-loaded code. This runs
+    # on every single decision (start_timer fires after every refresh()),
+    # so it also self-heals the hook after a cog/module reload instead of
+    # leaving it pointed at a stale closure from the old module instance.
+    t.game.on_player_acted = lambda uid: _afk_reset_consecutive(uid)
+
     cp = t.game.current_player()
     if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
         cancel_timer(t)
@@ -219,9 +231,124 @@ def start_timer(t: TableState, channel):
     t.timer_task.add_done_callback(_task_catcher)
 
 
+# ── AFK / decision-timeout helpers ──────────────────────────────
+# State is global — one record per user_id across every table/guild — and
+# persisted in the `afk_tracking` DB table (see database.py), not per-table.
+
+def _afk_reset_consecutive(user_id: int):
+    """Called synchronously from the engine right after a genuine decision
+    (fold/check/call/raise, including one resolved via a queued premove).
+    Engine action methods are synchronous, so the actual (rare) DB update is
+    scheduled as a background task rather than awaited here directly."""
+    task = asyncio.create_task(_afk_reset_consecutive_async(user_id))
+    task.add_done_callback(_task_catcher)
+
+async def _afk_reset_consecutive_async(user_id: int):
+    state = await db.get_afk_state(user_id)
+    if state["consecutive_count"] == 0:
+        return  # nothing to persist — avoid a needless write
+    await db.save_afk_state(
+        user_id, state["daily_count"], state["daily_date"], 0
+    )
+
+async def _handle_forgiven_timeout(t: TableState, channel, user_id: int, p, state: dict):
+    """Auto check/fold on behalf of an AFK player, using forgiveness."""
+    name = p.display_name
+    call_amt = t.game.call_amount(p)
+    # If this miss will push them over the consecutive-AFK limit, they're
+    # getting removed — don't let a legal "check" carry them (with live
+    # equity) through further streets while still AFK. Force them out of
+    # the current hand immediately instead.
+    will_be_removed = (state["consecutive_count"] + 1) >= CONSECUTIVE_AFK_LIMIT
+
+    # Suppress the on_player_acted callback for exactly this user_id so our
+    # own automatic action doesn't get mistaken for a real decision and wipe
+    # out the consecutive-AFK count we're about to record. Any other player
+    # whose premove fires as a knock-on effect is unaffected.
+    t.game._afk_auto_user_id = user_id
+    try:
+        if will_be_removed:
+            ok, action_msg = t.game.fold(user_id)
+        elif call_amt == 0:
+            ok, action_msg = t.game.check_or_call(user_id)  # legal check
+        else:
+            ok, action_msg = t.game.fold(user_id)
+    finally:
+        t.game._afk_auto_user_id = None
+
+    if not ok:
+        # It's no longer this player's turn / they already acted — a race
+        # resolved the decision through another path. Do nothing.
+        return
+
+    state["daily_count"] += 1
+    state["consecutive_count"] += 1
+    await db.save_afk_state(user_id, state["daily_count"], state["daily_date"], state["consecutive_count"])
+
+    if any(m in action_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+        slog_clear(t)
+    for part in action_msg.split("\n"):
+        if part.strip():
+            slog(t, part)
+
+    verb = "folded" if (will_be_removed or call_amt > 0) else "checked"
+    await channel.send(
+        f"⏰ **{name}** timed out and was auto-{verb}. "
+        f"({state['daily_count']}/{DAILY_AFK_LIMIT} timeouts used today)"
+    )
+
+    if state["consecutive_count"] >= CONSECUTIVE_AFK_LIMIT:
+        if user_id not in t.game.kicked_users:
+            t.game.kicked_users.append(user_id)
+        if user_id not in t.game.pending_leaves:
+            t.game.pending_leaves.append(user_id)
+        t.leave_cooldown_pending.add(user_id)
+        await channel.send(
+            f"🚪 **{name}** missed **{CONSECUTIVE_AFK_LIMIT}** decisions in a row "
+            f"and will be removed after this hand."
+        )
+
+    if t.game._hand_result:
+        await _process_result(channel.guild, channel, t)
+    else:
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+
+async def _handle_old_timeout(t: TableState, channel, user_id: int, p):
+    """Original (pre-forgiveness) timeout behavior: force-fold and remove
+    after the hand. Used once a player has exhausted the daily forgiveness
+    allowance. Left intentionally identical to the prior implementation."""
+    name = p.display_name
+    if user_id not in t.game.kicked_users:
+        t.game.kicked_users.append(user_id)
+    if user_id not in t.game.pending_leaves:
+        t.game.pending_leaves.append(user_id)
+    t.leave_cooldown_pending.add(user_id)
+
+    if not p.folded:
+        ok, fold_msg = t.game.force_fold(user_id)
+        if ok:
+            parts = fold_msg.split("\n")
+            if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                slog_clear(t)
+            for part in parts:
+                if part.strip():
+                    slog(t, part)
+
+    await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
+    if t.game._hand_result:
+        await _process_result(channel.guild, channel, t)
+    else:
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+
 async def _turn_timer(t: TableState, channel, user_id: int):
     settings = await db.get_settings(channel.guild.id)
     timeout = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
+
+    # Large-pot extra decision time — evaluated once, right as the timer
+    # starts, from the pot at that exact moment. Does not touch the timer
+    # for pots <= LARGE_POT_THRESHOLD.
+    if t.game.pot > LARGE_POT_THRESHOLD:
+        timeout += LARGE_POT_EXTRA_TIME
 
     # Set the initial mutable deadline
     t.turn_deadline = time.time() + timeout
@@ -269,29 +396,23 @@ async def _turn_timer(t: TableState, channel, user_id: int):
     p = t.game.get_player(user_id)
     if not p:
         return
+    # NOTE: deliberately NOT also checking p.acted here. _post_blind() sets
+    # acted=True for whoever posts the small blind (and it isn't reset the
+    # way the big blind's is), so in heads-up — and any time action folds
+    # back around to the SB with no reopening raise — the SB's `acted` flag
+    # is already True before they've made their real decision. is_turn() is
+    # the correct and sufficient guard here (it's what the original
+    # pre-AFK-system code relied on too); p.folded is kept as a cheap extra
+    # check since a folded player is unambiguously done for the hand.
+    if p.folded:
+        return
 
-    name = p.display_name
-    if user_id not in t.game.kicked_users:
-        t.game.kicked_users.append(user_id)
-    if user_id not in t.game.pending_leaves:
-        t.game.pending_leaves.append(user_id)
-    t.leave_cooldown_pending.add(user_id)
+    state = await db.get_afk_state(user_id)
 
-    if not p.folded:
-        ok, fold_msg = t.game.force_fold(user_id)
-        if ok:
-            parts = fold_msg.split("\n")
-            if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-                slog_clear(t)
-            for part in parts:
-                if part.strip():
-                    slog(t, part)
-
-    await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
-    if t.game._hand_result:
-        await _process_result(channel.guild, channel, t)
+    if state["daily_count"] < DAILY_AFK_LIMIT:
+        await _handle_forgiven_timeout(t, channel, user_id, p, state)
     else:
-        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+        await _handle_old_timeout(t, channel, user_id, p)
 
 # ── Auto next hand ────────────────────────────────────────────────────────────
 

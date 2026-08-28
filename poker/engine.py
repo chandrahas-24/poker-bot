@@ -1,6 +1,6 @@
 from treys import Card, Deck, Evaluator
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable
 from enum import Enum, auto
 from math import ceil
 import random
@@ -118,6 +118,20 @@ class PokerGame:
         self.is_tournament = False
         self.tax_exempt = False
         self.vpip = False
+
+        # ── AFK / decision-timeout hook ─────────────────────────────────────
+        # Optional callback(user_id) fired after a player *genuinely* completes
+        # a decision (fold/check/call/raise), including decisions resolved via
+        # a queued premove. Wired up by poker.py so the engine stays decoupled
+        # from Discord/AFK-tracking concerns.
+        self.on_player_acted: Optional[Callable[[int], None]] = None
+        # While set to a user_id, _notify_acted() will NOT fire the callback
+        # for that specific user_id. Used by the AFK system so its own
+        # automatic check/fold (which goes through the normal action methods)
+        # doesn't get mistaken for a real decision and reset the player's own
+        # consecutive-AFK counter. Any OTHER player's action (e.g. a premove
+        # that fires as a result of this auto-action) is unaffected.
+        self._afk_auto_user_id: Optional[int] = None
 
     @property
     def chip_emoji(self) -> str:
@@ -350,6 +364,21 @@ class PokerGame:
     def call_amount(self, player: PokerPlayer) -> int:
         return max(0,min(self.current_bet - player.bet, player.chips))
 
+    def _notify_acted(self, user_id: int):
+        """Fire on_player_acted for a genuine decision, unless this exact
+        user_id is currently being auto-acted for by the AFK system.
+        Uses getattr defaults so PokerGame instances that were already
+        alive (e.g. mid-hand across a hot reload/deploy) before these
+        attributes existed don't raise AttributeError."""
+        if user_id == getattr(self, '_afk_auto_user_id', None):
+            return
+        callback = getattr(self, 'on_player_acted', None)
+        if callback:
+            try:
+                callback(user_id)
+            except Exception:
+                pass
+
     # Actions
 
     def fold(self, user_id: int) -> tuple[bool, str]:
@@ -363,6 +392,7 @@ class PokerGame:
             "action": "fold", "amount": 0, "street": self.street.name
         })
         msg = f"🏳️ **{p.display_name}** folds."
+        self._notify_acted(user_id)
         end = self._advance()
         return True, msg + ("\n" + end if end else "")
 
@@ -389,6 +419,7 @@ class PokerGame:
             "amount": amount, "street": self.street.name
         })
         p.acted = True
+        self._notify_acted(user_id)
         end = self._advance()
         return True, msg + ("\n" + end if end else "")
 
@@ -447,6 +478,7 @@ class PokerGame:
         if p.chips == 0:
             p.all_in = True
         p.acted = True
+        self._notify_acted(user_id)
         msg = f"📈 **{p.display_name}** raises to {self.current_bet}. (Pot: {self.pot})"
         end = self._advance()
         return True, msg + ("\n" + end if end else "")

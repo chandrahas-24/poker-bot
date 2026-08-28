@@ -15,6 +15,11 @@ _write_lock = asyncio.Lock()
 _settings_cache: dict[int, dict] = {}
 _cache_lock = asyncio.Lock()
 
+# ── AFK/decision-timeout state cache (mirrors afk_tracking table) ─────────────
+# Keyed by user_id, global across every table/guild. Most players never time
+# out, so most calls hit this dict and never touch SQLite at all.
+_afk_cache: dict[int, dict] = {}
+
 
 async def _get_db() -> aiosqlite.Connection:
     global _db
@@ -288,6 +293,16 @@ async def init_db():
                 dealer_name TEXT NOT NULL,
                 event       TEXT NOT NULL,
                 ts          TEXT NOT NULL
+            )
+        """)
+
+        # ── AFK / decision-timeout forgiveness tracking (global, all tables) ──
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS afk_tracking (
+                user_id           INTEGER PRIMARY KEY,
+                daily_count       INTEGER DEFAULT 0,
+                daily_date        TEXT DEFAULT '',
+                consecutive_count INTEGER DEFAULT 0
             )
         """)
 
@@ -2145,6 +2160,61 @@ async def get_autorebuy(user_id: int) -> int:
 
 async def set_autorebuy(user_id: int, amount: int):
     await set_player_preference(user_id, auto_rebuy_amount=amount)
+
+# ── AFK / decision-timeout forgiveness state (global across every table) ──────
+
+def _afk_default(today: str) -> dict:
+    return {"daily_count": 0, "daily_date": today, "consecutive_count": 0}
+
+async def get_afk_state(user_id: int) -> dict:
+    """Returns {'daily_count', 'daily_date', 'consecutive_count'} for a
+    player, rolling the daily counter over (in-memory and in the DB) if the
+    stored date isn't today (UTC). Cache-first: players who have never timed
+    out never touch SQLite."""
+    today = datetime.utcnow().date().isoformat()
+
+    cached = _afk_cache.get(user_id)
+    if cached is not None:
+        if cached["daily_date"] != today:
+            cached["daily_count"] = 0
+            cached["daily_date"] = today
+        return cached
+
+    db = await _get_db()
+    async with db.execute(
+        "SELECT daily_count, daily_date, consecutive_count FROM afk_tracking WHERE user_id = ?",
+        (user_id,)
+    ) as c:
+        row = await c.fetchone()
+
+    state = dict(row) if row else _afk_default(today)
+    if state["daily_date"] != today:
+        state["daily_count"] = 0
+        state["daily_date"] = today
+
+    _afk_cache[user_id] = state
+    return state
+
+async def save_afk_state(user_id: int, daily_count: int, daily_date: str, consecutive_count: int):
+    """Persist a player's AFK state, updating the cache first so subsequent
+    reads in the same process see it immediately."""
+    _afk_cache[user_id] = {
+        "daily_count": daily_count,
+        "daily_date": daily_date,
+        "consecutive_count": consecutive_count,
+    }
+
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO afk_tracking (user_id, daily_count, daily_date, consecutive_count)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                daily_count       = excluded.daily_count,
+                daily_date        = excluded.daily_date,
+                consecutive_count = excluded.consecutive_count
+        """, (user_id, daily_count, daily_date, consecutive_count))
+        await db.commit()
 
 async def log_dealer_event(table_id: str, table_name: str, dealer_id: int, dealer_name: str, event: str):
     async with _write_lock:

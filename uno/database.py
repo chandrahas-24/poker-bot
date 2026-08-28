@@ -559,7 +559,52 @@ async def mark_player_active(user_id: int, chips_wagered: int = 0):
         await db.commit()
 
 
-async def get_players_at_risk() -> list[dict]:
+async def get_player_activity_stats(user_id: int) -> dict | None:
+    """Detailed activity stats for a player — admin check_inactive / self-check myactivity."""
+    db = await _get_db()
+    async with db.execute("""
+        SELECT username, balance, pending_cashout, last_activity, recent_rounds, recent_chips_wagered
+        FROM wallets WHERE user_id = ?
+    """, (user_id,)) as c:
+        row = await c.fetchone()
+        if not row:
+            return None
+
+    data = dict(row)
+    if not data.get("last_activity"):
+        return None
+    last_active = datetime.fromisoformat(data["last_activity"])
+    days_inactive = (datetime.utcnow() - last_active).days
+    days_until_wipe = max(0, INACTIVITY_DAYS - days_inactive)
+
+    data["days_inactive"] = days_inactive
+    data["days_until_wipe"] = days_until_wipe
+    data["is_at_risk"] = days_until_wipe <= 1
+    data["meets_rounds_requirement"] = data["recent_rounds"] >= MIN_ROUNDS_PER_PERIOD
+    data["meets_wager_requirement"] = data["recent_chips_wagered"] >= MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else True
+    return data
+
+
+async def reset_database(admin_id: int, admin_name: str):
+    """Wipes ALL UNO economy data — wallets, stats, logs, settings, bans. Irreversible."""
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("DELETE FROM wallets")
+        await db.execute("DELETE FROM stats")
+        await db.execute("DELETE FROM chip_log")
+        await db.execute("DELETE FROM chips_in_play")
+        await db.execute("DELETE FROM uno_bans")
+        await db.execute("DELETE FROM house_revenue")
+        await db.execute("DELETE FROM currency_log")
+        await db.execute("""
+            INSERT INTO audit_log (ts, action, user_id, user_name, detail)
+            VALUES (?, 'DATABASE_RESET', ?, ?, 'Full UNO database reset performed')
+        """, (ts, admin_id, admin_name))
+        await db.commit()
+
+    async with _cache_lock:
+        _settings_cache.clear()
     """O(1) query for players exactly 1 day away from a wipe."""
     db = await _get_db()
     async with db.execute("""

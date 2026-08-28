@@ -449,7 +449,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.channel_id != getattr(config, "CASHOUT_CHANNEL_ID", 0) and not is_uno:
         return
     target_db = uno_db if is_uno else db
-    payout_manager_role_id = config.UNO_PAYOUT_MANAGER_ROLE if is_uno else config.PAYOUT_MANAGER_ROLE
 
     # 3. Trigger on standard ✅ OR any custom emoji with "check" or "tick" in the name
     emoji_name = str(payload.emoji.name).lower()

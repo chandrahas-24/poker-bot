@@ -75,7 +75,7 @@ import discord
 import logging
 import config
 from pathlib import Path
-from datetime import datetime, timezone as _tz
+from datetime import datetime, timedelta, timezone as _tz
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import (
@@ -188,7 +188,7 @@ async def report_component_error(interaction: discord.Interaction, error: Except
         pass
 
 
-TURN_TIMEOUT_SECONDS = 120
+TURN_TIMEOUT_SECONDS = 45
 TABLE_REFRESH_EVERY_MESSAGES = 7
 # MAX_BUTTONS_TOTAL is imported from unodemo (both are Discord's 5x5 = 25 button ceiling)
 
@@ -360,7 +360,7 @@ def _build_table_text(session: "GameSession") -> str:
 
     if engine.bets:
         pot_total = sum(engine.bets.values())
-        lines.append(f"{config.UNO_CHIP_EMOJI} Pot: **{pot_total}**")
+        lines.append(f"Pot: **{pot_total}** {config.UNO_CHIP_EMOJI}")
 
     lines.append("")
     if session.turn_started_at:
@@ -411,8 +411,8 @@ class GameSession:
         self.turn_generation = 0
 
         # configurable via the Settings button, event-staff-only
-        self.max_players = 10
-        self.num_decks = 1
+        self.max_players = 6
+        self.num_decks = 4
         self.turn_timeout = TURN_TIMEOUT_SECONDS
         # NOT configurable — economy rounds end dynamically once every side
         # pot already has a determined winner (see GameState._pots_resolved),
@@ -558,6 +558,41 @@ class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
         await report_component_error(interaction, error, None, "LobbySettingsModal")
 
 
+class UnoConfirmResetView1(discord.ui.View):
+    def __init__(self, admin_id: int):
+        super().__init__(timeout=30)
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="Yes, I'm sure", style=discord.ButtonStyle.red)
+    async def step1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True)
+            return
+        view = UnoConfirmResetView2(self.admin_id)
+        await interaction.response.edit_message(
+            content="⚠️ **Final confirmation.** This CANNOT be undone.", view=view)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+class UnoConfirmResetView2(discord.ui.View):
+    def __init__(self, admin_id: int):
+        super().__init__(timeout=30)
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="WIPE EVERYTHING", style=discord.ButtonStyle.red)
+    async def step2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await db.reset_database(interaction.user.id, interaction.user.display_name)
+        await interaction.edit_original_response(
+            content=f"✅ UNO database wiped by **{interaction.user.display_name}**.", view=None)
+
+
 class RawSQLPaginationView(discord.ui.View):
     def __init__(self, columns: list, rows: list, title: str, items_per_page: int = 15, max_pages_limit: int = 20):
         super().__init__(timeout=300)
@@ -667,7 +702,7 @@ class UnoCurrencyLogView(discord.ui.View):
             sign = "+" if entry["amount"] > 0 else ""
             desc_lines.append(f"**{entry['description']}**")
             desc_lines.append(f"└ <t:{unix_ts}:R>")
-            desc_lines.append(f"└ {sign}{entry['amount']:,}{config.UNO_CHIP_EMOJI}")
+            desc_lines.append(f"└ {sign}{entry['amount']:,} {config.UNO_CHIP_EMOJI}")
             desc_lines.append("\u200b")
 
         embed.description = "\n".join(desc_lines)
@@ -741,7 +776,7 @@ class BetModal(discord.ui.Modal, title="UNO — Place Your Bet"):
         self.balance = balance
         self.bet_input = discord.ui.TextInput(
             label="How many chips to bet?",
-            placeholder=f"min {session.min_bet}  (wallet: {balance}{config.UNO_CHIP_EMOJI})",
+            placeholder=f"min {session.min_bet}  (wallet: {balance} {config.UNO_CHIP_EMOJI})",
             min_length=1, max_length=8,
         )
         self.add_item(self.bet_input)
@@ -767,12 +802,12 @@ class BetModal(discord.ui.Modal, title="UNO — Place Your Bet"):
                 return
             if bet < self.session.min_bet:
                 await interaction.response.send_message(
-                    f"⚠️ Minimum bet is **{self.session.min_bet}**{config.UNO_CHIP_EMOJI}.", ephemeral=True
+                    f"⚠️ Minimum bet is **{self.session.min_bet}** {config.UNO_CHIP_EMOJI}.", ephemeral=True
                 )
                 return
             if bet > self.balance:
                 await interaction.response.send_message(
-                    f"⚠️ You only have **{self.balance}**{config.UNO_CHIP_EMOJI} available.", ephemeral=True
+                    f"⚠️ You only have **{self.balance}** {config.UNO_CHIP_EMOJI} available.", ephemeral=True
                 )
                 return
 
@@ -829,7 +864,7 @@ class LobbyView(discord.ui.View):
     def build_embed(session: GameSession) -> discord.Embed:
         host_mention = f"<@{session.host_id}>"
         names = "\n".join(
-            f"<@{pid}> — **{session.lobby_bets[pid]}**{config.UNO_CHIP_EMOJI}"
+            f"<@{pid}> — **{session.lobby_bets[pid]}** {config.UNO_CHIP_EMOJI}"
             for pid in session.lobby_players
         ) or "_nobody yet_"
 
@@ -849,7 +884,7 @@ class LobbyView(discord.ui.View):
             value=f"\u200b\u200b{session.num_decks}",
             inline=True
         )
-        e.add_field(name=f"Minimum bet — {session.min_bet}{config.UNO_CHIP_EMOJI}", value=names, inline=False)
+        e.add_field(name=f"Minimum bet - {session.min_bet} {config.UNO_CHIP_EMOJI}", value=names, inline=False)
         e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
         return e
 
@@ -938,9 +973,15 @@ class LobbyView(discord.ui.View):
             # Refund anyone whose buy-in was uncontested from the start
             # (see GameState._trim_uncontested_excess) — right back to
             # their wallet now, before a single card is played.
+            refund_lines = []
             for pid, excess in self.session.engine.starting_refunds.items():
                 await db.return_chips(pid, excess)
                 await db.update_chips_in_play(pid, self.session.engine.bets[pid])
+                await db.log_currency_event(pid, "Cash In", excess, "Uncontested Buy-In Refund")
+                refund_lines.append(
+                    f"<@{pid}> — **{excess}** {config.UNO_CHIP_EMOJI} refunded "
+                    f"(no one else covered that much, bet trimmed to **{self.session.engine.bets[pid]}**)"
+                )
 
             self.session.started = True
             self.stop()
@@ -951,6 +992,12 @@ class LobbyView(discord.ui.View):
             for child in self.children:
                 child.disabled = True
             await interaction.response.edit_message(view=self)
+
+            if refund_lines:
+                await interaction.channel.send(
+                    "💰 **Uncontested buy-in refunded:**\n" + "\n".join(refund_lines),
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
 
             await self.cog.post_table(self.session, interaction.channel)
             self.cog.restart_timer(self.session)
@@ -1886,24 +1933,22 @@ class UnoGame(commands.Cog):
         if not channel or not engine:
             return
 
-        pot_lines = []
+        net_lines = []
         if engine.bets:
             # Every original bettor's buy-in is done being "in play" the
-            # moment the round ends, win or lose — pay out winners, then
-            # clear chips_in_play for everyone who put money in.
-            net_payout: dict[int, int] = collections.defaultdict(int)
+            # moment the round ends, win or lose. Nothing gets credited to
+            # a wallet until we know each player's NET result for the whole
+            # round (gross winnings across every pot they took, minus their
+            # own bet) — same order poker's engine.py applies its tax in
+            # (_showdown/_advance): distribute the raw pots first, then tax
+            # each player once off their total net profit for the hand/round,
+            # only if that net is actually positive.
+            gross_payout: dict[int, int] = collections.defaultdict(int)
             for sp in engine.side_pots:
                 payouts = sp.get("payouts") or {}
                 if payouts:
                     for pid, amount in payouts.items():
-                        await db.add_chips(
-                            self.bot.user.id, "UNO Pot", pid, engine.all_names.get(pid, str(pid)),
-                            amount, note="UNO pot win",
-                        )
-                        net_payout[pid] += amount
-                    label = ", ".join(f"{_mention(pid)} **+{amount}**{config.UNO_CHIP_EMOJI}"
-                                       for pid, amount in payouts.items())
-                    pot_lines.append(f"**{sp['amount']}**{config.UNO_CHIP_EMOJI} pot → {label}")
+                        gross_payout[pid] += amount
                 else:
                     # Shouldn't normally happen (_pots_resolved() guarantees
                     # a winner before the round ends) — defensive fallback
@@ -1917,22 +1962,42 @@ class UnoGame(commands.Cog):
                     for i, pid in enumerate(eligible):
                         amt = share + (remainder if i == 0 else 0)
                         if amt:
-                            await db.return_chips(pid, amt)
-                            net_payout[pid] += amt
-                    pot_lines.append(f"**{sp['amount']}**{config.UNO_CHIP_EMOJI} pot → refunded (uncontested)")
+                            gross_payout[pid] += amt
+
+            tax_rate = config.UNO_WINNERS_TAX_RATE
             for pid in engine.bets:
+                gross = gross_payout.get(pid, 0)
+                bet = engine.bets[pid]
+                net = gross - bet
+                tax = math.ceil(net * tax_rate) if net > 0 else 0
+                credited = gross - tax
+
+                if credited > 0:
+                    await db.add_chips(
+                        self.bot.user.id, "UNO Pot", pid, engine.all_names.get(pid, str(pid)),
+                        credited, note="UNO pot win" if net > 0 else "UNO pot refund",
+                    )
                 await db.clear_chips_in_play(pid)
-                net = net_payout.get(pid, 0) - engine.bets[pid]
+
+                net_after_tax = net - tax
                 await db.record_round_result(
-                    pid, engine.all_names.get(pid, str(pid)), won=net > 0,
-                    net_chips=net, chips_wagered=engine.bets[pid],
+                    pid, engine.all_names.get(pid, str(pid)), won=net_after_tax > 0,
+                    net_chips=net_after_tax, chips_wagered=bet,
                 )
-                await db.log_currency_event(pid, "Round", net, f"UNO round in #{channel.name if hasattr(channel, 'name') else session.channel_id}")
+                await db.log_currency_event(
+                    pid, "Round", net_after_tax,
+                    f"UNO round in #{channel.name if hasattr(channel, 'name') else session.channel_id}"
+                )
+                if tax > 0:
+                    await db.log_house_revenue(tax, source="winners_tax")
+
+                sign = "+" if net_after_tax >= 0 else ""
+                net_lines.append(f"{_mention(pid)} **{sign}{net_after_tax}** {config.UNO_CHIP_EMOJI}")
 
         if not engine.finishers:
             await channel.send(
                 "Game ended — no one finished (not enough players remaining)."
-                + ("\n" + "\n".join(pot_lines) if pot_lines else "")
+                + ("\n" + "\n".join(net_lines) if net_lines else "")
             )
             return
 
@@ -1953,8 +2018,8 @@ class UnoGame(commands.Cog):
             still_in = ", ".join(_mention(p.player_id) for p in engine.players)
             embed.add_field(name="Still had cards left", value=still_in, inline=False)
 
-        if pot_lines:
-            embed.add_field(name="Payouts", value="\n".join(pot_lines), inline=False)
+        if net_lines:
+            embed.add_field(name="Net", value="\n".join(net_lines), inline=False)
 
         embed.set_footer(text=f"{len(engine.finishers)} finisher(s) • {engine.num_decks} deck(s)")
         await channel.send(embed=embed)
@@ -2669,7 +2734,7 @@ class UnoGame(commands.Cog):
         await db.log_currency_event(user.id, "Cash In", amount, desc)
 
         await interaction.followup.send(
-            f"✅ **+{amount}** chips → **{user.mention}** | Balance: **{new_bal}**{config.UNO_CHIP_EMOJI}"
+            f"✅ **+{amount}** chips → **{user.mention}** | Balance: **{new_bal}** {config.UNO_CHIP_EMOJI}"
             + (f"\n> {note}" if note else ""), allowed_mentions=discord.AllowedMentions(users=True))
 
     @unomgr.command(name="removechips", description="[Manager] Remove chips from a player's UNO wallet")
@@ -2689,7 +2754,7 @@ class UnoGame(commands.Cog):
         bal_before = await db.get_balance(user.id)
         if amount > bal_before:
             await interaction.followup.send(
-                f"❌ **{user.display_name}** only has **{bal_before}**{config.UNO_CHIP_EMOJI} — cannot remove **{amount}**.",
+                f"❌ **{user.display_name}** only has **{bal_before}** {config.UNO_CHIP_EMOJI} — cannot remove **{amount}**.",
                 ephemeral=True)
             return
 
@@ -2699,7 +2764,7 @@ class UnoGame(commands.Cog):
         await db.log_currency_event(user.id, "Cash Out", -amount, desc)
 
         await interaction.followup.send(
-            f"✅ **-{amount}** chips from **{user.mention}** | Balance: **{new_bal}**{config.UNO_CHIP_EMOJI}"
+            f"✅ **-{amount}** chips from **{user.mention}** | Balance: **{new_bal}** {config.UNO_CHIP_EMOJI}"
             + (f"\n> {note}" if note else ""), allowed_mentions=discord.AllowedMentions(users=True))
 
     @unomgr.command(name="ban", description="[Manager] Ban a user from joining UNO tables in this server")
@@ -2774,12 +2839,12 @@ class UnoGame(commands.Cog):
         if not ok:
             _, pending = await db.get_wallet(user.id)
             await interaction.followup.send(
-                f"❌ **{user.display_name}** only has **{pending}**{config.UNO_CHIP_EMOJI} pending — cannot deduct {amount}.",
+                f"❌ **{user.display_name}** only has **{pending}** {config.UNO_CHIP_EMOJI} pending — cannot deduct {amount}.",
                 ephemeral=True)
             return
 
         await interaction.followup.send(
-            f"✅ Deducted **{amount}**{config.UNO_CHIP_EMOJI} from **{user.mention}**'s pending cashouts.",
+            f"✅ Deducted **{amount}** {config.UNO_CHIP_EMOJI} from **{user.mention}**'s pending cashouts.",
             allowed_mentions=discord.AllowedMentions(users=True))
 
     @unoset.command(name="managerrole", description="[Admin] Set the UNO Manager role")
@@ -2806,10 +2871,10 @@ class UnoGame(commands.Cog):
         total = avail + pending + in_play
 
         embed = discord.Embed(title="🃏 UNO Economy Dashboard", color=0x2ecc71)
-        embed.add_field(name="Available in Wallets", value=f"{avail:,}{config.UNO_CHIP_EMOJI}", inline=False)
-        embed.add_field(name="Locked Pending Cashouts", value=f"{pending:,}{config.UNO_CHIP_EMOJI}", inline=False)
-        embed.add_field(name="Currently at Tables", value=f"{in_play:,}{config.UNO_CHIP_EMOJI}", inline=False)
-        embed.add_field(name="Total Circulation", value=f"**{total:,}**{config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Available in Wallets", value=f"{avail:,} {config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Locked Pending Cashouts", value=f"{pending:,} {config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Currently at Tables", value=f"{in_play:,} {config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Total Circulation", value=f"**{total:,}** {config.UNO_CHIP_EMOJI}", inline=False)
 
         await interaction.followup.send(embed=embed)
 
@@ -2823,10 +2888,10 @@ class UnoGame(commands.Cog):
         stats = await db.get_revenue_stats()
 
         embed = discord.Embed(title="📈 UNO House Revenue (Inactivity Tax)", color=0xf1c40f)
-        embed.add_field(name="Past 24 Hours", value=f"{stats['daily']:,}{config.UNO_CHIP_EMOJI}", inline=True)
-        embed.add_field(name="Past 7 Days", value=f"{stats['weekly']:,}{config.UNO_CHIP_EMOJI}", inline=True)
-        embed.add_field(name="Past 30 Days", value=f"{stats['monthly']:,}{config.UNO_CHIP_EMOJI}", inline=True)
-        embed.add_field(name="All-Time Profit", value=f"**{stats['all_time']:,}**{config.UNO_CHIP_EMOJI}", inline=False)
+        embed.add_field(name="Past 24 Hours", value=f"{stats['daily']:,} {config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Past 7 Days", value=f"{stats['weekly']:,} {config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Past 30 Days", value=f"{stats['monthly']:,} {config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="All-Time Profit", value=f"**{stats['all_time']:,} **{config.UNO_CHIP_EMOJI}", inline=False)
 
         await interaction.followup.send(embed=embed)
 
@@ -2838,7 +2903,7 @@ class UnoGame(commands.Cog):
             return
         await interaction.response.defer(ephemeral=False)
         await db.log_house_revenue(amount, source="adjustment")
-        await interaction.followup.send(f"✅ Adjusted all-time UNO revenue by **{amount:+,}**{config.UNO_CHIP_EMOJI}.")
+        await interaction.followup.send(f"✅ Adjusted all-time UNO revenue by **{amount:+,}** {config.UNO_CHIP_EMOJI}.")
 
     @unoadmin.command(name="salt", description="[Admin] View daily UNO house profits in a monthly calendar layout")
     @app_commands.describe(month="YYYY-MM format (e.g. 2026-07) - defaults to current month")
@@ -3075,11 +3140,180 @@ class UnoGame(commands.Cog):
             log.exception("UNO backup failed")
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
+    @unoadmin.command(name="resetdb", description="[Admin] Wipe ALL UNO data from the database")
+    async def reset_db(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True)
+            return
+        view = UnoConfirmResetView1(interaction.user.id)
+        await interaction.response.send_message(
+            "⚠️ **This will permanently delete all UNO wallets, stats, logs and settings.**\nAre you sure?",
+            view=view, ephemeral=True)
+
+    @unoadmin.command(name="set_activity", description="[Dev] Change a player's UNO last_activity timestamp")
+    @app_commands.describe(user="The player to modify",
+                            timestamp="Discord timestamp (e.g. <t:1716388800:R>) or raw Unix epoch")
+    async def set_activity(self, interaction: discord.Interaction, user: discord.Member, timestamp: str):
+        if interaction.user.id not in config.DEV_USER_IDS:
+            await interaction.response.send_message("❌ Access Denied. Devs only.", ephemeral=True)
+            return
+
+        import re
+        match = re.search(r"<t:(\d+)", timestamp)
+        if match:
+            unix_ts = int(match.group(1))
+        elif timestamp.isdigit():
+            unix_ts = int(timestamp)
+        else:
+            await interaction.response.send_message(
+                "❌ Invalid format. Use a Discord timestamp like `<t:1716388800>` or a raw Unix epoch.",
+                ephemeral=True)
+            return
+
+        try:
+            new_iso = datetime.utcfromtimestamp(unix_ts).isoformat()
+        except (ValueError, OSError, OverflowError) as e:
+            await interaction.response.send_message(f"❌ Failed to parse date: {e}", ephemeral=True)
+            return
+
+        conn = await db._get_db()
+        try:
+            async with db._write_lock:
+                await conn.execute("UPDATE wallets SET last_activity = ? WHERE user_id = ?", (new_iso, user.id))
+                await conn.commit()
+            await interaction.response.send_message(
+                f"✅ Backdated **{user.display_name}**'s UNO activity to <t:{unix_ts}:F>!\n"
+                f"*(Saved as:* `{new_iso}`*)*", ephemeral=True)
+        except Exception as e:
+            log.exception("set_activity failed")
+            await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
+
+    @unoadmin.command(name="check_inactive", description="[Admin] Check who will be wiped soon")
+    async def check_inactive(self, interaction: discord.Interaction):
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        at_risk = await db.get_players_at_risk()
+        inactive = await db.get_inactive_players()
+
+        embed = discord.Embed(title="🔍 UNO Inactivity Report", color=0xe74c3c)
+
+        if at_risk:
+            risk_lines = [
+                f"• **{p['username']}**: {p['balance']} chips ({p.get('days_inactive', 0)}d ago, {p['recent_rounds']} rounds)"
+                for p in at_risk[:15]
+            ]
+            embed.add_field(name=f"⚠️ At Risk - Wiping in <24h ({len(at_risk)} players)",
+                             value="\n".join(risk_lines), inline=False)
+
+        if inactive:
+            inactive_lines = [
+                f"• **{p['username']}**: {p['balance']} chips ({p.get('days_inactive', 0)}d ago, {p['recent_rounds']} rounds)"
+                for p in inactive[:10]
+            ]
+            embed.add_field(name=f"💀 Will Be Wiped Next Run ({len(inactive)} players)",
+                             value="\n".join(inactive_lines), inline=False)
+
+        if not at_risk and not inactive:
+            embed.description = "✅ All players are active! No chips will be wiped."
+
+        await interaction.followup.send(embed=embed)
+
+    @unoadmin.command(name="force_wipe_inactive_players", description="[Admin] Manually trigger UNO inactivity wipe NOW")
+    async def force_wipe(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        wiped = await db.wipe_inactive_players()
+        if not wiped:
+            await interaction.followup.send("✅ No inactive players found. Nothing to wipe!")
+            return
+
+        summary = "\n".join(
+            f"• **{w['username']}**: {w['amount_wiped']} chips "
+            f"(rounds: {w['recent_rounds']}, wagered: {w['recent_chips_wagered']})"
+            for w in wiped[:20]
+        )
+        await interaction.followup.send(f"🧹 **Wiped {len(wiped)} inactive UNO player(s):**\n{summary}")
+
     # ── Player-facing stats/leaderboard ─────────────────────────────────────
     # Note: poker's /poker leaderboard renders a PIL/Twemoji graphic
     # (poker/leaderboard_image.py) that depends on bundled font + emoji PNG
     # assets. Those assets aren't part of this port, so these render as
     # plain embeds instead — same underlying data/ranking, simpler display.
+
+    @uno.command(name="wallet", description="Check your UNO chip wallet balance")
+    @app_commands.describe(user="Player to check (leave blank for yourself)")
+    async def wallet(self, interaction: discord.Interaction, user: discord.Member = None):
+        await interaction.response.defer(ephemeral=False)
+        target = user or interaction.user
+        bal, pending = await db.get_wallet(target.id)
+
+        session = self.sessions.get(interaction.channel_id)
+        table_str = ""
+        if session and session.started and session.engine and target.id in session.engine.bets:
+            table_str = f"\n**At table:** {session.engine.bets[target.id]} {config.UNO_CHIP_EMOJI}"
+        pending_str = f"\n**Pending Cashout:** 🔒 {pending} {config.UNO_CHIP_EMOJI}" if pending > 0 else ""
+
+        label = f"**{target.display_name}'s UNO Wallet**" if user else "**Your UNO Wallet**"
+        await interaction.followup.send(f"{label}: {bal} {config.UNO_CHIP_EMOJI}{table_str}{pending_str}", ephemeral=False)
+
+    @uno.command(name="myactivity", description="Check your UNO activity status and wipe risk")
+    @app_commands.describe(user="Player to check (Admins/Devs only, leave blank for yourself)")
+    async def myactivity(self, interaction: discord.Interaction, user: discord.Member = None):
+        target = user or interaction.user
+        if target.id != interaction.user.id:
+            if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+                await interaction.response.send_message(
+                    "❌ Only Administrators or Devs can check other players' activity.", ephemeral=True)
+                return
+
+        await interaction.response.defer(ephemeral=True)
+        stats = await db.get_player_activity_stats(target.id)
+        if not stats:
+            name_str = "You don't" if target.id == interaction.user.id else f"**{target.display_name}** doesn't"
+            await interaction.followup.send(f"❌ {name_str} have a UNO wallet yet!", ephemeral=True)
+            return
+
+        last_active = datetime.fromisoformat(stats["last_activity"]).replace(tzinfo=_tz.utc)
+        exact_expiration = last_active + timedelta(days=config.UNO_INACTIVITY_DAYS)
+        # Snap to the next scheduled UNO wipe run (03:45 UTC)
+        if exact_expiration.hour < 3 or (exact_expiration.hour == 3 and exact_expiration.minute <= 45):
+            wipe_date = exact_expiration.replace(hour=3, minute=45, second=0, microsecond=0)
+        else:
+            wipe_date = (exact_expiration + timedelta(days=1)).replace(hour=3, minute=45, second=0, microsecond=0)
+        wipe_timestamp = int(wipe_date.timestamp())
+
+        embed = discord.Embed(title=f"📊 UNO Activity Status: {stats['username']}", color=0x3498db)
+        total_chips = stats["balance"] + stats["pending_cashout"]
+        embed.add_field(name="💰 Total Chips", value=f"{total_chips:,} chips", inline=True)
+        embed.add_field(name="📅 Last Active", value=f"<t:{int(last_active.timestamp())}:R>", inline=True)
+        if stats["days_until_wipe"] > 0:
+            embed.add_field(name="⏰ Chips Wiped", value=f"<t:{wipe_timestamp}:R>", inline=True)
+        else:
+            embed.add_field(name="⏰ Chips Wiped", value="**Next cleanup run!**", inline=True)
+
+        def progress_bar(current: int, required: int, length: int = 10) -> str:
+            filled = min(int((current / max(required, 1)) * length), length)
+            done = "🟩" * filled
+            empty = "⬜" * (length - filled)
+            pct = min(int((current / max(required, 1)) * 100), 100)
+            return f"{done}{empty}  **{current}/{required}** ({pct}%)"
+
+        rounds_bar = progress_bar(stats["recent_rounds"], config.UNO_MIN_ROUNDS_PER_PERIOD)
+        rounds_status = "✅" if stats["meets_rounds_requirement"] else "❌"
+        embed.add_field(name=f"🃏 Rounds Played {rounds_status}", value=rounds_bar, inline=False)
+
+        if config.UNO_MIN_CHIPS_WAGERED > 0:
+            wager_bar = progress_bar(stats["recent_chips_wagered"], config.UNO_MIN_CHIPS_WAGERED)
+            wager_status = "✅" if stats["meets_wager_requirement"] else "❌"
+            embed.add_field(name=f"💵 Chips Wagered {wager_status}", value=wager_bar, inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @uno.command(name="stats", description="View your UNO stats")
     @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
@@ -3103,8 +3337,8 @@ class UnoGame(commands.Cog):
         embed.add_field(name="Rank", value=rank_str, inline=True)
         embed.add_field(name="Rounds Played", value=str(row["rounds_played"]), inline=True)
         embed.add_field(name="Win %", value=wp, inline=True)
-        embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,}{config.UNO_CHIP_EMOJI}", inline=True)
-        embed.add_field(name="Wallet Balance", value=f"{row['wallet']:,}{config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,} {config.UNO_CHIP_EMOJI}", inline=True)
+        embed.add_field(name="Wallet Balance", value=f"{row['wallet']:,} {config.UNO_CHIP_EMOJI}", inline=True)
         if row.get("times_wiped", 0) > 0:
             embed.add_field(name="Times Wiped", value=str(row["times_wiped"]), inline=True)
 
@@ -3126,7 +3360,7 @@ class UnoGame(commands.Cog):
             net = r["net_chips"]
             lines.append(
                 f"{PLACEMENT_EMOJI.get(i, f'`#{i+1}`')} <@{r['user_id']}> — "
-                f"**{'+' if net >= 0 else ''}{net:,}**{config.UNO_CHIP_EMOJI}"
+                f"**{'+' if net >= 0 else ''}{net:,} **{config.UNO_CHIP_EMOJI}"
             )
         embed = discord.Embed(title="🃏 UNO Leaderboard", description="\n".join(lines), color=0xF1C40F)
         if caller_row and caller_rank and caller_rank > 10:
@@ -3148,7 +3382,7 @@ class UnoGame(commands.Cog):
         bal, _ = await db.get_wallet(interaction.user.id)
         if chips > bal:
             await interaction.followup.send(
-                f"❌ You only have **{bal}**{config.UNO_CHIP_EMOJI} available. "
+                f"❌ You only have **{bal} **{config.UNO_CHIP_EMOJI} available. "
                 f"(Chips currently on a table aren't cashable until it settles.)", ephemeral=True)
             return
 
@@ -3167,7 +3401,7 @@ class UnoGame(commands.Cog):
                     # Format mirrors poker's cashout ticket exactly — same
                     # regex-based ✅-reaction payout handler in bot.py reads
                     # both, keyed only by which channel the reaction fired in.
-                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips}{config.UNO_CHIP_EMOJI}"
+                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} {config.UNO_CHIP_EMOJI}"
                     if note:
                         ticket_msg += f"\n**Notes:** {note}"
                     ticket = await ch.send(ticket_msg)
@@ -3176,7 +3410,7 @@ class UnoGame(commands.Cog):
                 log.exception("Failed to post UNO cashout ticket")
 
         await interaction.followup.send(
-            f"✅ Locked **{chips}**{config.UNO_CHIP_EMOJI} for cashout. Staff have been notified — "
+            f"✅ Locked **{chips}** {config.UNO_CHIP_EMOJI} for cashout. Staff have been notified — "
             f"react ✅ on the ticket to mark it paid.", ephemeral=True)
 
     @uno.command(name="currencylog", description="View recent UNO chip transactions")
@@ -3303,7 +3537,7 @@ class UnoGame(commands.Cog):
         container.add_item(
             TextDisplay(
                 "### <a:bay_alarm:1536288829248512030>️ Turn Timer / AFK\n"
-                "Each turn has a configurable timeout. **120 seconds by default.**\n"
+                "Each turn has a configurable timeout. **45 seconds by default.**\n"
                 "If the timer expires, the bot automatically makes you draw a card.\n"
                 "Consecutive AFK timeouts can result in removal from the game."
             )

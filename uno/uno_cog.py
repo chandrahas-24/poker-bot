@@ -77,7 +77,7 @@ import config
 from pathlib import Path
 from datetime import datetime, timedelta, timezone as _tz
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord.ui import (
     Container, TextDisplay, Section, Thumbnail, Separator, ActionRow, Button, MediaGallery,
 )
@@ -199,7 +199,7 @@ COLOR_TO_DISCORD = {
     "Blue": discord.Color.blue(),
 }
 
-PLACEMENT_EMOJI = {0: "<:uno_1:1536286536218443837>", 1: "<:uno_2:1536286641768108065>", 2: "<:uno_3:1536286708331446282>"}
+PLACEMENT_EMOJI = config.PLACEMENT_EMOJI
 
 MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT = 2, 20
 MIN_DECKS, MAX_DECKS = 1, 6
@@ -1626,6 +1626,8 @@ class UnoGame(commands.Cog):
         self._load_card_image_cache()
         self._thumb_bytes_cache: dict[str, bytes] = {}  # card_name -> pre-encoded padded PNG bytes
 
+        self._flush_turn_log.start()
+
     def _track_view(self, view: discord.ui.View):
         self._active_views.add(view)
 
@@ -1684,6 +1686,20 @@ class UnoGame(commands.Cog):
                 except Exception:
                     log.exception("Failed to checkpoint channel %s during cog_unload", session.channel_id)
 
+        self._flush_turn_log.cancel()
+        # One last drain so events since the final periodic flush aren't
+        # silently dropped on a reload — same reasoning as the checkpoint
+        # save just above.
+        all_events = []
+        for session in list(self.sessions.values()):
+            if session.started and session.engine:
+                all_events.extend(session.engine.pop_turn_events())
+        if all_events:
+            try:
+                await db.log_turn_events_bulk(all_events)
+            except Exception:
+                log.exception("Failed to flush final UNO turn log batch during cog_unload")
+
         for view in list(self._active_views):
             try:
                 view.stop()
@@ -1692,6 +1708,28 @@ class UnoGame(commands.Cog):
 
         self.sessions.clear()
         log.info("UnoGame cog unloaded — timers cancelled, views stopped, sessions checkpointed and cleared.")
+
+    @tasks.loop(seconds=5)
+    async def _flush_turn_log(self):
+        """The actual batching: instead of a DB write (and disk fsync) per
+        play/draw/pass across however many tables are live, drain every
+        active engine's buffered turn_events every 5 seconds and write
+        them all in ONE transaction. A round's own settlement also does a
+        final drain (see announce_and_cleanup) so nothing waits a full
+        cycle to land once the round's actually over."""
+        all_events = []
+        for session in list(self.sessions.values()):
+            if session.started and session.engine:
+                all_events.extend(session.engine.pop_turn_events())
+        if all_events:
+            try:
+                await db.log_turn_events_bulk(all_events)
+            except Exception:
+                log.exception("Failed to flush UNO turn log batch (%d events)", len(all_events))
+
+    @_flush_turn_log.before_loop
+    async def _before_flush_turn_log(self):
+        await self.bot.wait_until_ready()
 
     def _load_card_image_cache(self):
         if not os.path.isdir(card_assets.CARDS_DIR):
@@ -1965,7 +2003,11 @@ class UnoGame(commands.Cog):
                             gross_payout[pid] += amt
 
             tax_rate = config.UNO_WINNERS_TAX_RATE
+            placements = {pid: i + 1 for i, pid in enumerate(engine.finishers)}
+            round_players = []
+            total_tax = 0
             for pid in engine.bets:
+                name = engine.all_names.get(pid, str(pid))
                 gross = gross_payout.get(pid, 0)
                 bet = engine.bets[pid]
                 net = gross - bet
@@ -1974,14 +2016,14 @@ class UnoGame(commands.Cog):
 
                 if credited > 0:
                     await db.add_chips(
-                        self.bot.user.id, "UNO Pot", pid, engine.all_names.get(pid, str(pid)),
+                        self.bot.user.id, "UNO Pot", pid, name,
                         credited, note="UNO pot win" if net > 0 else "UNO pot refund",
                     )
                 await db.clear_chips_in_play(pid)
 
                 net_after_tax = net - tax
                 await db.record_round_result(
-                    pid, engine.all_names.get(pid, str(pid)), won=net_after_tax > 0,
+                    pid, name, won=net_after_tax > 0,
                     net_chips=net_after_tax, chips_wagered=bet,
                 )
                 await db.log_currency_event(
@@ -1990,9 +2032,47 @@ class UnoGame(commands.Cog):
                 )
                 if tax > 0:
                     await db.log_house_revenue(tax, source="winners_tax")
+                    total_tax += tax
+
+                round_players.append({
+                    "user_id": pid, "username": name, "bet": bet, "gross": gross,
+                    "tax": tax, "net": net_after_tax, "placement": placements.get(pid),
+                    "won": net_after_tax > 0,
+                })
 
                 sign = "+" if net_after_tax >= 0 else ""
                 net_lines.append(f"{_mention(pid)} **{sign}{net_after_tax}** {config.UNO_CHIP_EMOJI}")
+
+            winner_pid = engine.finishers[0] if engine.finishers else None
+            await db.log_round(
+                engine.round_uuid, session.guild_id, session.channel_id, len(engine.bets), engine.num_decks,
+                sum(engine.bets.values()), total_tax, winner_pid,
+                engine.all_names.get(winner_pid) if winner_pid else None, round_players,
+            )
+            # Catch anything played since the last periodic flush so the
+            # full turn-by-turn log is complete before the session (and
+            # its engine, along with any unflushed events still sitting on
+            # it) gets torn down a few lines below.
+            await db.log_turn_events_bulk(engine.pop_turn_events())
+
+            settings = await db.get_settings(session.guild_id)
+            log_channel_id = settings.get("log_channel_id")
+            if log_channel_id:
+                log_channel = self.bot.get_channel(int(log_channel_id))
+                if log_channel:
+                    rows = "\n".join(
+                        f"{p['username'][:14]:<14} bet:{p['bet']:<6} gross:{p['gross']:<6} "
+                        f"tax:{p['tax']:<4} net:{'+' if p['net'] >= 0 else ''}{p['net']}"
+                        for p in round_players
+                    )
+                    try:
+                        await log_channel.send(
+                            f"**UNO round** — #{getattr(channel, 'name', session.channel_id)} — "
+                            f"{len(round_players)}p, pot {sum(engine.bets.values())}{config.UNO_CHIP_EMOJI}, "
+                            f"tax {total_tax}\n```\n{rows}\n```"
+                        )
+                    except discord.HTTPException:
+                        pass
 
         if not engine.finishers:
             await channel.send(
@@ -2651,7 +2731,7 @@ class UnoGame(commands.Cog):
                 await interaction.response.send_message("That user isn't an active player.", ephemeral=True)
                 return
             name = player.name
-            engine.remove_player(target_id)
+            engine.remove_player(target_id, reason="kicked")
             # Not setting session.last_action — the send_message right below
             # is already the public announcement, and refresh_table (called
             # a few lines down) used to repost a whole new table whose
@@ -2703,7 +2783,7 @@ class UnoGame(commands.Cog):
             if engine.player_by_id(target_id) is None:
                 await interaction.response.send_message("You're not an active player in this game.", ephemeral=True)
                 return
-            engine.remove_player(target_id)
+            engine.remove_player(target_id, reason="left")
             # Same reasoning as /uno kick — don't duplicate the message below
             # as the next table headline too.
             await interaction.response.send_message(f"{_mention(target_id)} left the game.", ephemeral=False)
@@ -2856,6 +2936,16 @@ class UnoGame(commands.Cog):
         await interaction.response.defer(ephemeral=False)
         await db.set_settings(interaction.guild_id, manager_role_id=role.id)
         await interaction.followup.send(f"✅ UNO Manager role: **{role.name}**")
+
+    @unoset.command(name="logchannel", description="[Admin] Set where UNO round summaries get posted")
+    @app_commands.describe(channel="Channel for round-by-round summaries (also always saved to the DB regardless)")
+    async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        await db.set_settings(interaction.guild_id, log_channel_id=channel.id)
+        await interaction.followup.send(f"✅ UNO round log channel: {channel.mention}")
 
     # ── Admin/dev economy commands ──────────────────────────────────────────
 
@@ -3593,7 +3683,7 @@ class UnoGame(commands.Cog):
             async with session.lock:
                 if session.engine.player_by_id(user_id) is None:
                     continue
-                session.engine.remove_player(user_id)
+                session.engine.remove_player(user_id, reason="left_guild")
 
                 channel = self.bot.get_channel(session.channel_id)
                 if channel:

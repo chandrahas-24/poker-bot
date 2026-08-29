@@ -15,6 +15,9 @@ This is an original implementation written for this project.
 from __future__ import annotations
 import random
 import re
+import json
+import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -253,6 +256,21 @@ class GameState:
         self.wild_draw4_challenge = wild_draw4_challenge
         self.target_winners = max(1, min(target_winners, len(players) - 1))
 
+        # Identifies this round across turn_log/round_log rows in the DB —
+        # generated once here (not by the cog) so it's stable even across a
+        # crash+resume reload (see from_dict, which restores it instead of
+        # regenerating). The cog never sees a "round" until this object
+        # exists, so this is the one place that can hand out the id.
+        self.round_uuid: str = str(uuid.uuid4())
+        # Full per-turn action log — batched, not written to the DB by this
+        # class (pure game logic, no DB access). The cog layer drains this
+        # periodically via pop_turn_events(). Ephemeral: NOT persisted in
+        # to_dict/from_dict, so a crash between flushes loses at most a few
+        # seconds of turn-log rows — acceptable for analytics-only data,
+        # same trade-off documented for the economy write path elsewhere.
+        self.turn_events: list[dict] = []
+        self._turn_counter: int = 0
+
         bets = bets or {}
         adjusted_bets, self.starting_refunds = self._trim_uncontested_excess(dict(bets))
         # starting_refunds: {pid: amount} — the caller (cog layer) is
@@ -302,6 +320,35 @@ class GameState:
             self.current_index = self._offset(2)
             self.draw2_chain_count = 1  # so an immediate follow-up +2 correctly continues the chain at 4, not restarts at 2
 
+        self._log_event("deal", 0, "table", card=first,
+                         extra={"num_players": len(self.players), "hand_size": hand_size})
+
+    # ---------- turn log (replay/analytics — see turn_events above) ----------
+
+    def _log_event(self, action: str, player_id: int, player_name: str, card: str = None,
+                    chosen_color: str = None, hand_size_after: int = None, extra: dict = None):
+        self._turn_counter += 1
+        self.turn_events.append({
+            "round_uuid": self.round_uuid,
+            "turn_num": self._turn_counter,
+            "ts": datetime.utcnow().isoformat(),
+            "user_id": player_id,
+            "username": player_name,
+            "action": action,
+            "card": card,
+            "chosen_color": chosen_color,
+            "hand_size_after": hand_size_after,
+            "direction": self.direction,
+            "extra": json.dumps(extra) if extra else None,
+        })
+
+    def pop_turn_events(self) -> list[dict]:
+        """Drains and returns everything buffered since the last call —
+        the cog's batching flush task calls this, never reads turn_events
+        directly, so a flush can never race a concurrent append."""
+        events, self.turn_events = self.turn_events, []
+        return events
+
     # ---------- persistence ----------
 
     def to_dict(self):
@@ -330,6 +377,8 @@ class GameState:
             "left_early": list(self.left_early),
             "side_pots": [dict(sp) for sp in self.side_pots],
             "pot_results": [[amt, list(winners)] for amt, winners in self.pot_results],
+            "round_uuid": self.round_uuid,
+            "turn_counter": self._turn_counter,
         }
 
     @classmethod
@@ -438,6 +487,9 @@ class GameState:
             self.side_pots.append(sp)
         self.pot_results = [(amt, list(winners)) for amt, winners in d.get("pot_results", [])]
         self.starting_refunds = {}  # one-time construction artifact — already processed by the cog layer, nothing to redo on reload
+        self.round_uuid = d.get("round_uuid") or str(uuid.uuid4())  # fallback covers saves written before this field existed
+        self._turn_counter = d.get("turn_counter", 0)
+        self.turn_events = []  # buffer is ephemeral, never persisted — see the comment on __init__'s definition
         return self
 
     # ---------- helpers ----------
@@ -541,21 +593,26 @@ class GameState:
                    "drawn": drawn, "kicked": kicked}
 
         if kicked:
-            self.remove_player(player.player_id)
+            self._log_event("afk_draw", player.player_id, player.name, card=drawn, extra={"kicked": True})
+            self.remove_player(player.player_id, reason="afk_kick")
             self.last_summary = f"{player.name} was AFK too long and was removed from the game."
         else:
             self.current_index = self._offset(1)
             self.last_summary = f"{player.name} was AFK and auto-drew a card."
+            self._log_event("afk_draw", player.player_id, player.name, card=drawn,
+                             hand_size_after=len(player.hand), extra={"kicked": False})
 
         self._check_win()
         return result
 
     # ---------- player join/leave ----------
 
-    def remove_player(self, player_id: int):
+    def remove_player(self, player_id: int, reason: str = "removed"):
         """
         Removes a player entirely (AFK kick, left guild, banned, etc).
-        Their hand is shuffled back into the draw pile.
+        Their hand is shuffled back into the draw pile. `reason` is purely
+        for the turn log (see turn_events) — "afk_kick", "kicked",
+        "left_guild", etc — and doesn't affect game logic at all.
 
         Turn order is resolved by identity, not index arithmetic: before
         mutating the list we figure out WHICH player should hold the turn
@@ -610,6 +667,7 @@ class GameState:
             next_player_id = self.current_player().player_id
 
         del self.players[idx]
+        self._log_event("remove", player_id, leaving.name, extra={"reason": reason})
 
         if not self.players:
             self.finished = True
@@ -668,6 +726,8 @@ class GameState:
                 self._post_play_uno_check(player, declare_uno)
                 self._check_win()
                 self.last_summary = f"{player.name} played {card} — waiting on color choice."
+                self._log_event("play", player_id, player.name, card=card,
+                                 hand_size_after=len(player.hand), extra={"color_pending": True})
                 return effects
             self._apply_wild_color(card, chosen_color, player, effects)
         else:
@@ -676,6 +736,8 @@ class GameState:
 
         self._post_play_uno_check(player, declare_uno)
         self._check_win()
+        self._log_event("play", player_id, player.name, card=card, chosen_color=chosen_color,
+                         hand_size_after=len(player.hand), extra={k: v for k, v in effects.items() if k not in ("card", "player_id")})
         self.last_summary = f"{player.name} played {card}."
         return effects
 
@@ -698,6 +760,9 @@ class GameState:
         self._apply_wild_color(card, color, player, effects)
         self._check_win()
         self.last_summary = f"{player.name} chose {color}."
+        self._log_event("choose_color", player_id, player.name, card=card, chosen_color=color,
+                         hand_size_after=len(player.hand),
+                         extra={k: v for k, v in effects.items() if k not in ("card", "player_id")})
         return effects
 
     def _apply_wild_color(self, card: str, color: str, player: Player, effects: dict):
@@ -747,6 +812,7 @@ class GameState:
         self.current_index = self._offset(2)  # skip the target, move to the player after them
         self.last_summary = f"{target.name} accepted the Wild Draw Four and drew 4 cards."
         self._check_win()
+        self._log_event("accept_wd4", target_id, target.name, hand_size_after=len(target.hand), extra={"n": 4})
         return {"target_id": target_id, "n": 4, "success": None}
 
     def challenge_wild_draw4(self, target_id: int) -> dict:
@@ -785,6 +851,7 @@ class GameState:
             result = {"target_id": target_id, "success": False, "penalty_to": target_id, "n": 6}
 
         self._check_win()
+        self._log_event("challenge_wd4", target_id, target.name, hand_size_after=len(target.hand), extra=result)
         return result
 
     def _apply_value_effects(self, card: str, player: Player, effects: dict):
@@ -851,7 +918,10 @@ class GameState:
         self.draw2_chain_count = 0  # voluntarily drawing instead of playing a Draw_2 breaks the chain
         self.last_summary = f"{player.name} drew a card."
 
-        return {"player_id": player_id, "drawn": card, "still_playable": self.is_legal(player, card)}
+        still_playable = self.is_legal(player, card)
+        self._log_event("draw", player_id, player.name, card=card,
+                         hand_size_after=len(player.hand), extra={"still_playable": still_playable})
+        return {"player_id": player_id, "drawn": card, "still_playable": still_playable}
 
     def pass_turn(self, player_id: int):
         player = self.current_player()
@@ -860,6 +930,7 @@ class GameState:
         if self.pending_wd4_challenge:
             raise IllegalCard("Waiting on the targeted player to accept or challenge the Wild Draw Four")
         self.current_index = self._offset(1)
+        self._log_event("pass", player_id, player.name, hand_size_after=len(player.hand))
 
     # ---------- uno callout ----------
 
@@ -870,6 +941,7 @@ class GameState:
         if len(player.hand) == 1:
             player.said_uno = True
             self.callout_window = None
+            self._log_event("call_uno", player_id, player.name, hand_size_after=1)
 
     def uncall_uno(self, player_id: int):
         """Reverses call_uno — lets a player un-toggle their UNO declaration
@@ -880,6 +952,7 @@ class GameState:
         if len(player.hand) == 1:
             player.said_uno = False
             self.callout_window = player.player_id
+            self._log_event("uncall_uno", player_id, player.name, hand_size_after=1)
 
     def _post_play_uno_check(self, player: Player, declared: bool):
         if len(player.hand) == 1:
@@ -916,6 +989,10 @@ class GameState:
         if len(target.hand) == 1 and not target.said_uno:
             self._force_draw(target, penalty)
             self.callout_window = None
+            accuser = self.player_by_id(accuser_id)
+            self._log_event("challenge_uno", accuser_id, accuser.name if accuser else str(accuser_id),
+                             hand_size_after=len(target.hand),
+                             extra={"target_id": target_id, "success": True, "n": penalty})
             return True
         return False
 
@@ -937,15 +1014,19 @@ class GameState:
             p for p in self.players
             if p.player_id != accuser_id and len(p.hand) == 1 and not p.said_uno
         ]
+        accuser = self.player_by_id(accuser_id)
 
         if caught:
             for p in caught:
                 self._force_draw(p, penalty)
             self.callout_window = None
+            self._log_event("challenge_uno_auto", accuser_id, accuser.name,
+                             extra={"caught": [p.player_id for p in caught], "penalty_to_accuser": False, "n": penalty})
             return {"caught": [p.player_id for p in caught], "penalty_to_accuser": False, "n": penalty}
 
-        accuser = self.player_by_id(accuser_id)
         self._force_draw(accuser, penalty)
+        self._log_event("challenge_uno_auto", accuser_id, accuser.name, hand_size_after=len(accuser.hand),
+                         extra={"caught": [], "penalty_to_accuser": True, "n": penalty})
         return {"caught": [], "penalty_to_accuser": True, "n": penalty}
 
     # ---------- win check ----------
@@ -996,6 +1077,8 @@ class GameState:
             for p in list(self.players):
                 if len(p.hand) == 0 and p.player_id not in self.finishers:
                     self.finishers.append(p.player_id)
+                    self._log_event("finish", p.player_id, p.name, hand_size_after=0,
+                                     extra={"placement": len(self.finishers)})
                     self._finish_player(p.player_id)
                     progressed = True
                     break

@@ -756,7 +756,7 @@ class PokerAICog(commands.Cog):
             self.sessions = {}
             bot.poker_ai_sessions = self.sessions
 
-    advtut = app_commands.Group(name="advtut", description="Poker Heads-Up vs Skymax")
+    advtut = app_commands.Group(name="advtut", description="Poker Heads-Up vs Skymax", guild_ids=[config.GUILD_ID])
 
     @advtut.command(name="start", description="Start a Heads-Up poker game against Skymax")
     async def create(self, interaction: discord.Interaction):

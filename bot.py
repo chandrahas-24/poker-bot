@@ -194,12 +194,11 @@ async def on_ready():
     YOUR_GUILD_ID = config.GUILD_ID
     if YOUR_GUILD_ID:
         guild = discord.Object(id=YOUR_GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         print(f"✅ Synced commands to guild {YOUR_GUILD_ID}")
 
     await bot.tree.sync()
-    print("✅ Synced commands globally")
+    print("✅ Synced global/user-install commands")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     daily_inactive_wipe.start()
@@ -593,6 +592,7 @@ async def global_channel_restriction(interaction: discord.Interaction) -> bool:
         "jackpot",
         "drawcards",
         "myactivity",
+        "changelog",
     }
 
     allowed_guild = config.GUILD_ID

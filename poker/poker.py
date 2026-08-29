@@ -3436,10 +3436,10 @@ class PokerCog(commands.Cog):
     async def before_daily_backup(self):
         await self.bot.wait_until_ready()
 
-    poker = app_commands.Group(name="poker", description="Texas Hold'em poker")
-    pokerset = app_commands.Group(name="pokerset", description="Configure poker settings")
-    pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands")
-    pokeradmin = app_commands.Group(name="pokeradmin", description="Poker economy and admin commands")
+    poker = app_commands.Group(name="poker", description="Texas Hold'em poker", guild_ids=[config.GUILD_ID])
+    pokerset = app_commands.Group(name="pokerset", description="Configure poker settings", guild_ids=[config.GUILD_ID])
+    pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands", guild_ids=[config.GUILD_ID])
+    pokeradmin = app_commands.Group(name="pokeradmin", description="Poker economy and admin commands", guild_ids=[config.GUILD_ID])
 
     @poker.command(name="ping", description="Check the bot's latency")
     async def ping(self, interaction: discord.Interaction):

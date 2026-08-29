@@ -555,8 +555,8 @@ class TournamentCog(commands.Cog):
     async def before_enforcer(self):
         await self.bot.wait_until_ready()
 
-    tourney      = app_commands.Group(name="tourney",      description="Tournament player commands")
-    tourneymgr   = app_commands.Group(name="tourneymgr",   description="Tournament manager commands")
+    tourney      = app_commands.Group(name="tourney",      description="Tournament player commands", guild_ids=[config.GUILD_ID])
+    tourneymgr   = app_commands.Group(name="tourneymgr",   description="Tournament manager commands", guild_ids=[config.GUILD_ID])
 
     async def is_manager(self, interaction: discord.Interaction) -> bool:
         settings = await db.get_settings(interaction.guild_id)

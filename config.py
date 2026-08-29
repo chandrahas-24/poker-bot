@@ -4,6 +4,8 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+DONATION_CONVERSION_ENABLED = True
+
 # Load the secret tokens from .env
 load_dotenv()
 

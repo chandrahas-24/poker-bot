@@ -197,9 +197,9 @@ async def on_ready():
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         print(f"✅ Synced commands to guild {YOUR_GUILD_ID}")
-    else:
-        await bot.tree.sync()
-        print("✅ Synced commands globally")
+
+    await bot.tree.sync()
+    print("✅ Synced commands globally")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     daily_inactive_wipe.start()
@@ -579,12 +579,24 @@ async def global_channel_restriction(interaction: discord.Interaction) -> bool:
     LOCKDOWN_CHANNELS = config.LOCKDOWN_CHANNELS
     RESTRICTED_CHANNELS = config.RESTRICTED_CHANNELS
 
+
     # qualified_name captures the full path: e.g., "poker start" or "tourneymgr setcycle"
-    cmd_name = interaction.command.qualified_name
+    command_name = (interaction.command.qualified_name
+        if interaction.command
+        else ""
+    )
     channel_id = interaction.channel_id
 
+    USER_INSTALL_COMMANDS = {
+        "stats",
+        "leaderboard",
+        "jackpot",
+        "drawcards",
+        "myactivity",
+    }
+
     allowed_guild = config.GUILD_ID
-    if allowed_guild and interaction.guild_id != allowed_guild:
+    if (allowed_guild and interaction.guild_id != allowed_guild and command_name not in USER_INSTALL_COMMANDS):
         await interaction.response.send_message(
             "❌ This bot is exclusively configured for another server.",
             ephemeral=True
@@ -602,14 +614,14 @@ async def global_channel_restriction(interaction: discord.Interaction) -> bool:
     # ─── WHITELIST CHANNELS (MGR + EXCEPTIONS ONLY) ───────────────────
     if channel_id in RESTRICTED_CHANNELS:
         # Automatically allow ANY command inside the tourneymgr slash group
-        is_manager_cmd = cmd_name.startswith("tourneymgr") or cmd_name.startswith("pokermgr")
+        is_manager_cmd = command_name.startswith("tourneymgr") or command_name.startswith("pokermgr")
 
         # Check if the exact subcommand path is in your allowed exceptions
-        is_allowed_exception = cmd_name in RESTRICTED_CHANNELS[channel_id]
+        is_allowed_exception = command_name in RESTRICTED_CHANNELS[channel_id]
 
         if not (is_manager_cmd or is_allowed_exception):
             await interaction.response.send_message(
-                f"❌ The command `{cmd_name}` cannot be used in this channel.",
+                f"❌ The command `{command_name}` cannot be used in this channel.",
                 ephemeral=True
             )
             return False

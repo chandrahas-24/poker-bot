@@ -5245,27 +5245,48 @@ class PokerCog(commands.Cog):
             traceback.print_exc()
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
-    @poker.command(name="testcards", description="[Dev] Generate a random 2-card hand to test image sizes")
-    async def test_cards(self, interaction: discord.Interaction):
-        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
-            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
-            return
-
-        # 1. Defer so the bot has time to process the image
+    @poker.command(
+        name="drawcards",
+        description="Draw cards to test image sizes"
+    )
+    @app_commands.describe(
+        number="Number of cards to draw",
+        infinite="Use a fresh deck for every card (Default: False)"
+    )
+    async def draw_cards(
+            self,
+            interaction: discord.Interaction,
+            number: app_commands.Range[int, 1, 10],
+            infinite: bool = False,
+    ):
         await interaction.response.defer(ephemeral=False)
 
         from treys import Deck
 
-        # 2. Draw 2 random cards
-        deck = Deck()
-        cards = deck.draw(2)
+        if infinite:
+            # Each card comes from its own fresh deck.
+            cards = []
+            for _ in range(number):
+                deck = Deck()
+                cards.extend(deck.draw(1))
+        else:
+            # All cards come from the same deck.
+            deck = Deck()
+            cards = deck.draw(number)
 
-        # 3. Stitch them using your image settings
-        # (Using asyncio.to_thread just like your real bot does to prevent lag)
-        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True)
+        file = await asyncio.to_thread(
+            card_images.make_strip,
+            cards,
+            0,
+            True
+        )
 
-        # 4. Send the result!
-        await interaction.followup.send(f"🃏 Test Hand: {hand_str(cards)}", file=file)
+        await interaction.followup.send(
+            f"🃏 Drew **{number}** card{'s' if number != 1 else ''}"
+            f"{' (infinite deck)' if infinite else ''}: "
+            f"\n {hand_str(cards)}",
+            file=file
+        )
 
     @poker.command(name="currencylog", description="View recent chip transactions")
     @app_commands.describe(minimum="Only show transactions with this many chips or more", user="Player to check (Admins/Devs only, leave blank for yourself)")
@@ -5562,6 +5583,55 @@ class PokerCog(commands.Cog):
         view = ChangelogView(caller=interaction.user,commits=commits,search=search,)
 
         await interaction.followup.send(view=view,ephemeral=True,)
+
+    # ── User-install top-level aliases ─────────────────────────────────────
+
+    @app_commands.command(name="stats", description="View your poker stats")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
+    async def user_stats(self, interaction: discord.Interaction, hidden: bool = False):
+        await self.stats.callback(self, interaction, hidden)
+
+    @app_commands.command(name="leaderboard", description="Top poker players by net chips")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def user_leaderboard(self, interaction: discord.Interaction):
+        await self.leaderboard.callback(self, interaction)
+
+    @app_commands.command(name="jackpot", description="View the current casino jackpot!")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def user_jackpot(self, interaction: discord.Interaction):
+        await self.jackpot_cmd.callback(self, interaction)
+
+    @app_commands.command(
+        name="drawcards",
+        description="Draw cards to test image sizes"
+    )
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(
+        guilds=True,
+        dms=True,
+        private_channels=True
+    )
+    @app_commands.describe(
+        number="Number of cards to draw",
+        infinite="Use a fresh deck for every card (Default: False)"
+    )
+    async def user_drawcards(
+            self,
+            interaction: discord.Interaction,
+            number: app_commands.Range[int, 1, 10],
+            infinite: bool = False,
+    ):
+        await self.draw_cards.callback(self, interaction, number, infinite)
+
+    @app_commands.command(name="myactivity", description="Check your poker activity status")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def user_myactivity(self, interaction: discord.Interaction):
+        await self.myactivity.callback(self, interaction)
 
 
 class StatsView(discord.ui.View):

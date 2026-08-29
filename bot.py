@@ -202,7 +202,9 @@ async def on_ready():
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     daily_inactive_wipe.start()
-    clear_donation_cache.start()
+
+    if config.DONATION_CONVERSION_ENABLED:
+        clear_donation_cache.start()
 
 
 _processed_donations = set()
@@ -212,126 +214,127 @@ async def clear_donation_cache():
     """Periodically clear the memory set to prevent slow memory leaks."""
     _processed_donations.clear()
 
-@bot.event
-async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
-    # ── 0. Prevent concurrent duplicate triggers ──
-    if payload.message_id in _processed_donations:
-        return
-
-    # ── 1. Channel filter — cheapest check, drop everything else immediately ──
-    if payload.channel_id not in config.ADD_CHIPS_CHANNELS:
-        return
-
-    # ── 2. Author filter — check raw payload before fetching the full message ──
-    author_id = int((payload.data.get("author") or {}).get("id", 0))
-    if author_id and author_id != DONATION_BOT_ID:
-        return  # Not Dank Memer, bail before any API call
-
-    # ── 3. Fetch full message (needed for Components v2 text + interaction_metadata) ──
-    channel = bot.get_channel(payload.channel_id)
-    if not channel:
-        return
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except discord.NotFound:
-        return
-
-    # Double-check author on the fetched message (author may have been absent in delta)
-    if message.author.id != DONATION_BOT_ID:
-        return
-
-    # ── 3.5. Ensure we haven't already processed this message (persistent check) ──
-    for reaction in message.reactions:
-        if reaction.me and str(reaction.emoji) == "✅":
+if config.DONATION_CONVERSION_ENABLED:
+    @bot.event
+    async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+        # ── 0. Prevent concurrent duplicate triggers ──
+        if payload.message_id in _processed_donations:
             return
 
-    # ── 4. Content filter — extract all text, look for the success phrase ──
-    def _extract_component_text(components: list) -> str:
-        """Recursively extract text from Components v2 nodes."""
-        out = ""
-        for c in components:
-            out += " " + (c.get("content") or "")       # type 10 Text Display
-            out += " " + (c.get("description") or "")   # type 9 Section
-            out += _extract_component_text(c.get("components") or [])
-            if c.get("accessory"):
-                out += _extract_component_text([c["accessory"]])
-        return out
+        # ── 1. Channel filter — cheapest check, drop everything else immediately ──
+        if payload.channel_id not in config.ADD_CHIPS_CHANNELS:
+            return
 
-    try:
-        raw = await bot.http.get_message(channel.id, message.id)
-    except Exception:
-        traceback.print_exc()
-        return
+        # ── 2. Author filter — check raw payload before fetching the full message ──
+        author_id = int((payload.data.get("author") or {}).get("id", 0))
+        if author_id and author_id != DONATION_BOT_ID:
+            return  # Not Dank Memer, bail before any API call
 
-    text = raw.get("content") or ""
-    for e in raw.get("embeds") or []:
-        text += " " + (e.get("title") or "")
-        text += " " + (e.get("description") or "")
-        for f in e.get("fields") or []:
-            text += " " + (f.get("name") or "")
-            text += " " + (f.get("value") or "")
-        text += " " + ((e.get("footer") or {}).get("text") or "")
-        text += " " + ((e.get("author") or {}).get("name") or "")
-    text += _extract_component_text(raw.get("components") or [])
+        # ── 3. Fetch full message (needed for Components v2 text + interaction_metadata) ──
+        channel = bot.get_channel(payload.channel_id)
+        if not channel:
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.NotFound:
+            return
 
-    if "Successfully donated" not in text:
-        return
+        # Double-check author on the fetched message (author may have been absent in delta)
+        if message.author.id != DONATION_BOT_ID:
+            return
 
-    # ── Lock the transaction IMMEDIATELY to prevent fast race conditions ──
-    if payload.message_id in _processed_donations:
-        return
-    _processed_donations.add(payload.message_id)
+        # ── 3.5. Ensure we haven't already processed this message (persistent check) ──
+        for reaction in message.reactions:
+            if reaction.me and str(reaction.emoji) == "✅":
+                return
 
-    # ── 5. Parse amount ───────────────────────────────────────────────────────
-    match = re.search(r"Successfully donated[^0-9]*([\d,]+)", text)
-    if not match:
-        print("[Donation] Regex found no amount — skipping")
-        # Unlock if it was a false positive so it can try again
-        _processed_donations.discard(payload.message_id)
-        return
+        # ── 4. Content filter — extract all text, look for the success phrase ──
+        def _extract_component_text(components: list) -> str:
+            """Recursively extract text from Components v2 nodes."""
+            out = ""
+            for c in components:
+                out += " " + (c.get("content") or "")       # type 10 Text Display
+                out += " " + (c.get("description") or "")   # type 9 Section
+                out += _extract_component_text(c.get("components") or [])
+                if c.get("accessory"):
+                    out += _extract_component_text([c["accessory"]])
+            return out
 
-    donated = int(match.group(1).replace(",", ""))
-    chips   = donated // CHIPS_PER_COIN  # floor division: 1.9M → 1 chip
+        try:
+            raw = await bot.http.get_message(channel.id, message.id)
+        except Exception:
+            traceback.print_exc()
+            return
 
-    if chips <= 0:
-        await message.reply(
-            f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
-            f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
-        )
-        return
+        text = raw.get("content") or ""
+        for e in raw.get("embeds") or []:
+            text += " " + (e.get("title") or "")
+            text += " " + (e.get("description") or "")
+            for f in e.get("fields") or []:
+                text += " " + (f.get("name") or "")
+                text += " " + (f.get("value") or "")
+            text += " " + ((e.get("footer") or {}).get("text") or "")
+            text += " " + ((e.get("author") or {}).get("name") or "")
+        text += _extract_component_text(raw.get("components") or [])
 
-    # ── 6. Resolve donor ─────────────────────────────────────────────────────
-    meta = getattr(message, "interaction_metadata", None)
-    user = getattr(meta, "user", None)
-    if user is None:
-        print(f"[Donation] No interaction_metadata on message {message.id} — skipping")
-        # Unlock if we couldn't resolve the user
-        _processed_donations.discard(payload.message_id)
-        return
+        if "Successfully donated" not in text:
+            return
 
-    if message.guild:
-        user = message.guild.get_member(user.id) or user
+        # ── Lock the transaction IMMEDIATELY to prevent fast race conditions ──
+        if payload.message_id in _processed_donations:
+            return
+        _processed_donations.add(payload.message_id)
 
-    # ── 7. Credit chips ───────────────────────────────────────────────────────
-    try:
-        new_bal = await db.add_chips(
-            bot.user.id,
-            bot.user.display_name,
-            user.id,
-            user.name,
-            chips,
-            "Dank Memer Donation Exchange",
-        )
-        await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+        # ── 5. Parse amount ───────────────────────────────────────────────────────
+        match = re.search(r"Successfully donated[^0-9]*([\d,]+)", text)
+        if not match:
+            print("[Donation] Regex found no amount — skipping")
+            # Unlock if it was a false positive so it can try again
+            _processed_donations.discard(payload.message_id)
+            return
 
-        print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
+        donated = int(match.group(1).replace(",", ""))
+        chips   = donated // CHIPS_PER_COIN  # floor division: 1.9M → 1 chip
 
-        await message.reply(
-            f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
-        )
-        await message.add_reaction("✅")
-    except Exception as e:
-        print(f"[Donation Error] Failed to process donation for {user.id}: {e}")
+        if chips <= 0:
+            await message.reply(
+                f"⚠️ Donation of ⏣{donated:,} is less than the minimum "
+                f"⏣{CHIPS_PER_COIN:,} needed for 1 chip."
+            )
+            return
+
+        # ── 6. Resolve donor ─────────────────────────────────────────────────────
+        meta = getattr(message, "interaction_metadata", None)
+        user = getattr(meta, "user", None)
+        if user is None:
+            print(f"[Donation] No interaction_metadata on message {message.id} — skipping")
+            # Unlock if we couldn't resolve the user
+            _processed_donations.discard(payload.message_id)
+            return
+
+        if message.guild:
+            user = message.guild.get_member(user.id) or user
+
+        # ── 7. Credit chips ───────────────────────────────────────────────────────
+        try:
+            new_bal = await db.add_chips(
+                bot.user.id,
+                bot.user.display_name,
+                user.id,
+                user.name,
+                chips,
+                "Dank Memer Donation Exchange",
+            )
+            await db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+
+            print(f"[Donation] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
+
+            await message.reply(
+                f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** <:poker_chip:1490458259855773707>"
+            )
+            await message.add_reaction("✅")
+        except Exception as e:
+            print(f"[Donation Error] Failed to process donation for {user.id}: {e}")
 
 
 _processing_cashouts = set()

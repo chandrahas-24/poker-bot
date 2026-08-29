@@ -2910,7 +2910,18 @@ class GameView(discord.ui.View):
     async def btn_fold(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
         if not self.t.game.is_turn(uid):
-            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
+            # Treat an early Fold click as a one-shot "Fold Any" premove.
+            # This is intentionally not a toggle: repeated clicks while waiting
+            # simply keep the same premove armed, avoiding lag/double-click issues.
+            p = self.t.game.get_player(uid)
+            if not p or p.folded or p.all_in:
+                await interaction.response.send_message("❌ You can't fold right now.", ephemeral=True)
+                return
+            p.premove = {"action": "fold_any"}
+            await interaction.response.send_message(
+                "⚡ **Fold Any premove set.** It will fold on your next turn if bet > 0",
+                ephemeral=True
+            )
             return
 
         p = self.t.game.get_player(uid)

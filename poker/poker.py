@@ -5256,46 +5256,37 @@ class PokerCog(commands.Cog):
             traceback.print_exc()
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
-    @poker.command(
-        name="drawcards",
-        description="Draw cards to test image sizes"
-    )
+    @poker.command(name="drawcards", description="Draw cards from a 52 card deck")
     @app_commands.describe(
         number="Number of cards to draw",
-        infinite="Use a fresh deck for every card (Default: False)"
+        infinite="Use a fresh deck for every card (Default: False)",
+        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)"
     )
-    async def draw_cards(
-            self,
-            interaction: discord.Interaction,
-            number: app_commands.Range[int, 1, 10],
-            infinite: bool = False,
-    ):
+    async def draw_cards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
+                         infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0):
         await interaction.response.defer(ephemeral=False)
 
-        from treys import Deck
+        from treys import Deck, Card
+        import random
 
         if infinite:
-            # Each card comes from its own fresh deck.
             cards = []
             for _ in range(number):
                 deck = Deck()
                 cards.extend(deck.draw(1))
         else:
-            # All cards come from the same deck.
             deck = Deck()
             cards = deck.draw(number)
 
-        file = await asyncio.to_thread(
-            card_images.make_strip,
-            cards,
-            0,
-            True
-        )
+        ace_of_spades = Card.new("As")
+        shiny = ace_of_spades in cards and random.random() < shiny_chance
+
+        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True, shiny)
 
         await interaction.followup.send(
             f"🃏 Drew **{number}** card{'s' if number != 1 else ''}"
             f"{' (infinite deck)' if infinite else ''}: "
-            f"\n {hand_str(cards)}",
+            f"\n {hand_str(cards)}{' ✨' if shiny else ''}",
             file=file
         )
 
@@ -5618,7 +5609,7 @@ class PokerCog(commands.Cog):
 
     @app_commands.command(
         name="drawcards",
-        description="Draw cards to test image sizes"
+        description="Draw cards from a 52 card deck."
     )
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(
@@ -5630,13 +5621,9 @@ class PokerCog(commands.Cog):
         number="Number of cards to draw",
         infinite="Use a fresh deck for every card (Default: False)"
     )
-    async def user_drawcards(
-            self,
-            interaction: discord.Interaction,
-            number: app_commands.Range[int, 1, 10],
-            infinite: bool = False,
-    ):
-        await self.draw_cards.callback(self, interaction, number, infinite)
+    async def user_drawcards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
+                             infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0):
+        await self.draw_cards.callback(self, interaction, number, infinite, shiny_chance)
 
     @app_commands.command(name="myactivity", description="Check your poker activity status")
     @app_commands.allowed_installs(guilds=True, users=True)

@@ -5619,7 +5619,8 @@ class PokerCog(commands.Cog):
     )
     @app_commands.describe(
         number="Number of cards to draw",
-        infinite="Use a fresh deck for every card (Default: False)"
+        infinite="Use a fresh deck for every card (Default: False)",
+        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)"
     )
     async def user_drawcards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
                              infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0):

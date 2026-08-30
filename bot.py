@@ -187,7 +187,7 @@ async def on_ready():
     #await bot.load_extension("hotpotato")
     #await bot.load_extension("uno.unodemo")
     await bot.load_extension("uno.uno_cog")
-    # await bot.load_extension("highlight")
+    await bot.load_extension("highlight")
     # await bot.load_extension("tournament.tournament")
 
 

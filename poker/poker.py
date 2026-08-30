@@ -5561,7 +5561,7 @@ class PokerCog(commands.Cog):
                 end = date.today().strftime(DATE_FORMAT)
 
         except ValueError:
-            await interaction.response.send_message(
+            await interaction.followup.send_message(
                 "❌ Invalid date.",
                 ephemeral=True,
             )

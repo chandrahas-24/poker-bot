@@ -12,7 +12,7 @@ import config
 
 DATA_FILE = "highlight_words.json"
 COOLDOWN_SECONDS = 10        # No spam hl
-ACTIVE_CONTEXT_SECONDS = 15  # User won't get pinged if they recently talked here
+ACTIVE_CONTEXT_SECONDS = 60  # User won't get pinged if they recently talked here
 
 hl_allowed = {}          # User IDs
 HIGHLIGHT_ROLE_IDS = [836210264873369630]  # Role IDs

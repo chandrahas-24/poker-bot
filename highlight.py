@@ -7,6 +7,7 @@ import re
 import time
 from collections import deque
 import aiohttp
+import asyncio
 import config
 
 DATA_FILE = "highlight_words.json"
@@ -395,65 +396,152 @@ class HighlightCog(commands.Cog):
     # ── AI Verification & DM Dispatch ─────────────────────────────────────
 
     async def verify_context_with_gemini(self, word: str, context_text: str) -> bool:
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("API_KEY")
+
         if not api_key:
+            print("[Groq] API key not found -> allowing highlight")
             return True
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        model = "openai/gpt-oss-20b"
+        url = "https://api.groq.com/openai/v1/chat/completions"
         base_word = word.replace('*', '')
 
         prompt = (
-            f"You are a strict Discord chat moderator AI.\n"
-            f"Analyze this chat log, but evaluate STRICTLY AND ONLY the FINAL message sent.\n\n"
-            f"Chat Log:\n{context_text}\n\n"
-            f"TASK: Look ONLY at the final message. A user is tracking the substring '{base_word}'.\n"
-            f"Determine if the matched word containing '{base_word}' should trigger an alert based on these simple rules:\n\n"
-            f"RULES:\n"
-            f"1. Reply 'YES' if the matched word is clearly being used as a username, player nickname, fictional character, unique moniker, or a stretched spelling of '{base_word}' (e.g., '{base_word}yyy').\n"
-            f"2. Reply 'NO' if the matched word is a real-world geographical location, city, or place where the substring just happens to appear.\n"
-            f"3. Reply 'NO' if the matched word is just a standard conversational dictionary word.\n\n"
-            f"Reply strictly with the exact word 'YES' or 'NO'."
+            f"You are deciding whether a Discord highlight should trigger.\n\n"
+            f"Tracked term: '{base_word}'\n\n"
+            f"Chat log:\n"
+            f"{context_text}\n\n"
+            f"Only the FINAL message is being evaluated. Earlier messages are "
+            f"provided only as context to understand the final message.\n\n"
+            f"Decide whether the occurrence of '{base_word}' in the final message "
+            f"is a meaningful use of the tracked term, rather than an accidental "
+            f"substring.\n\n"
+            f"ALLOW (YES) when the occurrence is intentionally being used as:\n"
+            f"- a username, nickname, alias, or player name\n"
+            f"- a fictional character or other named entity\n"
+            f"- a deliberately altered or stretched spelling of the tracked term\n"
+            f"- another clear reference to the tracked term that a person would "
+            f"reasonably want highlighted\n\n"
+            f"REJECT (NO) when the occurrence is merely incidental, such as:\n"
+            f"- normal grammatical or conversational usage of a common word "
+            f"(for example, 'may' meaning possibility or permission)\n"
+            f"- part of an ordinary dictionary word with an unrelated meaning\n"
+            f"- part of a city, country, geographical location, or other place name\n"
+            f"- part of an unrelated person's name or other entity\n"
+            f"- an accidental substring with no meaningful connection to the "
+            f"tracked term\n\n"
+            f"Important:\n"
+            f"- Judge the meaning and usage of the FINAL message, not merely whether "
+            f"the characters match.\n"
+            f"- Do not reject a match simply because it is not an exact standalone "
+            f"word.\n"
+            f"- A stretched or intentionally modified spelling can still be a valid "
+            f"match.\n"
+            f"- Use earlier messages only when they clearly help establish the "
+            f"meaning of the final message.\n\n"
+            f"Respond with exactly one word: YES or NO."
         )
 
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": 5
-            },
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-            ]
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_completion_tokens": 256,
+            "reasoning_effort": "low",
+            "include_reasoning": False
         }
 
-        # Fallback safeguard in case session wasn't initialized cleanly
+        # Give all attempts a shared 60-second deadline rather than 60 seconds each.
+        total_timeout = 60
+        max_attempts = 3
+        deadline = time.monotonic() + total_timeout
+
         session = self.session if (self.session and not self.session.closed) else aiohttp.ClientSession()
 
-        try:
-            async with session.post(url, json=payload, headers={'Content-Type': 'application/json'}) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    print(f"[Gemini] HTTP Error {resp.status}: {error_text}")
-                    return True
+        for attempt in range(1, max_attempts + 1):
+            remaining = deadline - time.monotonic()
 
-                data = await resp.json()
-
-                if 'candidates' not in data or not data['candidates'][0].get('content'):
-                    print(f"[Gemini] AI returned empty response. Raw: {data}")
-                    return True
-
-                reply = data['candidates'][0]['content']['parts'][0]['text'].strip().upper()
-
-                if "NO" in reply:
-                    return False
-
+            if remaining <= 0:
+                print("[Groq] 60s total timeout reached -> allowing highlight")
                 return True
-        except Exception as e:
-            print(f"[Gemini] API connection failed: {e}")
-            return True
+
+            try:
+                print(f"[Groq] Attempt {attempt}/{max_attempts}")
+
+                timeout = aiohttp.ClientTimeout(total=remaining)
+
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=timeout
+                ) as resp:
+                    response_text = await resp.text()
+
+                    if resp.status != 200:
+                        if resp.status in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                            print(f"[Groq] HTTP {resp.status} -> retrying")
+                            continue
+
+                        print(f"[Groq] HTTP {resp.status} -> allowing highlight")
+                        return True
+
+                    try:
+                        data = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        print("[Groq] Invalid JSON response -> allowing highlight")
+                        return True
+
+                    choices = data.get("choices", [])
+
+                    if not choices:
+                        print("[Groq] No choices returned -> allowing highlight")
+                        return True
+
+                    content = choices[0].get("message", {}).get("content", "")
+                    reply = content.strip().upper()
+
+                    print(f"[Groq] Response: {reply!r}")
+
+                    if reply == "NO":
+                        return False
+
+                    if reply == "YES":
+                        return True
+
+                    print("[Groq] Unexpected response -> allowing highlight")
+                    return True
+
+            except (aiohttp.ServerTimeoutError, asyncio.TimeoutError):
+                remaining = deadline - time.monotonic()
+
+                if remaining > 0 and attempt < max_attempts:
+                    print(f"[Groq] Attempt {attempt} timed out -> retrying")
+                    continue
+
+                print("[Groq] 60s total timeout reached -> allowing highlight")
+                return True
+
+            except aiohttp.ClientError as e:
+                remaining = deadline - time.monotonic()
+
+                if remaining > 0 and attempt < max_attempts:
+                    print(f"[Groq] Connection error -> retrying ({remaining:.1f}s left)")
+                    continue
+
+                print(f"[Groq] Connection failed: {type(e).__name__} -> allowing highlight")
+                return True
+
+            except Exception as e:
+                print(f"[Groq] API error: {type(e).__name__}: {e} -> allowing highlight")
+                return True
 
     async def send_alert(self, user_id_str: str, word: str, message: discord.Message):
         try:

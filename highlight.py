@@ -114,7 +114,7 @@ class HighlightCog(commands.Cog):
 
     # ── UI Management Slash Commands ───────────────────────────────────────
 
-    highlight_group = app_commands.Group(name="hl", description="Manage your tracked keywords and blocks")
+    highlight_group = app_commands.Group(name="hl", description="Manage your tracked keywords and blocks", guild_ids=[config.GUILD_ID],)
 
     @highlight_group.command(name="add", description="Add a new keyword to track")
     @app_commands.describe(

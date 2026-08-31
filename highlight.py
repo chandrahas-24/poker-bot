@@ -452,7 +452,7 @@ class HighlightCog(commands.Cog):
             ],
             "max_completion_tokens": 256,
             "reasoning_effort": "low",
-            "include_reasoning": False
+            "include_reasoning": True
         }
 
         # Give all attempts a shared 60-second deadline rather than 60 seconds each.

@@ -470,8 +470,6 @@ class HighlightCog(commands.Cog):
                 return True
 
             try:
-                print(f"[Groq] Attempt {attempt}/{max_attempts}")
-
                 timeout = aiohttp.ClientTimeout(total=remaining)
 
                 async with session.post(
@@ -507,8 +505,6 @@ class HighlightCog(commands.Cog):
 
                     content = choices[0].get("message", {}).get("content", "")
                     reply = content.strip().upper()
-
-                    print(f"[Groq] Response: {reply!r}")
 
                     if reply == "NO":
                         return False

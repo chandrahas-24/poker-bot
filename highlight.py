@@ -11,11 +11,44 @@ import asyncio
 import config
 
 DATA_FILE = "highlight_words.json"
-COOLDOWN_SECONDS = 10        # No spam hl
-ACTIVE_CONTEXT_SECONDS = 60  # User won't get pinged if they recently talked here
+CONFIG_FILE = "highlight_config.json"
 
-hl_allowed = {}          # User IDs
-HIGHLIGHT_ROLE_IDS = [836210264873369630]  # Role IDs
+DEFAULT_CONFIG = {
+    "cooldown_seconds": 10,
+    "active_context_seconds": 60,
+    "allowed_users": [],
+    "role_ids": [836210264873369630],
+    "max_context_words": 1
+}
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        config_data = DEFAULT_CONFIG.copy()
+        save_config(config_data)
+        return config_data
+
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config_data = json.load(f)
+
+        for key, value in DEFAULT_CONFIG.items():
+            config_data.setdefault(key, value)
+
+        return config_data
+    except Exception as e:
+        print(f"[Highlight] Error loading config: {e}")
+        return DEFAULT_CONFIG.copy()
+
+def save_config(config_data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config_data, f, indent=4)
+
+
+HIGHLIGHT_CONFIG = load_config()
+COOLDOWN_SECONDS = HIGHLIGHT_CONFIG["cooldown_seconds"]
+ACTIVE_CONTEXT_SECONDS = HIGHLIGHT_CONFIG["active_context_seconds"]
+hl_allowed = {int(user_id): True for user_id in HIGHLIGHT_CONFIG["allowed_users"]}
+HIGHLIGHT_ROLE_IDS = HIGHLIGHT_CONFIG["role_ids"]
 
 async def is_hl_authorized(interaction: discord.Interaction) -> bool:
     """Checks if the user is a Dev, Admin, has a specific role, or is whitelisted."""
@@ -74,7 +107,7 @@ class HighlightCog(commands.Cog):
                         "strict": set(user_data),
                         "general": set(),
                         "wildcard": set(),
-                        "context_word": None,
+                        "context_words": set(),
                         "blocked_channels": set(),
                         "blocked_users": set()
                     }
@@ -83,7 +116,12 @@ class HighlightCog(commands.Cog):
                         "strict": set(user_data.get("strict", [])),
                         "general": set(user_data.get("general", [])),
                         "wildcard": set(user_data.get("wildcard", [])),
-                        "context_word": user_data.get("context_word", None),
+                        "context_words": set(
+                            user_data.get(
+                                "context_words",
+                                [user_data["context_word"]] if user_data.get("context_word") else []
+                            )
+                        ),
                         "blocked_channels": set(user_data.get("blocked_channels", [])),
                         "blocked_users": set(user_data.get("blocked_users", []))
                     }
@@ -100,7 +138,7 @@ class HighlightCog(commands.Cog):
                     "strict": list(data["strict"]),
                     "general": list(data["general"]),
                     "wildcard": list(data["wildcard"]),
-                    "context_word": data.get("context_word"),
+                    "context_words": list(data.get("context_words", set())),
                     "blocked_channels": list(data["blocked_channels"]),
                     "blocked_users": list(data["blocked_users"])
                 }
@@ -109,7 +147,7 @@ class HighlightCog(commands.Cog):
     def _ensure_user(self, user_id: str):
         if user_id not in self.highlights:
             self.highlights[user_id] = {
-                "strict": set(), "general": set(), "wildcard": set(), "context_word": None, "blocked_channels": set(),
+                "strict": set(), "general": set(), "wildcard": set(), "context_words": set(), "blocked_channels": set(),
                 "blocked_users": set()
             }
 
@@ -179,8 +217,7 @@ class HighlightCog(commands.Cog):
                 removed = True
 
         if removed:
-            if self.highlights[user_id].get("context_word") == word:
-                self.highlights[user_id]["context_word"] = None
+            self.highlights[user_id]["context_words"].discard(word)
 
             self.save_data()
             embed = discord.Embed(title="🗑️ Keyword Removed", description=f"I have stopped tracking **{word}**.",
@@ -191,7 +228,7 @@ class HighlightCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @highlight_group.command(name="set_context", description="Set your ONE allowed context-aware highlight word.")
+    @highlight_group.command(name="set_context", description="Add a context-aware highlight word.")
     @app_commands.describe(word="The exact word you want the AI to verify")
     async def setai(self, interaction: discord.Interaction, word: str):
         if not await is_hl_authorized(interaction):
@@ -199,10 +236,21 @@ class HighlightCog(commands.Cog):
             return
 
         clean_word = word.strip().lower()
+        if not clean_word:
+            return await interaction.response.send_message("❌ You must provide a word.", ephemeral=True)
+
         user_id = str(interaction.user.id)
         self._ensure_user(user_id)
+        context_words = self.highlights[user_id]["context_words"]
 
-        self.highlights[user_id]["context_word"] = clean_word
+        if clean_word not in context_words:
+            max_context_words = HIGHLIGHT_CONFIG["max_context_words"]
+            if len(context_words) >= max_context_words:
+                return await interaction.response.send_message(
+                    f"❌ You can only have **{max_context_words}** context word{'s' if max_context_words != 1 else ''}.",
+                    ephemeral=True
+                )
+            context_words.add(clean_word)
 
         wildcard_version = f"*{clean_word}*"
         if wildcard_version not in self.highlights[user_id]["wildcard"]:
@@ -210,31 +258,84 @@ class HighlightCog(commands.Cog):
 
         self.save_data()
         await interaction.response.send_message(
-            f"✅ **{clean_word}** is now your context-verified word. (Added as `*{clean_word}*` to catch stretched text!)",
+            f"✅ **{clean_word}** is now a context-verified word.",
             ephemeral=True
         )
 
-    @highlight_group.command(name="remove_context", description="Remove your context specific highlight word.")
-    async def removeai(self, interaction: discord.Interaction):
+    @highlight_group.command(name="remove_context", description="Remove a context-specific highlight word.")
+    @app_commands.describe(word="The context word to remove")
+    async def removeai(self, interaction: discord.Interaction, word: str):
         if not await is_hl_authorized(interaction):
             await interaction.response.send_message("❌ This command is restricted.", ephemeral=True)
             return
 
         user_id = str(interaction.user.id)
         self._ensure_user(user_id)
+        clean_word = word.strip().lower()
+        context_words = self.highlights[user_id]["context_words"]
 
-        old_word = self.highlights[user_id].get("context_word")
-        if old_word:
-            self.highlights[user_id]["context_word"] = None
+        if clean_word not in context_words:
+            return await interaction.response.send_message(
+                f"⚠️ **{clean_word}** is not a context word.", ephemeral=True
+            )
 
-            wildcard_version = f"*{old_word}*"
-            if wildcard_version in self.highlights[user_id]["wildcard"]:
-                self.highlights[user_id]["wildcard"].remove(wildcard_version)
+        context_words.remove(clean_word)
+        wildcard_version = f"*{clean_word}*"
+        self.highlights[user_id]["wildcard"].discard(wildcard_version)
+        self.save_data()
 
-            self.save_data()
-            await interaction.response.send_message(f"❌ Removed your highlight word (**{old_word}**).", ephemeral=True)
-        else:
-            await interaction.response.send_message("⚠️ You don't have a context highlight word set.", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ Removed context word **{clean_word}**.", ephemeral=True
+        )
+
+    @highlight_group.command(name="context_list", description="View your context-verified words.")
+    async def context_list(self, interaction: discord.Interaction):
+        if not await is_hl_authorized(interaction):
+            await interaction.response.send_message("❌ This command is restricted.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        self._ensure_user(user_id)
+        context_words = self.highlights[user_id]["context_words"]
+        max_context_words = HIGHLIGHT_CONFIG["max_context_words"]
+
+        words = "\n".join(f"• `{word}`" for word in sorted(context_words)) or "None"
+        embed = discord.Embed(title="🤖 Context-Verified Words", description=words, color=discord.Color.blue())
+        embed.set_footer(text=f"{len(context_words)}/{max_context_words} slots used")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @highlight_group.command(name="config", description="Configure highlight system settings.")
+    @app_commands.describe(setting="Setting to change", value="New value")
+    @app_commands.choices(setting=[
+        app_commands.Choice(name="Cooldown Seconds", value="cooldown"),
+        app_commands.Choice(name="Active Context Seconds", value="active_context"),
+        app_commands.Choice(name="Max Context Words", value="max_context_words")
+    ])
+    async def config_highlight(self, interaction: discord.Interaction, setting: str, value: int):
+        if interaction.user.id not in getattr(config, "DEV_USER_IDS", []):
+            await interaction.response.send_message("❌ Dev-only command.", ephemeral=True)
+            return
+
+        if value < 0:
+            return await interaction.response.send_message("❌ Value must be 0 or greater.", ephemeral=True)
+
+        global COOLDOWN_SECONDS, ACTIVE_CONTEXT_SECONDS
+
+        if setting == "cooldown":
+            if value < 1:
+                return await interaction.response.send_message("❌ Cooldown must be at least 1 second.", ephemeral=True)
+            COOLDOWN_SECONDS = value
+            HIGHLIGHT_CONFIG["cooldown_seconds"] = value
+        elif setting == "active_context":
+            ACTIVE_CONTEXT_SECONDS = value
+            HIGHLIGHT_CONFIG["active_context_seconds"] = value
+        elif setting == "max_context_words":
+            if value < 1:
+                return await interaction.response.send_message("❌ Max context words must be at least 1.", ephemeral=True)
+            HIGHLIGHT_CONFIG["max_context_words"] = value
+
+        save_config(HIGHLIGHT_CONFIG)
+        await interaction.response.send_message(f"✅ `{setting}` set to **{value}**.", ephemeral=True)
 
     @highlight_group.command(name="block", description="Block a channel or user from triggering your highlights")
     async def block_source(self, interaction: discord.Interaction, channel: discord.TextChannel = None,
@@ -300,8 +401,9 @@ class HighlightCog(commands.Cog):
         data = self.highlights[user_id]
         embed = discord.Embed(title="📋 Your Highlight Settings", color=discord.Color.blue())
 
-        ai_word = data.get("context_word") or "None"
-        embed.add_field(name="Context Word", value=f"`{ai_word}`", inline=False)
+        context_words = data.get("context_words", set())
+        ai_words = "\n".join(f"• `{word}`" for word in sorted(context_words)) or "None"
+        embed.add_field(name="Context Words", value=ai_words, inline=False)
 
         strict_list = "\n".join([f"• `{w}`" for w in data["strict"]]) or "None"
         embed.add_field(name="Strict Matches", value=strict_list, inline=True)
@@ -547,7 +649,7 @@ class HighlightCog(commands.Cog):
 
             context_lines = list(self.channel_history.get(message.channel.id, []))
             user_prefs = self.highlights.get(user_id_str, {})
-            designated_ai_word = user_prefs.get("context_word")
+            context_words = user_prefs.get("context_words", set())
 
             pattern = None
             if word in user_prefs.get("wildcard", []):
@@ -572,13 +674,16 @@ class HighlightCog(commands.Cog):
 
             formatted_context = "\n".join(highlighted_lines)
 
-            if designated_ai_word and (
-                    word.lower() == designated_ai_word.lower() or word.lower() == f"*{designated_ai_word.lower()}*"):
+            is_context_word = any(
+                word.lower() == context_word.lower()
+                or word.lower() == f"*{context_word.lower()}*"
+                for context_word in context_words
+            )
+
+            if is_context_word:
                 is_valid_target = await self.verify_context_with_gemini(word, formatted_context)
                 if not is_valid_target:
                     return
-            else:
-                pass
 
             embed = discord.Embed(
                 title=f"Highlight word \"{word}\"",

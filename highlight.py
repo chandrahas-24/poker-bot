@@ -304,13 +304,36 @@ class HighlightCog(commands.Cog):
         embed.set_footer(text=f"{len(context_words)}/{max_context_words} slots used")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    async def config_setting_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str
+    ):
+        choices = [
+            app_commands.Choice(
+                name=f"Cooldown — {HIGHLIGHT_CONFIG['cooldown_seconds']}s",
+                value="cooldown"
+            ),
+            app_commands.Choice(
+                name=f"Active Context — {HIGHLIGHT_CONFIG['active_context_seconds']}s",
+                value="active_context"
+            ),
+            app_commands.Choice(
+                name=f"Max Context Words — {HIGHLIGHT_CONFIG['max_context_words']}",
+                value="max_context_words"
+            ),
+        ]
+
+        current_lower = current.lower()
+        return [
+            choice for choice in choices
+            if current_lower in choice.name.lower()
+            or current_lower in choice.value.lower()
+        ]
+
     @highlight_group.command(name="config", description="Configure highlight system settings.")
     @app_commands.describe(setting="Setting to change", value="New value")
-    @app_commands.choices(setting=[
-        app_commands.Choice(name="Cooldown Seconds", value="cooldown"),
-        app_commands.Choice(name="Active Context Seconds", value="active_context"),
-        app_commands.Choice(name="Max Context Words", value="max_context_words")
-    ])
+    @app_commands.autocomplete(setting=config_setting_autocomplete)
     async def config_highlight(self, interaction: discord.Interaction, setting: str, value: int):
         if interaction.user.id not in getattr(config, "DEV_USER_IDS", []):
             await interaction.response.send_message("❌ Dev-only command.", ephemeral=True)
@@ -492,6 +515,17 @@ class HighlightCog(commands.Cog):
                 last_sent = self.cooldowns.get(cooldown_key, 0)
 
                 if current_time - last_sent > COOLDOWN_SECONDS:
+                    # Only deliver highlights for channels the recipient can see.
+                    member = message.guild.get_member(int(user_id_str)) if message.guild else None
+                    if member is None and message.guild:
+                        try:
+                            member = await message.guild.fetch_member(int(user_id_str))
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            member = None
+
+                    if member is None or not message.channel.permissions_for(member).view_channel:
+                        continue
+
                     self.cooldowns[cooldown_key] = current_time
                     self.bot.loop.create_task(self.send_alert(user_id_str, word, message))
 

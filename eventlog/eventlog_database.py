@@ -13,12 +13,20 @@ async def init_log_db():
                 donator_username TEXT,
                 event_type TEXT,
                 event_prize_msg TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                mistake INTEGER NOT NULL DEFAULT 0
             )
         ''')
 
         try:
             await db.execute('ALTER TABLE event_logs ADD COLUMN staff_username TEXT')
+        except aiosqlite.OperationalError:
+            pass
+
+        try:
+            await db.execute(
+                'ALTER TABLE event_logs ADD COLUMN mistake INTEGER NOT NULL DEFAULT 0'
+            )
         except aiosqlite.OperationalError:
             pass
 
@@ -95,7 +103,9 @@ async def fetch_staff_stats(start_date: str, end_date: str):
         query = """
             SELECT staff_id, COUNT(*) as total_events 
             FROM event_logs 
-            WHERE timestamp >= ? AND timestamp <= ?
+            WHERE timestamp >= ?
+              AND timestamp <= ?
+              AND mistake = 0
             GROUP BY staff_id 
             ORDER BY total_events DESC
         """

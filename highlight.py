@@ -304,61 +304,164 @@ class HighlightCog(commands.Cog):
         embed.set_footer(text=f"{len(context_words)}/{max_context_words} slots used")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    async def config_setting_autocomplete(
+    @highlight_group.command(name="config", description="Configure highlight system settings.")
+    @app_commands.describe(
+        setting="Setting or allowlist operation",
+        value="New numeric value (for numeric settings)",
+        user="User for allow/disallow",
+        role="Role for addrole/removerole"
+    )
+    @app_commands.choices(setting=[
+        app_commands.Choice(name="Cooldown Seconds", value="cooldown"),
+        app_commands.Choice(name="Active Context Seconds", value="active_context"),
+        app_commands.Choice(name="Max Context Words", value="max_context_words"),
+        app_commands.Choice(name="Allow User", value="allow"),
+        app_commands.Choice(name="Disallow User", value="disallow"),
+        app_commands.Choice(name="Add Role", value="add_role"),
+        app_commands.Choice(name="Remove Role", value="remove_role"),
+    ])
+    async def config_highlight(
         self,
         interaction: discord.Interaction,
-        current: str
+        setting: str,
+        value: int = None,
+        user: discord.User = None,
+        role: discord.Role = None
     ):
-        choices = [
-            app_commands.Choice(
-                name=f"Cooldown — {HIGHLIGHT_CONFIG['cooldown_seconds']}s",
-                value="cooldown"
-            ),
-            app_commands.Choice(
-                name=f"Active Context — {HIGHLIGHT_CONFIG['active_context_seconds']}s",
-                value="active_context"
-            ),
-            app_commands.Choice(
-                name=f"Max Context Words — {HIGHLIGHT_CONFIG['max_context_words']}",
-                value="max_context_words"
-            ),
-        ]
-
-        current_lower = current.lower()
-        return [
-            choice for choice in choices
-            if current_lower in choice.name.lower()
-            or current_lower in choice.value.lower()
-        ]
-
-    @highlight_group.command(name="config", description="Configure highlight system settings.")
-    @app_commands.describe(setting="Setting to change", value="New value")
-    @app_commands.autocomplete(setting=config_setting_autocomplete)
-    async def config_highlight(self, interaction: discord.Interaction, setting: str, value: int):
         if interaction.user.id not in getattr(config, "DEV_USER_IDS", []):
             await interaction.response.send_message("❌ Dev-only command.", ephemeral=True)
             return
 
-        if value < 0:
-            return await interaction.response.send_message("❌ Value must be 0 or greater.", ephemeral=True)
-
-        global COOLDOWN_SECONDS, ACTIVE_CONTEXT_SECONDS
-
         if setting == "cooldown":
-            if value < 1:
-                return await interaction.response.send_message("❌ Cooldown must be at least 1 second.", ephemeral=True)
-            COOLDOWN_SECONDS = value
+            if value is None or value < 0:
+                await interaction.response.send_message("❌ Provide a non-negative numeric value.", ephemeral=True)
+                return
             HIGHLIGHT_CONFIG["cooldown_seconds"] = value
-        elif setting == "active_context":
-            ACTIVE_CONTEXT_SECONDS = value
-            HIGHLIGHT_CONFIG["active_context_seconds"] = value
-        elif setting == "max_context_words":
-            if value < 1:
-                return await interaction.response.send_message("❌ Max context words must be at least 1.", ephemeral=True)
-            HIGHLIGHT_CONFIG["max_context_words"] = value
+            globals()["COOLDOWN_SECONDS"] = value
+            save_config()
+            await interaction.response.send_message(f"✅ Cooldown set to `{value}s`.", ephemeral=True)
 
-        save_config(HIGHLIGHT_CONFIG)
-        await interaction.response.send_message(f"✅ `{setting}` set to **{value}**.", ephemeral=True)
+        elif setting == "active_context":
+            if value is None or value < 0:
+                await interaction.response.send_message("❌ Provide a non-negative numeric value.", ephemeral=True)
+                return
+            HIGHLIGHT_CONFIG["active_context_seconds"] = value
+            globals()["ACTIVE_CONTEXT_SECONDS"] = value
+            save_config()
+            await interaction.response.send_message(f"✅ Active context set to `{value}s`.", ephemeral=True)
+
+        elif setting == "max_context_words":
+            if value is None or value < 1:
+                await interaction.response.send_message("❌ Max context words must be at least 1.", ephemeral=True)
+                return
+            HIGHLIGHT_CONFIG["max_context_words"] = value
+            save_config()
+            await interaction.response.send_message(f"✅ Max context words set to `{value}`.", ephemeral=True)
+
+        elif setting == "allow":
+            if user is None:
+                await interaction.response.send_message("❌ Select a user.", ephemeral=True)
+                return
+            hl_allowed[user.id] = True
+            allowed_users = {int(uid) for uid in HIGHLIGHT_CONFIG.get("allowed_users", [])}
+            allowed_users.add(user.id)
+            HIGHLIGHT_CONFIG["allowed_users"] = sorted(allowed_users)
+            save_config()
+            await interaction.response.send_message(f"✅ {user.mention} is now allowlisted.", ephemeral=True)
+
+        elif setting == "disallow":
+            if user is None:
+                await interaction.response.send_message("❌ Select a user.", ephemeral=True)
+                return
+            hl_allowed.pop(user.id, None)
+            allowed_users = {int(uid) for uid in HIGHLIGHT_CONFIG.get("allowed_users", [])}
+            allowed_users.discard(user.id)
+            HIGHLIGHT_CONFIG["allowed_users"] = sorted(allowed_users)
+            save_config()
+            await interaction.response.send_message(f"✅ {user.mention} was removed from the allowlist.", ephemeral=True)
+
+        elif setting == "add_role":
+            if role is None:
+                await interaction.response.send_message("❌ Select a role.", ephemeral=True)
+                return
+            role_ids = {int(role_id) for role_id in HIGHLIGHT_CONFIG.get("role_ids", [])}
+            role_ids.add(role.id)
+            HIGHLIGHT_CONFIG["role_ids"] = sorted(role_ids)
+            if role.id not in HIGHLIGHT_ROLE_IDS:
+                HIGHLIGHT_ROLE_IDS.append(role.id)
+            save_config()
+            await interaction.response.send_message(
+                f"✅ Members with {role.mention} can now use highlights.",
+                ephemeral=True
+            )
+
+        elif setting == "remove_role":
+            if role is None:
+                await interaction.response.send_message("❌ Select a role.", ephemeral=True)
+                return
+            role_ids = {int(role_id) for role_id in HIGHLIGHT_CONFIG.get("role_ids", [])}
+            role_ids.discard(role.id)
+            HIGHLIGHT_CONFIG["role_ids"] = sorted(role_ids)
+            while role.id in HIGHLIGHT_ROLE_IDS:
+                HIGHLIGHT_ROLE_IDS.remove(role.id)
+            save_config()
+            await interaction.response.send_message(
+                f"✅ {role.mention} was removed from the highlight role allowlist.",
+                ephemeral=True
+            )
+
+    @highlight_group.command(name="settings", description="Show the current highlight configuration.")
+    async def highlight_settings(self, interaction: discord.Interaction):
+        if interaction.user.id not in getattr(config, "DEV_USER_IDS", []):
+            await interaction.response.send_message(
+                "❌ Dev-only command.",
+                ephemeral=True
+            )
+            return
+
+        config_lines = []
+
+        # Display every field currently present in highlight_config.json.
+        for key, value in HIGHLIGHT_CONFIG.items():
+            label = key.replace("_", " ").title()
+
+            if key == "allowed_users":
+                if value:
+                    users = []
+                    for user_id in value:
+                        users.append(f"<@{int(user_id)}>")
+                    display_value = "\n".join(f"• {user}" for user in users)
+                else:
+                    display_value = "None"
+
+            elif key == "role_ids":
+                if value:
+                    roles = []
+                    for role_id in value:
+                        roles.append(f"<@&{int(role_id)}>")
+                    display_value = "\n".join(f"• {role}" for role in roles)
+                else:
+                    display_value = "None"
+
+            elif isinstance(value, list):
+                display_value = ", ".join(str(item) for item in value) or "None"
+
+            else:
+                display_value = str(value)
+
+            config_lines.append(f"**{label}:**\n{display_value}")
+
+        embed = discord.Embed(
+            title="⚙️ Highlight Configuration",
+            description="\n\n".join(config_lines),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="Loaded from highlight_config.json")
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
 
     @highlight_group.command(name="block", description="Block a channel or user from triggering your highlights")
     async def block_source(self, interaction: discord.Interaction, channel: discord.TextChannel = None,

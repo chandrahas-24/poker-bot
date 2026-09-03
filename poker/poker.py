@@ -5260,10 +5260,11 @@ class PokerCog(commands.Cog):
     @app_commands.describe(
         number="Number of cards to draw",
         infinite="Use a fresh deck for every card (Default: False)",
-        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)"
+        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)",
+        name=""
     )
     async def draw_cards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
-                         infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0):
+                         infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0, name: str = ""):
         await interaction.response.defer(ephemeral=False)
 
         from treys import Deck, Card
@@ -5284,7 +5285,7 @@ class PokerCog(commands.Cog):
         file = await asyncio.to_thread(card_images.make_strip, cards, 0, True, shiny)
 
         await interaction.followup.send(
-            f"🃏 Drew **{number}** card{'s' if number != 1 else ''}"
+            f"🃏 {name} drew **{number}** card{'s' if number != 1 else ''}"
             f"{' (infinite deck)' if infinite else ''}: "
             f"\n {hand_str(cards)}{' ✨' if shiny else ''}",
             file=file
@@ -5620,11 +5621,12 @@ class PokerCog(commands.Cog):
     @app_commands.describe(
         number="Number of cards to draw",
         infinite="Use a fresh deck for every card (Default: False)",
-        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)"
+        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)",
+        name="",
     )
     async def user_drawcards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
-                             infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0):
-        await self.draw_cards.callback(self, interaction, number, infinite, shiny_chance)
+                             infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0, name: str = ""):
+        await self.draw_cards.callback(self, interaction, number, infinite, shiny_chance, name)
 
     @app_commands.command(name="myactivity", description="Check your poker activity status")
     @app_commands.allowed_installs(guilds=True, users=True)

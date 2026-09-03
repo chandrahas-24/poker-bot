@@ -490,9 +490,12 @@ async def reload(ctx, cog_name: str = None):
     elif cog_name_lower in ("uno"):
         helpers_to_reload = ["config"]
         cogs_to_reload = ["uno.uno_cog"]
+    elif cog_name_lower in ("highlight", "hl"):
+        helpers_to_reload = ["config"]
+        cogs_to_reload = ["highlight"]
     elif cog_name_lower is None:
         helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
-        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai"]
+        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "highlight"]
     else:
         # Check if it is a loaded extension
         ext_name = cog_name if cog_name in bot.extensions else (f"cogs.{cog_name}" if f"cogs.{cog_name}" in bot.extensions else None)
@@ -550,14 +553,18 @@ async def reload(ctx, cog_name: str = None):
     sync_msg = ""
     try:
         YOUR_GUILD_ID = config.GUILD_ID
+        sync_lines = []
+
         if YOUR_GUILD_ID:
             guild = discord.Object(id=YOUR_GUILD_ID)
-            bot.tree.copy_global_to(guild=guild)
             await bot.tree.sync(guild=guild)
-            sync_msg = f"Synced commands to guild {YOUR_GUILD_ID}"
-        else:
-            await bot.tree.sync()
-            sync_msg = "Synced commands globally"
+            sync_lines.append(f"Synced commands to guild {YOUR_GUILD_ID}")
+
+        await bot.tree.sync()
+        sync_lines.append("Synced global/user-install commands")
+
+        sync_msg = "\n".join(sync_lines)
+
     except Exception as e:
         sync_msg = f"⚠️ **Command Sync failed:** {e}"
 

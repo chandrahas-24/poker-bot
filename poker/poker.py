@@ -3462,7 +3462,7 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="open", description="[Manager] Open a poker table in this channel")
     @app_commands.describe(name="Table name")
-    async def open_table(self, interaction: discord.Interaction, name: str = "Poker Table"):
+    async def open_table(self, interaction: discord.Interaction, name: app_commands.Range[str, 1, 25] = "Poker Table"):
         await interaction.response.defer(ephemeral=True)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True);

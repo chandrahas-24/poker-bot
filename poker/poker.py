@@ -5257,14 +5257,15 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
     @poker.command(name="drawcards", description="Draw cards from a 52 card deck")
-    @app_commands.describe(
-        number="Number of cards to draw",
-        infinite="Use a fresh deck for every card (Default: False)",
-        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)",
-        name="X drew"
-    )
+    @app_commands.describe(number="Number of cards to draw",
+                           infinite="Use a fresh deck for every card (Default: False)",
+                           shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)", name="X drew",
+                           sort="Sort cards by rank or suit (Default: rank)")
+    @app_commands.choices(
+        sort=[app_commands.Choice(name="Rank", value="rank"), app_commands.Choice(name="Suit", value="suit")])
     async def draw_cards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
-                         infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0, name: str = ""):
+                         infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0,
+                         name: str = "", sort: str = "rank"):
         await interaction.response.defer(ephemeral=False)
 
         from treys import Deck, Card
@@ -5278,6 +5279,14 @@ class PokerCog(commands.Cog):
         else:
             deck = Deck()
             cards = deck.draw(number)
+
+        suit_order = {"s": 0, "d": 1, "c": 2, "h": 3}
+        rank_order = {r: i for i, r in enumerate("23456789TJQKA")}
+
+        if sort == "rank":
+            cards.sort(key=lambda card: (rank_order[Card.int_to_str(card)[0]], suit_order[Card.int_to_str(card)[1]]))
+        else:
+            cards.sort(key=lambda card: (suit_order[Card.int_to_str(card)[1]], rank_order[Card.int_to_str(card)[0]]))
 
         ace_of_spades = Card.new("As")
         shiny = ace_of_spades in cards and random.random() < shiny_chance
@@ -5590,20 +5599,20 @@ class PokerCog(commands.Cog):
     # ── User-install top-level aliases ─────────────────────────────────────
 
     @app_commands.command(name="stats", description="View your poker stats")
-    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_installs(guilds=False, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
     async def user_stats(self, interaction: discord.Interaction, hidden: bool = False):
         await self.stats.callback(self, interaction, hidden)
 
     @app_commands.command(name="leaderboard", description="Top poker players by net chips")
-    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_installs(guilds=False, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def user_leaderboard(self, interaction: discord.Interaction):
         await self.leaderboard.callback(self, interaction)
 
     @app_commands.command(name="jackpot", description="View the current casino jackpot!")
-    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_installs(guilds=False, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def user_jackpot(self, interaction: discord.Interaction):
         await self.jackpot_cmd.callback(self, interaction)
@@ -5612,24 +5621,28 @@ class PokerCog(commands.Cog):
         name="drawcards",
         description="Draw cards from a 52 card deck."
     )
-    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_installs(guilds=False, users=True)
     @app_commands.allowed_contexts(
         guilds=True,
         dms=True,
         private_channels=True
     )
-    @app_commands.describe(
-        number="Number of cards to draw",
-        infinite="Use a fresh deck for every card (Default: False)",
-        shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)",
-        name="X drew",
-    )
+    @app_commands.command(name="drawcards", description="Draw cards from a 52 card deck.")
+    @app_commands.allowed_installs(guilds=False, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.describe(number="Number of cards to draw",
+                           infinite="Use a fresh deck for every card (Default: False)",
+                           shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)", name="X drew",
+                           sort="Sort cards by rank or suit (Default: rank)")
+    @app_commands.choices(
+        sort=[app_commands.Choice(name="Rank", value="rank"), app_commands.Choice(name="Suit", value="suit")])
     async def user_drawcards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
-                             infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0, name: str = ""):
-        await self.draw_cards.callback(self, interaction, number, infinite, shiny_chance, name)
+                             infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0,
+                             name: str = "", sort: str = "rank"):
+        await self.draw_cards.callback(self, interaction, number, infinite, shiny_chance, name, sort)
 
     @app_commands.command(name="myactivity", description="Check your poker activity status")
-    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_installs(guilds=False, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def user_myactivity(self, interaction: discord.Interaction):
         await self.myactivity.callback(self, interaction)

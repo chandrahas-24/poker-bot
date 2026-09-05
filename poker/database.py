@@ -1181,7 +1181,7 @@ TITLES: dict[str, dict] = {
     },
 
     "bay": {
-        "display": "<:hawl:1538302870581940264>",
+        "display": "<:bay_stare:1472176122564313089>",
         "description": "",
         "rarity": "unique",
         "hidden": True,

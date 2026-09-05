@@ -5618,7 +5618,7 @@ class PokerCog(commands.Cog):
         await self.jackpot_cmd.callback(self, interaction)
 
     @app_commands.command(name="drawcards", description="Draw cards from a 52 card deck.")
-    @app_commands.allowed_installs(guilds=False, users=True)
+    @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(number="Number of cards to draw",
                            infinite="Use a fresh deck for every card (Default: False)",

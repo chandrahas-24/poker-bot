@@ -7,6 +7,7 @@ from treys import Evaluator, Card
 import os, asyncio, uuid, zipfile, traceback
 from datetime import datetime, timedelta, time as dt_time, timezone as _tz, date
 import time
+import re
 import math
 import sys
 import config
@@ -180,6 +181,60 @@ async def is_manager(interaction: discord.Interaction) -> bool:
         if role and role in interaction.user.roles:
             return True
     return interaction.user.guild_permissions.administrator
+
+# ── Moderation (duration / reason / DM) ─────────────────────────────────────
+
+_DURATION_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$", re.IGNORECASE)
+_DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+_DURATION_LABELS = {"m": "minute", "h": "hour", "d": "day", "w": "week"}
+
+
+def parse_duration(duration: str | None) -> tuple[int | None, str]:
+    """Parses a duration string like '10m', '2h', '7d', '1w' into (seconds, label).
+
+    Returns (None, "Permanent") when duration is None/blank/"permanent".
+    Raises ValueError on an unrecognized format.
+    """
+    if not duration or duration.strip().lower() in ("permanent", "perm", "forever"):
+        return None, "Permanent"
+    m = _DURATION_RE.match(duration)
+    if not m:
+        raise ValueError(
+            "Invalid duration. Use a number + unit, e.g. `30m`, `12h`, `7d`, `2w`, or leave blank / `permanent`."
+        )
+    amount, unit = int(m.group(1)), m.group(2).lower()
+    if amount <= 0:
+        raise ValueError("Duration must be greater than zero.")
+    seconds = amount * _DURATION_UNITS[unit]
+    label_unit = _DURATION_LABELS[unit] + ("s" if amount != 1 else "")
+    return seconds, f"{amount} {label_unit}"
+
+
+def expires_at_str(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    return (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M UTC")
+
+
+async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
+                       duration_label: str, moderator: discord.Member, guild_name: str):
+    """Best-effort DM to a user affected by a kick/ban. Never raises."""
+    emoji = "🔨" if action.lower() == "ban" else "🦵"
+    embed = discord.Embed(
+        title=f"{emoji} You've been {action.lower()}ed",
+        color=0xED4245,
+    )
+    embed.add_field(name="Server", value=guild_name, inline=True)
+    embed.add_field(name="Duration", value=duration_label, inline=True)
+    embed.add_field(name="Moderator", value=moderator.display_name, inline=True)
+    embed.add_field(name="Reason", value=reason or "No reason given.", inline=False)
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        pass
+    except Exception as e:
+        print(f"[Moderation DM Error] Failed to DM {user.id}: {e}")
+
 
 def _task_catcher(task: asyncio.Task):
     """Catches and prints silent errors from background tasks."""
@@ -3358,6 +3413,7 @@ class PokerCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.daily_backup.start()
+        self.expire_bans.start()
 
     async def cog_load(self):
         # Reload custom cosmetics from the database whenever the poker cog is loaded/reloaded.
@@ -3365,6 +3421,7 @@ class PokerCog(commands.Cog):
 
     def cog_unload(self):
         self.daily_backup.cancel()
+        self.expire_bans.cancel()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -3445,6 +3502,38 @@ class PokerCog(commands.Cog):
 
     @daily_backup.before_loop
     async def before_daily_backup(self):
+        await self.bot.wait_until_ready()
+
+    # ── Expired ban sweeper ──────────────────────────────────────────────
+    @tasks.loop(minutes=5)
+    async def expire_bans(self):
+        try:
+            expired = await db.get_expired_bans()
+            for b in expired:
+                await db.delete_ban_by_id(b['id'])
+                guild = self.bot.get_guild(b['guild_id'])
+                # Clear from any live in-memory table state for this guild.
+                for (gid, cid), t in tables.items():
+                    if gid == b['guild_id'] and (b['table_name'] is None or t.name.lower() == (b['table_name'] or '').lower()):
+                        if b['user_id'] in t.game.banned_users:
+                            t.game.banned_users.remove(b['user_id'])
+                if guild:
+                    try:
+                        user = self.bot.get_user(b['user_id']) or await self.bot.fetch_user(b['user_id'])
+                        embed = discord.Embed(
+                            title="✅ Your poker ban has expired",
+                            description=f"You can rejoin the tables in **{guild.name}** again.",
+                            color=0x57F287,
+                        )
+                        await user.send(embed=embed)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[Ban Expiry Task Error] {e}")
+            traceback.print_exc()
+
+    @expire_bans.before_loop
+    async def before_expire_bans(self):
         await self.bot.wait_until_ready()
 
     poker = app_commands.Group(name="poker", description="Texas Hold'em poker", guild_ids=[config.GUILD_ID])
@@ -3605,12 +3694,30 @@ class PokerCog(commands.Cog):
     # ── Manager moderation commands ───────────────────────────────────────
 
     @pokermgr.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
-    @app_commands.describe(user="Player to kick")
-    async def kick(self, interaction: discord.Interaction, user: discord.Member):
+    @app_commands.describe(user="Player to kick", reason="Reason for the kick",
+                           duration="Rejoin cooldown, e.g. 10m, 2h, 1d (default: standard cooldown)")
+    async def kick(self, interaction: discord.Interaction, user: discord.Member,
+                   reason: str = None, duration: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
+
+        if duration and duration.strip():
+            try:
+                cooldown_seconds, duration_label = parse_duration(duration)
+            except ValueError as e:
+                await interaction.followup.send(f"❌ {e}", ephemeral=True)
+                return
+            if cooldown_seconds is None:
+                await interaction.followup.send(
+                    "❌ A kick can't be permanent — give a duration like `10m`, `2h`, `1d`, or leave it blank for the default cooldown.",
+                    ephemeral=True)
+                return
+        else:
+            cooldown_seconds = config.REGULAR_REJOIN_COOLDOWN
+            mins = cooldown_seconds // 60
+            duration_label = f"{mins} minute{'s' if mins != 1 else ''}"
 
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
@@ -3629,6 +3736,10 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"❌ **{user.display_name}** is not at the table.", ephemeral=True);
             return
 
+        reason_note = f" — *{reason}*" if reason else ""
+        t.rejoin_cooldowns[user.id] = time.time() + cooldown_seconds
+        await send_mod_dm(user, "kick", reason, duration_label, interaction.user, interaction.guild.name)
+
         # Kick from waiting list
         if pj:
             t.game.pending_joins.remove(pj)
@@ -3636,7 +3747,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            await interaction.followup.send(f"🦵 **{user.display_name}** has been kicked from the waiting list.")
+            await interaction.followup.send(f"🦵 **{user.display_name}** has been kicked from the waiting list.{reason_note}")
             return
 
         # Kick from table
@@ -3647,7 +3758,7 @@ class PokerCog(commands.Cog):
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
             await interaction.followup.send(
-                f"🦵 **{user.display_name}** has been kicked and removed from the table.")
+                f"🦵 **{user.display_name}** has been kicked and removed from the table.{reason_note}")
             await refresh(interaction.channel, t)
             return
 
@@ -3667,7 +3778,7 @@ class PokerCog(commands.Cog):
                         slog(t, part)
 
         await interaction.followup.send(
-            f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
+            f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.{reason_note}")
 
         if t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, t)
@@ -3675,11 +3786,19 @@ class PokerCog(commands.Cog):
             await refresh(interaction.channel, t)
 
     @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
-    @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
-    async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
+    @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)",
+                           reason="Reason for the ban", duration="Ban length, e.g. 7d, 12h, 2w (leave blank for permanent)")
+    async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None,
+                 reason: str = None, duration: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
+            return
+
+        try:
+            ban_seconds, duration_label = parse_duration(duration)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
 
         # Check if current channel table is a tournament table
@@ -3697,8 +3816,12 @@ class PokerCog(commands.Cog):
 
         # 2. Persist ban to DB
         added = await db.ban_player(interaction.guild_id, user.id, user.display_name,
-                                    interaction.user.id, table_name)
+                                    interaction.user.id, table_name, reason,
+                                    expires_at_str(ban_seconds))
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
+
+        if added:
+            await send_mod_dm(user, "ban", reason, duration_label, interaction.user, interaction.guild.name)
 
         kicked_from = ""
 
@@ -3766,7 +3889,8 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kicked_from}",
                                             ephemeral=True)
         else:
-            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kicked_from}",
+            detail = f" *({duration_label}{f' — {reason}' if reason else ''})*"
+            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{detail}{kicked_from}",
                                             ephemeral=not kicked_from)
 
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
@@ -4134,7 +4258,9 @@ class PokerCog(commands.Cog):
         for b in bans:
             scope = f"Table: **{b['table_name']}**" if b['table_name'] else "**Server-wide**"
             date_str = b['ts'].split(" ")[0]
-            lines.append(f"• **{b['username']}** (`{b['user_id']}`) — {scope} *(on {date_str})*")
+            expiry = f" — expires {b['expires_at']}" if b.get('expires_at') else " — permanent"
+            reason = f" — *{b['reason']}*" if b.get('reason') else ""
+            lines.append(f"• **{b['username']}** (`{b['user_id']}`) — {scope} *(on {date_str})*{expiry}{reason}")
 
         description = "\n".join(lines)[:4096]
 

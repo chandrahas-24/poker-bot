@@ -145,6 +145,15 @@ async def init_db():
                 ts         TEXT NOT NULL
             )
         """)
+        for col, col_type in [
+            ("reason", "TEXT"),
+            ("expires_at", "TEXT"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE poker_bans ADD COLUMN {col} {col_type}")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
         await db.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -711,7 +720,8 @@ async def write_audit(action: str, user_id: int, user_name: str, detail: str = "
 # ── Bans ──────────────────────────────────────────────────────────────────────
 
 async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int,
-                     table_name: str | None = None):
+                     table_name: str | None = None, reason: str | None = None,
+                     expires_at: str | None = None):
     db = await _get_db()
     async with _write_lock:
         async with db.execute(
@@ -721,10 +731,10 @@ async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int,
             if await c.fetchone():
                 return False
         await db.execute(
-            "INSERT INTO poker_bans (guild_id, user_id, username, table_name, banned_by, ts) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO poker_bans (guild_id, user_id, username, table_name, banned_by, ts, reason, expires_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (guild_id, user_id, username, table_name, banned_by,
-             datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+             datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), reason, expires_at)
         )
         await db.commit()
     return True
@@ -757,17 +767,20 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
 
 
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     db = await _get_db()
     async with db.execute(
-            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
-            (guild_id, user_id)
+            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL "
+            "AND (expires_at IS NULL OR expires_at > ?)",
+            (guild_id, user_id, now)
     ) as c:
         if await c.fetchone():
             return True
     if table_name:
         async with db.execute(
-                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
-                (guild_id, user_id, table_name)
+                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=? "
+                "AND (expires_at IS NULL OR expires_at > ?)",
+                (guild_id, user_id, table_name, now)
         ) as c:
             if await c.fetchone():
                 return True
@@ -777,12 +790,31 @@ async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) 
 async def get_all_bans(guild_id: int) -> list[dict]:
     db = await _get_db()
     async with db.execute("""
-        SELECT user_id, username, table_name, banned_by, ts
+        SELECT id, user_id, username, table_name, banned_by, ts, reason, expires_at
         FROM poker_bans
         WHERE guild_id = ?
         ORDER BY ts DESC
     """, (guild_id,)) as c:
         return [dict(r) for r in await c.fetchall()]
+
+
+async def get_expired_bans() -> list[dict]:
+    """Bans whose expires_at has passed and are still present in the table."""
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    db = await _get_db()
+    async with db.execute("""
+        SELECT id, guild_id, user_id, username, table_name
+        FROM poker_bans
+        WHERE expires_at IS NOT NULL AND expires_at <= ?
+    """, (now,)) as c:
+        return [dict(r) for r in await c.fetchall()]
+
+
+async def delete_ban_by_id(ban_id: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("DELETE FROM poker_bans WHERE id=?", (ban_id,))
+        await db.commit()
 
 
 async def delete_player_stats(user_id: int) -> bool:

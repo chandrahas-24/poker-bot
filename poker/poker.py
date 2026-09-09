@@ -5,6 +5,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from treys import Evaluator, Card
 import os, asyncio, uuid, zipfile, traceback
+import random
+import re
 from datetime import datetime, timedelta, time as dt_time, timezone as _tz, date
 import time
 import math
@@ -12,11 +14,14 @@ import sys
 import config
 import subprocess
 
-from .engine import PokerGame, Street, hand_str
+from .engine import PokerGame, Street, hand_str, card_str, UNO_COLOR_EMOJI, SUIT_EMOJI
 from . import database as db
 from . import jackpot
 from . import taxation
 from . import card_images
+from . import shiny_cards
+from . import chaos
+from . import hand_eval
 from tournament import tournament_db as tdb
 import dateparser
 
@@ -30,11 +35,24 @@ TURN_TIMEOUT_DEFAULT    = config.TURN_TIMEOUT_DEFAULT
 NEXT_HAND_DELAY_DEFAULT = config.NEXT_HAND_DELAY_DEFAULT
 TABLE_RESEND_MSGS       = config.TABLE_RESEND_MSGS
 
-# ── AFK / decision-timeout system ───────────────────────────────
-LARGE_POT_THRESHOLD   = config.LARGE_POT_THRESHOLD
-LARGE_POT_EXTRA_TIME  = config.LARGE_POT_EXTRA_TIME
-DAILY_AFK_LIMIT        = config.DAILY_AFK_LIMIT
-CONSECUTIVE_AFK_LIMIT  = config.CONSECUTIVE_AFK_LIMIT
+# Chaos only
+BLUFF_27_BONUS = 30  # chips taken from each other player's table stack
+
+def _is_27_offsuit(hole_cards: list[int]) -> bool:
+    # 2/7 offsuit only
+    # triple threat not valid
+    if len(hole_cards) != 2:
+        return False
+    strs = [Card.int_to_str(c) for c in hole_cards]
+    ranks = {s[0] for s in strs}
+    suits = {s[1] for s in strs}
+    return ranks == {"2", "7"} and len(suits) == 2
+
+def _has_six_and_seven(hole_cards: list[int]) -> bool:
+    ranks = {Card.int_to_str(c)[0] for c in hole_cards}
+    return "6" in ranks and "7" in ranks
+
+SIXSEVEN_PATTERN = re.compile(r"\bsixx*\s*sevenn*\b|\b67\b", re.IGNORECASE)
 
 # ── TableState ────────────────────────────────────────────────────────────────
 
@@ -118,8 +136,13 @@ class TableState:
         self.msg_count = 0
         self.resend_threshold = TABLE_RESEND_MSGS
         self.session_allin_winners: set[int] = set()
-        self.rejoin_cooldowns: dict[int, float] = {}
         self.leave_cooldown_pending: set[int] = set()
+        self.chaos_mode: bool = False           # True if this table's guild is set to the Chaos preset
+        self.chaos_modifiers: list[str] = []    # active chaos modifier ids for the CURRENT hand
+        self.chaos_hand_num: int = 0            # counts hands at this table, for the announcement embed title
+        self.pending_gamble_bets: dict = {}      # Gamble the Gamble during the pre-deal window
+        self.active_random_event: dict | None = None  # Random events: message-based ones (phrase chant, number guess) read this from on_message
+        self.sixseven_bait_active: bool = False # 67 title after hand before next hand
 
     @property
     def is_tournament(self) -> bool:
@@ -147,6 +170,35 @@ if bot_instance and hasattr(bot_instance, 'poker_tables'):
 else:
     tables = {}
 
+# Cross table rejoin locks
+# manual kick, leaving, execution kick all globally lock w/ option for payment to override
+# ban has no bypass
+
+if bot_instance and hasattr(bot_instance, 'poker_global_locks'):
+    global_rejoin_locks: dict[int, dict] = bot_instance.poker_global_locks
+else:
+    global_rejoin_locks: dict[int, dict] = {}
+
+
+def apply_global_lock(user_id: int, seconds: int, payable: bool):
+    # Locks user_id out of joining any table for `seconds`
+    global_rejoin_locks[user_id] = {"expiry": time.time() + seconds, "payable": payable}
+
+
+def get_global_lock(user_id: int) -> dict | None:
+    # Returns {"expiry": float, "payable": bool} if user_id is currently locked out anywhere, else None
+    lock = global_rejoin_locks.get(user_id)
+    if lock is None:
+        return None
+    if time.time() >= lock["expiry"]:
+        global_rejoin_locks.pop(user_id, None)
+        return None
+    return lock
+
+
+def clear_global_lock(user_id: int):
+    global_rejoin_locks.pop(user_id, None)
+
 def get_table(key: tuple) -> TableState | None:
     return tables.get(key)
 
@@ -164,7 +216,13 @@ def get_chip_emoji(t_or_game) -> str:
             break
     return config.POKER_CHIP_EMOJI
 
+# Hidden Pot
+_HIDDEN_ACTION_PREFIXES = ("🏳️", "✅", "📞")
+
+
 def slog(t: TableState, text: str):
+    if "hidden_pot" in getattr(t, "chaos_modifiers", []) and text.lstrip().startswith(_HIDDEN_ACTION_PREFIXES):
+        return
     t.street_log.append(text)
 
 def slog_clear(t: TableState):
@@ -209,12 +267,6 @@ def cancel_timer(t: TableState):
     t.turn_deadline = 0.0
 
 def start_timer(t: TableState, channel):
-    # Always (re)bind the callback to the currently-loaded code. This runs
-    # on every single decision (start_timer fires after every refresh()),
-    # so it also self-heals the hook after a cog/module reload instead of
-    # leaving it pointed at a stale closure from the old module instance.
-    t.game.on_player_acted = lambda uid: _afk_reset_consecutive(uid)
-
     cp = t.game.current_player()
     if not cp or t.game.street in (Street.WAITING, Street.SHOWDOWN):
         cancel_timer(t)
@@ -231,124 +283,9 @@ def start_timer(t: TableState, channel):
     t.timer_task.add_done_callback(_task_catcher)
 
 
-# ── AFK / decision-timeout helpers ──────────────────────────────
-# State is global — one record per user_id across every table/guild — and
-# persisted in the `afk_tracking` DB table (see database.py), not per-table.
-
-def _afk_reset_consecutive(user_id: int):
-    """Called synchronously from the engine right after a genuine decision
-    (fold/check/call/raise, including one resolved via a queued premove).
-    Engine action methods are synchronous, so the actual (rare) DB update is
-    scheduled as a background task rather than awaited here directly."""
-    task = asyncio.create_task(_afk_reset_consecutive_async(user_id))
-    task.add_done_callback(_task_catcher)
-
-async def _afk_reset_consecutive_async(user_id: int):
-    state = await db.get_afk_state(user_id)
-    if state["consecutive_count"] == 0:
-        return  # nothing to persist — avoid a needless write
-    await db.save_afk_state(
-        user_id, state["daily_count"], state["daily_date"], 0
-    )
-
-async def _handle_forgiven_timeout(t: TableState, channel, user_id: int, p, state: dict):
-    """Auto check/fold on behalf of an AFK player, using forgiveness."""
-    name = p.display_name
-    call_amt = t.game.call_amount(p)
-    # If this miss will push them over the consecutive-AFK limit, they're
-    # getting removed — don't let a legal "check" carry them (with live
-    # equity) through further streets while still AFK. Force them out of
-    # the current hand immediately instead.
-    will_be_removed = (state["consecutive_count"] + 1) >= CONSECUTIVE_AFK_LIMIT
-
-    # Suppress the on_player_acted callback for exactly this user_id so our
-    # own automatic action doesn't get mistaken for a real decision and wipe
-    # out the consecutive-AFK count we're about to record. Any other player
-    # whose premove fires as a knock-on effect is unaffected.
-    t.game._afk_auto_user_id = user_id
-    try:
-        if will_be_removed:
-            ok, action_msg = t.game.fold(user_id)
-        elif call_amt == 0:
-            ok, action_msg = t.game.check_or_call(user_id)  # legal check
-        else:
-            ok, action_msg = t.game.fold(user_id)
-    finally:
-        t.game._afk_auto_user_id = None
-
-    if not ok:
-        # It's no longer this player's turn / they already acted — a race
-        # resolved the decision through another path. Do nothing.
-        return
-
-    state["daily_count"] += 1
-    state["consecutive_count"] += 1
-    await db.save_afk_state(user_id, state["daily_count"], state["daily_date"], state["consecutive_count"])
-
-    if any(m in action_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-        slog_clear(t)
-    for part in action_msg.split("\n"):
-        if part.strip():
-            slog(t, part)
-
-    verb = "folded" if (will_be_removed or call_amt > 0) else "checked"
-    await channel.send(
-        f"⏰ **{name}** timed out and was auto-{verb}. "
-        f"({state['daily_count']}/{DAILY_AFK_LIMIT} timeouts used today)"
-    )
-
-    if state["consecutive_count"] >= CONSECUTIVE_AFK_LIMIT:
-        if user_id not in t.game.kicked_users:
-            t.game.kicked_users.append(user_id)
-        if user_id not in t.game.pending_leaves:
-            t.game.pending_leaves.append(user_id)
-        t.leave_cooldown_pending.add(user_id)
-        await channel.send(
-            f"🚪 **{name}** missed **{CONSECUTIVE_AFK_LIMIT}** decisions in a row "
-            f"and will be removed after this hand."
-        )
-
-    if t.game._hand_result:
-        await _process_result(channel.guild, channel, t)
-    else:
-        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
-
-async def _handle_old_timeout(t: TableState, channel, user_id: int, p):
-    """Original (pre-forgiveness) timeout behavior: force-fold and remove
-    after the hand. Used once a player has exhausted the daily forgiveness
-    allowance. Left intentionally identical to the prior implementation."""
-    name = p.display_name
-    if user_id not in t.game.kicked_users:
-        t.game.kicked_users.append(user_id)
-    if user_id not in t.game.pending_leaves:
-        t.game.pending_leaves.append(user_id)
-    t.leave_cooldown_pending.add(user_id)
-
-    if not p.folded:
-        ok, fold_msg = t.game.force_fold(user_id)
-        if ok:
-            parts = fold_msg.split("\n")
-            if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-                slog_clear(t)
-            for part in parts:
-                if part.strip():
-                    slog(t, part)
-
-    await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
-    if t.game._hand_result:
-        await _process_result(channel.guild, channel, t)
-    else:
-        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
-
 async def _turn_timer(t: TableState, channel, user_id: int):
     settings = await db.get_settings(channel.guild.id)
     timeout = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
-
-    # Large-pot extra decision time — evaluated once, right as the timer
-    # starts, from the pot at that exact moment. Does not touch the timer
-    # for pots <= LARGE_POT_THRESHOLD.
-    if t.game.pot > LARGE_POT_THRESHOLD:
-        timeout += LARGE_POT_EXTRA_TIME
 
     # Set the initial mutable deadline
     t.turn_deadline = time.time() + timeout
@@ -396,23 +333,26 @@ async def _turn_timer(t: TableState, channel, user_id: int):
     p = t.game.get_player(user_id)
     if not p:
         return
-    # NOTE: deliberately NOT also checking p.acted here. _post_blind() sets
-    # acted=True for whoever posts the small blind (and it isn't reset the
-    # way the big blind's is), so in heads-up — and any time action folds
-    # back around to the SB with no reopening raise — the SB's `acted` flag
-    # is already True before they've made their real decision. is_turn() is
-    # the correct and sufficient guard here (it's what the original
-    # pre-AFK-system code relied on too); p.folded is kept as a cheap extra
-    # check since a folded player is unambiguously done for the hand.
-    if p.folded:
-        return
 
-    state = await db.get_afk_state(user_id)
+    name = p.display_name
+    if user_id not in t.game.kicked_users:
+        t.game.kicked_users.append(user_id)
+    if user_id not in t.game.pending_leaves:
+        t.game.pending_leaves.append(user_id)
+    t.leave_cooldown_pending.add(user_id)
 
-    if state["daily_count"] < DAILY_AFK_LIMIT:
-        await _handle_forgiven_timeout(t, channel, user_id, p, state)
-    else:
-        await _handle_old_timeout(t, channel, user_id, p)
+    if not p.folded:
+        ok, fold_msg = t.game.force_fold(user_id)
+        if ok:
+            parts = fold_msg.split("\n")
+            if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                slog_clear(t)
+            for part in parts:
+                if part.strip():
+                    slog(t, part)
+
+    await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
+    await _handle_post_action(channel.guild, channel, t)
 
 # ── Auto next hand ────────────────────────────────────────────────────────────
 
@@ -421,6 +361,68 @@ def schedule_next_hand(t: TableState, channel):
         t.auto_task.cancel()
     t.auto_task = asyncio.create_task(_auto_next_hand(t, channel))
     t.auto_task.add_done_callback(_task_catcher)
+
+async def _roll_chaos_for_hand(channel, t: TableState, settings: dict, player_count: int):
+    # Called right before each start_hand() (non tutorial tables)
+    # if chaos rolls modifiers & stores on TableState and PokerGame
+    # clears mods on switching to normal table
+    
+    t.chaos_mode = settings.get("table_mode") == "chaos"
+    t.game.is_chaos_hand = t.chaos_mode
+    if not t.chaos_mode:
+        t.chaos_modifiers = []
+        t.game.chaos_modifiers = []
+        return
+
+    t.chaos_hand_num += 1
+    t.chaos_modifiers = chaos.pick_modifiers(player_count)
+    t.game.chaos_modifiers = t.chaos_modifiers
+
+    # Leaky Jackpot 
+    # pull the DB jackpot down here (async), then hand the game engine a number to add to the pot synchronously.
+    if "leaky_jackpot" in t.chaos_modifiers:
+        jp = await db.get_jackpot()
+        leak = math.ceil(jp * chaos.get("leaky_jackpot").params["leak_pct"])
+        if leak > 0:
+            await db.adjust_jackpot(-leak)
+        t.game.pending_pot_boost = leak
+    else:
+        t.game.pending_pot_boost = 0
+
+    try:
+        await channel.send(embed=chaos.build_announcement_embed(t.chaos_modifiers, hand_num=t.chaos_hand_num))
+        if "leaky_jackpot" in t.chaos_modifiers and t.game.pending_pot_boost > 0:
+            await channel.send(
+                f"💧 The **jackpot** sprung a leak of **{t.game.pending_pot_boost}** chips into this hand's pot!"
+            )
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to send chaos announcement embed: {e}")
+
+    # Gamble the Gamble timed pre-deal betting window. 
+    # cards don't exist yet at this point, so nobody can see their hand while betting, no extra guarding needed.
+    if "gamble_the_gamble" in t.chaos_modifiers:
+        t.pending_gamble_bets = await _run_gamble_the_gamble(channel, t)
+    else:
+        t.pending_gamble_bets = {}
+
+
+async def _announce_bounty_if_active(channel, t: TableState):
+    pass
+
+
+async def _announce_uno_reverse_reminder(channel, t: TableState):
+    # Uno Reverse reminder
+    # mentions everyone at table
+    mentions = " ".join(f"<@{p.user_id}>" for p in t.game.players_in_hand)
+    if not mentions:
+        return
+    try:
+        await channel.send(
+            f"🔄 {mentions} if you still have an Uno Reverse card, now's your last chance to use it!"
+        )
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to announce Uno Reverse reminder: {e}")
+
 
 async def _auto_next_hand(t: TableState, channel):
     settings = await db.get_settings(channel.guild.id)
@@ -437,6 +439,9 @@ async def _auto_next_hand(t: TableState, channel):
         print(f"🚨 [ERROR] {e}")
         import traceback
         traceback.print_exc()
+
+    # Random events rolled between hands
+    await _maybe_fire_random_event(channel, t, "")
 
     try:
         await asyncio.sleep(delay)
@@ -580,6 +585,9 @@ async def _auto_next_hand(t: TableState, channel):
         t.game.MIN_BUYIN = settings.get("min_wallet", 50)
     t.resend_threshold = settings.get("resend_after_msgs", TABLE_RESEND_MSGS)
 
+    if not getattr(t, 'is_tournament', False):
+        await _roll_chaos_for_hand(channel, t, settings, total)
+
     slog_clear(t)
     success, msg = t.game.start_hand()
     slog(t, msg)
@@ -588,14 +596,43 @@ async def _auto_next_hand(t: TableState, channel):
         await channel.send(f"⚠️ Could not start next hand: {msg}")
         return
 
+    t.sixseven_bait_active = False  # "67" window closes the moment the next hand actually starts
+    await _announce_bounty_if_active(channel, t)
+
+    if t.pending_gamble_bets:
+        await _resolve_gamble_the_gamble(channel, t, t.pending_gamble_bets)
+        t.pending_gamble_bets = {}
+
     t.msg_count = 0
     await refresh(channel, t, new_hand=True, cosmetics_cache=t.cosmetics_cache)
+
+async def _silent_strip_view(msg: discord.Message):
+    try:
+        await msg.edit(view=None)
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
 
 async def _close_table(channel, t: TableState):
     if getattr(t, 'is_fully_closed', False):
         return
     t.is_fully_closed = True
     await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'close')
+
+    # closing chaos falls back to a normal Medium table.
+    if getattr(t, "chaos_mode", False):
+        try:
+            reset = chaos.MEDIUM_RESET_SETTINGS
+            await db.set_settings(
+                channel.guild.id,
+                small_blind=reset["small_blind"],
+                big_blind=reset["big_blind"],
+                min_wallet=reset["min_wallet"],
+                max_wallet=reset["max_wallet"],
+                table_mode="normal",
+            )
+        except Exception as e:
+            print(f"🚨 [ERROR] Failed to reset chaos table settings on close: {e}")
 
     t.closing = True
     key = (channel.guild.id, channel.id)
@@ -609,13 +646,9 @@ async def _close_table(channel, t: TableState):
     tables.pop(key, None)
 
     if t.hand_msg:
-        try:
-            # Fire-and-forget: Tell Discord to remove the buttons, but DO NOT wait for it to finish
-            asyncio.create_task(t.hand_msg.edit(view=None))
-        except Exception as e:
-            print(f"🚨 [ERROR] {e}")
-            import traceback
-            traceback.print_exc()
+        # tell discord to remove buttons, don't wait for it to finish
+        # Goes through _silent_strip_view rather than a bare `t.hand_msg.edit(view=None)` here
+        asyncio.create_task(_silent_strip_view(t.hand_msg))
 
     is_tourney = getattr(t, 'is_tournament', False)
     if is_tourney:
@@ -719,11 +752,17 @@ async def post_hand_log(channel, t: TableState, result):
         uname = _name_map.get(uid, "Unknown")
         return f"{uname} ({uid})"
 
-    if hasattr(result, 'community') and result.community:
+    if hasattr(result, 'community2') and result.community2:
+        lines.append(f"Board 1: {hand_str(result.community)}")
+        lines.append(f"Board 2: {hand_str(result.community2)}")
+    elif hasattr(result, 'community') and result.community:
         lines.append(f"Board: {hand_str(result.community)}")
 
     pot_results = result.pot_results or []
+    pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results))]
     ranks = result.winner_ranks or {}
+    ranks2 = result.winner_ranks2 or {}
+    double_board_active = bool(getattr(result, "community2", None))
 
     # 🚨 Grab the folded snapshot from the engine
     folded_ids = getattr(result, "folded_ids", set())
@@ -732,24 +771,37 @@ async def post_hand_log(channel, t: TableState, result):
     for uid, delta in result.chip_deltas.items():
         sign = "+" if delta > 0 else ""
         ustr = await uid_str(uid)
-        rank = ranks.get(uid)
         sp = _player_map.get(uid)
 
         # 🚨 Check the snapshot to append (folded)
         if sp and sp.hole_cards:
-            cards = hand_str(sp.hole_cards) + (" ✨" if sp.egirl_saro else "")
+            cards = hand_str(sp.hole_cards) + (" ✨" if sp.shiny_ids else "")
             if uid in folded_ids:
                 cards += " (folded)"
         else:
             cards = "no cards"
 
-        rank_part = f" [{rank}]" if rank else ""
+        if double_board_active:
+            # Each board gets its own rank shown separately
+            board_parts = []
+            r1 = ranks.get(uid)
+            r2 = ranks2.get(uid)
+            if r1:
+                board_parts.append(f"B1: {r1}")
+            if r2:
+                board_parts.append(f"B2: {r2}")
+            rank_part = f" [{', '.join(board_parts)}]" if board_parts else ""
+        else:
+            rank = ranks.get(uid)
+            rank_part = f" [{rank}]" if rank else ""
 
         lines.append(f"  {ustr}: {cards}{rank_part}  Net: {sign}{delta}")
 
     if pot_results:
-        for i, (amt, winners) in enumerate(pot_results):
-            label = "Main pot" if i == 0 else f"Side pot {i}"
+        for (amt, winners), (pot_idx, board_num) in zip(pot_results, pot_result_meta):
+            label = "Main pot" if pot_idx == 0 else f"Side pot {pot_idx}"
+            if board_num:
+                label += f" (Board {board_num})"
             wstrs = [await uid_str(w.user_id) for w in winners]
             each = amt // len(winners)
             lines.append(f"  {label} ({amt}): {', '.join(wstrs)}" + (f" ({each} each)" if len(winners) > 1 else ""))
@@ -818,7 +870,14 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
     label = STREET_LABEL.get(game.street, "")
     cp    = game.current_player()
 
+    # cute mode, visual only
+    cute_mode = "cute_mode" in getattr(t, "chaos_modifiers", [])
+    if cute_mode:
+        color = 0xFFB6D9
+
     title = f"🃏 {t.name}"
+    if cute_mode:
+        title = f"💕 {t.name}"
     if game.hand_num:
         title += f"  ·  Hand #{game.hand_num}"
     title += f"  ·  {manager_name}"
@@ -859,6 +918,11 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
                 chunk_text = chunk_text[:1020] + "..."
             embed.add_field(name=field_title, value=chunk_text, inline=False)
 
+    # 1.5 CHAOS MODIFIERS (only shown while active for the current hand)
+    if getattr(t, "chaos_modifiers", None):
+        embed.add_field(name="🎲 Chaos Modifiers Active",
+                         value=chaos.modifiers_summary_line(t.chaos_modifiers), inline=False)
+
     # 2. SAFE STREET LOG (Hard-capped at 1024 characters)
     if t.street_log:
         log_text = "\n".join(t.street_log[-8:])
@@ -868,7 +932,12 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
 
     # 3. POT / TURN LOGIC
     if game.street not in (Street.WAITING,):
-        pot_line = f"**Pot:** {game.pot} {emoji}"
+        # Chaos: Hidden Pot — pot size is hidden, but the current bet stays
+        # visible since players still need it to call raises.
+        if "hidden_pot" in getattr(t, "chaos_modifiers", []):
+            pot_line = "**Pot:** 🙈 hidden"
+        else:
+            pot_line = f"**Pot:** {game.pot} {emoji}"
         if game.current_bet:
             pot_line += f"  ·  **Bet:** {game.current_bet}"
         if cp:
@@ -879,16 +948,77 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
 
 # ── Board image ───────────────────────────────────────────────────────────────
 
+def _reverse_board_display(community: list[int]) -> list[int]:
+    # reveal left to right
+    n = len(community)
+    slots = [card_images.BACK_SENTINEL] * 5
+    if n >= 1:
+        slots[4] = community[0]        # river (revealed 1st)
+    if n >= 2:
+        slots[3] = community[1]        # turn (revealed 2nd)
+    if n >= 5:
+        slots[0], slots[1], slots[2] = community[2], community[3], community[4]  # flop (revealed 3rd)
+    return slots
+
+
+def _remap_blind_indices_for_reverse(community: list[int], blind_idx: set[int]) -> set[int]:
+    # translates blindness reveal order indices into reverse display positions 
+    n = len(community)
+    mapping = {}
+    if n >= 1:
+        mapping[0] = 4
+    if n >= 2:
+        mapping[1] = 3
+    if n >= 5:
+        mapping[2], mapping[3], mapping[4] = 0, 1, 2
+    return {mapping[i] for i in blind_idx if i in mapping}
+
+
 async def update_board(t: TableState):
     """Generate card strip File object — attached directly to the embed message."""
     game = t.game
     if not USE_IMAGES or game.street in (Street.WAITING, Street.PREFLOP) or not game.community:
         t.board_file = None
         return
+
+    cute_mode = "cute_mode" in t.chaos_modifiers
+
+    if "double_board" in t.chaos_modifiers:
+        if "reverse" in t.chaos_modifiers:
+            # river, turn, then flop
+            display_board1 = _reverse_board_display(game.community)
+            display_blind1 = _remap_blind_indices_for_reverse(game.community, game.blinded_community_idx)
+            display_board2 = _reverse_board_display(game.community2)
+            display_blind2 = _remap_blind_indices_for_reverse(game.community2, game.blinded_community2_idx)
+            t.board_file = await asyncio.to_thread(
+                card_images.make_double_board_strip,
+                display_board1, display_board2,
+                display_blind1, display_blind2, cute_mode,
+            )
+            return
+
+        t.board_file = await asyncio.to_thread(
+            card_images.make_double_board_strip,
+            list(game.community), list(game.community2),
+            game.blinded_community_idx, game.blinded_community2_idx, cute_mode,
+        )
+        return
+
+    if "reverse" in t.chaos_modifiers:
+        display_cards = _reverse_board_display(game.community)
+        display_blind = _remap_blind_indices_for_reverse(game.community, game.blinded_community_idx)
+        t.board_file = await asyncio.to_thread(
+            card_images.make_strip, display_cards, 0, False, None, display_blind, None, cute_mode
+        )
+        return
+
     backs = max(0, 5 - len(game.community))
 
     # Push image generation to a background thread!
-    t.board_file = await asyncio.to_thread(card_images.make_strip, list(game.community), backs)
+    t.board_file = await asyncio.to_thread(
+        card_images.make_strip, list(game.community), backs, False, None, game.blinded_community_idx,
+        None, cute_mode
+    )
 # ── Auto-delete helper ────────────────────────────────────────────────────────
 
 async def _delete_after(message: discord.Message, delay: float):
@@ -944,6 +1074,77 @@ async def send_turn_ping(channel, t: TableState):
 
 # ── Action & Execution Helpers ────────────────────────────────────────────────
 
+RUNOUT_REVEAL_DELAY = 2.5  # seconds paused between each community card reveal during
+                            # an all-in run-out (natural, or the "All In!" modifier) —
+                            # see _handle_post_action and engine.py's runout_pause_pending
+
+
+async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
+    for trigger_point in t.game.pending_random_event_triggers:
+        event_id = chaos.pick_event_id()
+        if event_id:
+            asyncio.create_task(_run_random_event(channel, t, event_id, trigger_point))
+    t.game.pending_random_event_triggers = []
+
+    # all in reveals
+    while t.game.runout_pause_pending:
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+
+        # uno reverse fires at turn to avoid all in bugs
+        if t.game.uno_reverse_reminder_pending:
+            t.game.uno_reverse_reminder_pending = False
+            await _announce_uno_reverse_reminder(channel, t)
+        await asyncio.sleep(RUNOUT_REVEAL_DELAY)
+        tail = t.game.continue_runout()
+        if tail:
+            if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
+                slog_clear(t)
+            for part in tail.split("\n"):
+                if part.strip():
+                    slog(t, part)
+
+    # uno reverse
+    if t.game.uno_reverse_reminder_pending:
+        t.game.uno_reverse_reminder_pending = False
+        await _announce_uno_reverse_reminder(channel, t)
+
+    if t.game._hand_result:
+        await _process_result(guild, channel, t)
+        return
+
+    # auction pauses river betting
+    ran_auction = False
+    if ("community_auction" in t.chaos_modifiers and t.game.street == Street.RIVER
+            and len(t.game.community) == 5 and not t.game.community_auction_done):
+        t.game.community_auction_done = True
+        # Update the board image/embed so no turn ping, or inactivity timer
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+        await _run_community_auction(channel, t)
+        ran_auction = True
+
+    # 
+    if t.game.awaiting_runout_showdown:
+        if not ran_auction:
+            await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+            await asyncio.sleep(RUNOUT_REVEAL_DELAY)
+        tail = t.game.resume_runout_showdown()
+        if tail:
+            if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
+                slog_clear(t)
+            for part in tail.split("\n"):
+                if part.strip():
+                    slog(t, part)
+        await _handle_post_action(guild, channel, t)
+        return
+
+    if ran_auction:
+        # resume turn ping and inactivity timers
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+        return
+
+    await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+
+
 async def run_table_action(guild: discord.Guild, channel, t: TableState, interaction: discord.Interaction, fn, *args):
     if not interaction.response.is_done():
         await interaction.response.defer()
@@ -963,10 +1164,7 @@ async def run_table_action(guild: discord.Guild, channel, t: TableState, interac
         if part.strip():
             slog(t, part)
 
-    if t.game._hand_result:
-        await _process_result(guild, channel, t)
-    else:
-        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+    await _handle_post_action(guild, channel, t)
 
 class ActionConfirmView(discord.ui.View):
     def __init__(self, t: TableState, channel, guild, user_id: int, action_fn, action_args: list, prompt_text: str):
@@ -1020,7 +1218,7 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
         await channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
     elif "left" in msg or "cashed out" in msg:
         cooldown = config.TOURNAMENT_REJOIN_COOLDOWN if getattr(t, 'is_tournament', False) else config.REGULAR_REJOIN_COOLDOWN
-        t.rejoin_cooldowns[interaction.user.id] = time.time() + cooldown
+        apply_global_lock(interaction.user.id, cooldown, payable=True)
         await channel.send(
             f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
 
@@ -1043,7 +1241,7 @@ async def join_table_execute(interaction: discord.Interaction, t: TableState, ch
         if not ok_fee:
             await interaction.followup.send("❌ Failed to deduct rejoin fee.", ephemeral=True)
             return
-        t.rejoin_cooldowns.pop(interaction.user.id, None)
+        clear_global_lock(interaction.user.id)
 
         try:
             await db.adjust_jackpot(rejoin_fee)
@@ -1178,6 +1376,9 @@ class PreferencesView(discord.ui.View):
         self.btn_confirm_call_raise = discord.ui.Button(custom_id="pref_confirm_call_raise")
         self.btn_confirm_call_raise.callback = self.on_confirm_call_raise_click
 
+        self.btn_card_size = discord.ui.Button(custom_id="pref_card_size")
+        self.btn_card_size.callback = self.toggle_card_size
+
         # Add items so they are registered in ViewStore for dispatching
         self.add_item(self.btn_auto_rebuy)
         self.add_item(self.btn_auto_showdown)
@@ -1186,6 +1387,7 @@ class PreferencesView(discord.ui.View):
         self.add_item(self.btn_confirm_fold)
         self.add_item(self.btn_confirm_leave)
         self.add_item(self.btn_confirm_call_raise)
+        self.add_item(self.btn_card_size)
 
     def has_components_v2(self) -> bool:
         return True
@@ -1264,6 +1466,11 @@ class PreferencesView(discord.ui.View):
         else:
             self.btn_confirm_call_raise.label = f"> {ccr_thresh:,}"
             self.btn_confirm_call_raise.style = discord.ButtonStyle.blurple
+
+        # Card Size (private "My Cards" view only)
+        cs_val = self.pref.get("card_size", "normal")
+        self.btn_card_size.label = "Compact" if cs_val == "compact" else "Normal"
+        self.btn_card_size.style = discord.ButtonStyle.blurple if cs_val == "compact" else discord.ButtonStyle.grey
 
     def to_components(self) -> list[dict]:
         self.update_button_states()
@@ -1365,6 +1572,23 @@ class PreferencesView(discord.ui.View):
                         }
                     ],
                     "accessory": button_to_dict(self.btn_confirm_call_raise)
+                },
+                # Separator
+                {
+                    "type": 14,
+                    "divider": True,
+                    "spacing": 1
+                },
+                # Section 8: Card Size
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Card Size**\nShrink your own hole-card image (My Cards only) for a better fit on small/mobile screens. Doesn't affect what other players see."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_card_size)
                 }
             ]
         }
@@ -1443,6 +1667,15 @@ class PreferencesView(discord.ui.View):
         await db.set_player_preference(self.user_id, confirm_leave=new_val)
         await self.refresh_preferences(interaction)
 
+    async def toggle_card_size(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        val = self.pref.get("card_size", "normal")
+        new_val = "normal" if val == "compact" else "compact"
+        await db.set_player_preference(self.user_id, card_size=new_val)
+        await self.refresh_preferences(interaction)
+
     async def on_confirm_call_raise_click(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
@@ -1467,7 +1700,19 @@ class PreferencesView(discord.ui.View):
 
 # ── Refresh ───────────────────────────────────────────────────────────────────
 
-async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cache: dict = None):
+async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cache: dict = None,
+                   pause_turn: bool = False):
+    """
+    `pause_turn=True` posts/edits the board embed and image as normal, but
+    withholds the interactive action view and skips the turn ping /
+    inactivity timer entirely — nobody can act (or get auto-folded) while
+    it's on. Used for Chaos: Community Auction (freshly-dealt river shown
+    before the auction opens) and for the dramatic run-out reveal (each
+    street shown in turn while an all-in hand plays itself out with no
+    betting to pause for in the first place). A normal (pause_turn=False)
+    refresh() afterward is what brings the active view, ping, and timer
+    back.
+    """
     await update_board(t)
     title_cache: dict[int, str | None] = {}
     try:
@@ -1491,7 +1736,10 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
 
     embed = build_embed(t, title_cache, t.manager_name)   # sets attachment://board.png if file present
 
-    if t.is_tournament:
+    if pause_turn:
+        # bet pause 
+        view = AuctionCardsOnlyView(t)
+    elif t.is_tournament:
         from tournament import tournament
         view = tournament.TournamentGameView(t)
     else:
@@ -1499,17 +1747,31 @@ async def refresh(channel, t: TableState, new_hand: bool = False, cosmetics_cach
     t.active_view = view
 
     f     = t.board_file
+    send_view = view if view is not None else discord.utils.MISSING
     if new_hand or not t.hand_msg:
         if new_hand:
             t.ping_user_id = None  # allow ping to re-send beneath the new embed
-        t.hand_msg = await channel.send(embed=embed, view=view, file=f)
+        t.hand_msg = await channel.send(embed=embed, view=send_view, file=f)
     else:
         try:
             # Edit with new attachment — Discord replaces the previous one
             await t.hand_msg.edit(embed=embed, view=view, attachments=([f] if f else []))
         except (discord.NotFound, discord.HTTPException):
-            t.hand_msg = await channel.send(embed=embed, view=view, file=f)
+            t.hand_msg = await channel.send(embed=embed, view=send_view, file=f)
     t.board_file = None  # consumed
+
+    if pause_turn:
+        # timer + ping pause
+        cancel_timer(t)
+        if t.ping_msg:
+            try:
+                await t.ping_msg.delete()
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            t.ping_msg = None
+        t.ping_user_id = None
+        return
+
     await send_turn_ping(channel, t)
     start_timer(t, channel)
 
@@ -1519,47 +1781,74 @@ def _slog_result(t: TableState, result):
     """Put a clean winner line into street_log so the embed shows correct info."""
     game        = t.game
     ranks       = result.winner_ranks or {}
+    ranks2      = result.winner_ranks2 or {}
     pot_results = result.pot_results
+    pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results or []))]
+    double_board_active = bool(result.community2)
     emoji       = get_chip_emoji(t)
+    hidden_pot  = "hidden_pot" in getattr(t, "chaos_modifiers", [])
+    
     # Use result.community — game.community is already cleared by _end_hand at this point.
-    if result.community:
+    if double_board_active:
+        slog(t, f"🃏 Board 1: {hand_str(result.community)}")
+        slog(t, f"🃏 Board 2: {hand_str(result.community2)}")
+    elif result.community:
         slog(t, f"🃏 Board: {hand_str(result.community)}")
 
-    if not pot_results or len(pot_results) == 1:
+    distinct_pots = len({pot_idx for pot_idx, _ in pot_result_meta})
+    if not pot_results or (distinct_pots <= 1 and not double_board_active):
         if len(result.winners) == 1:
             w = result.winners[0]
             gained = result.chip_deltas.get(w.user_id, 0)
             rank = ranks.get(w.user_id)
             rs = f" ({rank})" if rank else ""
 
-            # FIX: Smart sign formatting
-            sign = "+" if gained > 0 else ""
-            slog(t, f"🏆 **{w.display_name}** won **{sign}{gained}** {emoji}{rs}")
+            if hidden_pot:
+                slog(t, f"🏆 **{w.display_name}** won 🙈 hidden{rs}")
+            else:
+                # FIX: Smart sign formatting
+                sign = "+" if gained > 0 else ""
+                slog(t, f"🏆 **{w.display_name}** won **{sign}{gained}** {emoji}{rs}")
         else:
             names_and_nets = []
             for w in result.winners:
-                gained = result.chip_deltas.get(w.user_id, 0)
-                sign = "+" if gained > 0 else ""
-                names_and_nets.append(f"**{w.display_name}** ({sign}{gained})")
-            slog(t, f"🤝 Split: {', '.join(names_and_nets)} {emoji}")
+                if hidden_pot:
+                    names_and_nets.append(f"**{w.display_name}**")
+                else:
+                    gained = result.chip_deltas.get(w.user_id, 0)
+                    sign = "+" if gained > 0 else ""
+                    names_and_nets.append(f"**{w.display_name}** ({sign}{gained})")
+            tail = "" if hidden_pot else f" {emoji}"
+            slog(t, f"🤝 Split: {', '.join(names_and_nets)}{tail}")
+            
     else:
-        for i, (amt, winners) in enumerate(pot_results):
-            label = "Main" if i == 0 else f"Side {i}"
+        for (amt, winners), (pot_idx, board_num) in zip(pot_results, pot_result_meta):
+            label = "Main" if pot_idx == 0 else f"Side {pot_idx}"
+            if board_num:
+                label += f" (Board {board_num})"
+            amt_str = "🙈 hidden" if hidden_pot else f"{amt}{emoji}"
+            board_ranks = ranks2 if board_num == 2 else ranks
             if len(winners) == 1:
                 w      = winners[0]
-                rank   = ranks.get(w.user_id)
+                rank   = board_ranks.get(w.user_id)
                 rs     = f" ({rank})" if rank else ""
-                slog(t, f"🏆 **{label}** ({amt}{emoji}) → **{w.display_name}**{rs}")
+                slog(t, f"🏆 **{label}** ({amt_str}) → **{w.display_name}**{rs}")
             else:
-                each  = amt // len(winners)
                 names = ", ".join(f"**{w.display_name}**" for w in winners)
-                slog(t, f"🤝 **{label}** ({amt}{emoji}) split → {names} ({each} each)")
+                if hidden_pot:
+                    slog(t, f"🤝 **{label}** ({amt_str}) split → {names}")
+                else:
+                    each = amt // len(winners)
+                    slog(t, f"🤝 **{label}** ({amt_str}) split → {names} ({each} each)")
 
 
 async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict = None):
     game = t.game
     ranks = result.winner_ranks or {}
+    ranks2 = result.winner_ranks2 or {}
     pot_results = result.pot_results  # [(amount, [PokerPlayer, ...]), ...]
+    pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results or []))]
+    double_board_active = bool(result.community2)
     emoji = get_chip_emoji(t)
 
     _cos_cache = cosmetics_cache or {}
@@ -1591,12 +1880,20 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
                 else:
                     quotes.append(f"> **{w.display_name}:** *\"{wm}\"*")
         return "\n".join(quotes)
+    
+    def _add_board_fields():
+        if double_board_active:
+            embed.add_field(name="🃏 Board 1", value=f"{hand_str(result.community)}\n\u200b", inline=True)
+            embed.add_field(name="🃏 Board 2", value=f"{hand_str(result.community2)}\n\u200b", inline=True)
+        elif result.community:
+            embed.add_field(name="🃏 Board", value=f"{hand_str(result.community)}\n\u200b", inline=False)
 
     # 🏆 Create the sleek winner "Receipt" Embed
     embed = discord.Embed(title=f"🏆 Hand #{game.hand_num} Results", color=0xF1C40F)
     desc_lines = []
 
-    if not pot_results or len(pot_results) == 1:
+    distinct_pots = len({pot_idx for pot_idx, _ in pot_result_meta})
+    if not pot_results or (distinct_pots <= 1 and not double_board_active):
         # ── Single Pot (or Fold Win) ──
         if len(result.winners) == 1:
             w = result.winners[0]
@@ -1615,8 +1912,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
 
             embed.description = "\n".join(desc_lines).strip() + "\n\u200b"
 
-            if result.community:
-                embed.add_field(name="🃏 Board", value=f"{hand_str(result.community)}\n\u200b", inline=False)
+            _add_board_fields()
 
             pre_tax_pot = result.pot + getattr(result, "tax", 0)
             embed.add_field(name="Pot", value=f"{pre_tax_pot} {emoji}", inline=True)
@@ -1639,28 +1935,29 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
 
             embed.description = "\n".join(desc_lines).strip() + "\n\u200b"
 
-            if result.community:
-                embed.add_field(name="🃏 Board", value=f"{hand_str(result.community)}\n\u200b", inline=False)
+            _add_board_fields()
 
             # Removed the Total Pot block as requested for split pots
     else:
-        # ── Multiple Side Pots ──
-        for i, (amt, winners) in enumerate(pot_results):
-            label = "Main Pot" if i == 0 else f"Side Pot {i}"
-            icon = "🥇" if i == 0 else "🥈"
-
-            # 🚨 Updated format based on the screenshot!
+        # Multiple Side Pots and/or Double Board splits
+        for (amt, winners), (pot_idx, board_num) in zip(pot_results, pot_result_meta):
+            label = "Main Pot" if pot_idx == 0 else f"Side Pot {pot_idx}"
+            if board_num:
+                label += f" — Board {board_num}"
+            icon = "🥇" if pot_idx == 0 else "🥈"
+            board_ranks = ranks2 if board_num == 2 else ranks
+            
             desc_lines.append(f"{icon} **{label}** {emoji} **{amt}**")
 
             if len(winners) == 1:
                 w = winners[0]
-                rank = ranks.get(w.user_id)
+                rank = board_ranks.get(w.user_id)
                 rs = f" with **{rank}**" if rank else ""
                 desc_lines.append(f"↳ **{w.display_name}**{_title_str(w.user_id)}{rs}")
             else:
                 split_amt = amt // len(winners)
                 for w in winners:
-                    rank = ranks.get(w.user_id)
+                    rank = board_ranks.get(w.user_id)
                     rs = f" with **{rank}**" if rank else ""
                     desc_lines.append(
                         f"↳ **{w.display_name}**{_title_str(w.user_id)} *(split {split_amt}* {emoji}*){rs}")
@@ -1673,9 +1970,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
         # Inject invisible spacer (\u200b) to force Discord to give us breathing room before the Board
         embed.description = "\n".join(desc_lines).strip() + "\n\u200b"
 
-        if result.community:
-            # Inject invisible spacer after the board cards
-            embed.add_field(name="🃏 Board", value=f"{hand_str(result.community)}\n\u200b", inline=False)
+        _add_board_fields()
 
         stack_lines = []
         seen = set()
@@ -1685,9 +1980,19 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
                     seen.add(w.user_id)
                     gained = result.chip_deltas.get(w.user_id, 0)
                     sign = "+" if gained > 0 else ""
-                    stack_lines.append(f"**{w.display_name}**: {sign}{gained} → **{w.chips}**")
+                    before = w.chips - gained
+                    stack_lines.append(f"**{w.display_name}**: {before} → **{w.chips}** ({sign}{gained})")
         if stack_lines:
             embed.add_field(name="💰 Final Stacks", value="\n".join(stack_lines), inline=False)
+
+    # Bounty successes in the same embed as the round's winners
+    bounty_results = getattr(result, "bounty_results", None) or []
+    if bounty_results:
+        bounty_lines = [
+            f"<@{hunter_uid}> claimed <@{target_uid}>'s bounty — **+{paid}** {emoji}!"
+            for hunter_uid, target_uid, paid in bounty_results
+        ]
+        embed.add_field(name="🎯💰 Bounty Claimed!", value="\n".join(bounty_lines), inline=False)
 
     if not getattr(t, 'is_tournament', False):
         rate, is_special = taxation.get_tax_config()
@@ -1699,32 +2004,45 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     await channel.send(embed=embed)
 
 
-async def _handle_egirl_saro(channel, t: TableState):
-    # Announce and unlock cosmetics for any player dealt the saro ace this hand
-    if not t.game.egirl_saro_holders:
+async def _handle_shiny_cards(channel, t: TableState):
+    # Announce and unlock cosmetics for any player dealt a shiny card this hand
+    if not t.game.shiny_holders:
         return
-    for uid in list(t.game.egirl_saro_holders):
-        p = t.game.get_player(uid)
-        name = p.display_name if p else f"<@{uid}>"
-        newly_title = await db.unlock_cosmetic(uid, "title", "sarosmommy")
-        newly_winmsg1 = await db.unlock_cosmetic(uid, "winmsg", "egirl_ace_winmsg")
-        newly_winmsg2 = await db.unlock_cosmetic(uid, "winmsg", "noo")
+    frenzy_active = "shiny_frenzy" in t.game.chaos_modifiers
+    min_shinies = chaos.get("shiny_frenzy").params["min_shinies"] if frenzy_active else 1
 
-        # If ANY of the three are newly unlocked, trigger the first-time message
-        first_time = newly_title or newly_winmsg1 or newly_winmsg2
-        try:
-            if first_time:
-                await channel.send(
-                    f"✨ **{name}** was dealt the shiny **e-girl Saroshi!**\n"
-                    f"A legendary cosmetic has been unlocked — check `/poker titles`."
-                )
-            else:
-                await channel.send(
-                    f"✨ **{name}** was dealt the shiny **e-girl Saroshi** again!"
-                )
-        except (discord.HTTPException, discord.Forbidden) as e:
-            print(f"[Error] Failed to announce E-girl Saro drop for {uid}: {e}")
-    t.game.egirl_saro_holders.clear()
+    for shiny_id, uids in list(t.game.shiny_holders.items()):
+        shiny = shiny_cards.get_by_id(shiny_id)
+        if not shiny:
+            continue
+        for uid in list(uids):
+            p = t.game.get_player(uid)
+            name = p.display_name if p else f"<@{uid}>"
+
+            # Shiny Frenzy: a single shiny doesn't qualify for cosmetics
+            qualifies = not frenzy_active or len(getattr(p, "shiny_ids", None) or []) >= min_shinies
+            if not qualifies:
+                continue
+
+            newly = False
+            if shiny.title_id:
+                newly = await db.unlock_cosmetic(uid, "title", shiny.title_id) or newly
+            for winmsg_id in shiny.winmsg_ids:
+                newly = await db.unlock_cosmetic(uid, "winmsg", winmsg_id) or newly
+
+            try:
+                if newly:
+                    await channel.send(
+                        f"{shiny.emoji} **{name}** was dealt the shiny **{shiny.display_name}!**\n"
+                        f"A legendary cosmetic has been unlocked — check `/poker titles`."
+                    )
+                else:
+                    await channel.send(
+                        f"{shiny.emoji} **{name}** was dealt the shiny **{shiny.display_name}** again!"
+                    )
+            except (discord.HTTPException, discord.Forbidden) as e:
+                print(f"[Error] Failed to announce {shiny.display_name} drop for {uid}: {e}")
+    t.game.shiny_holders.clear()
 
 
 async def _process_result(guild, channel, t: TableState):
@@ -1754,7 +2072,7 @@ async def _process_result(guild, channel, t: TableState):
                     await tournament_db.return_chips(uid, total_to_return)
                 await tournament_db.clear_chips_in_play(uid)
             if uid in t.leave_cooldown_pending:
-                t.rejoin_cooldowns[uid] = time.time() + config.TOURNAMENT_REJOIN_COOLDOWN
+                apply_global_lock(uid, config.TOURNAMENT_REJOIN_COOLDOWN, payable=True)
 
         # Remove them from game.players now so the post-hand embed is clean.
         for uid in list(t.game.pending_leaves):
@@ -1770,6 +2088,10 @@ async def _process_result(guild, channel, t: TableState):
 
         if result.showdown_players:
             await _reveal_phase(channel, t, result)
+
+        # random event chance
+        if t.game.was_runout_hand:
+            await _maybe_fire_random_event(channel, t, "")
 
         t.game._hand_result = None
 
@@ -1790,7 +2112,9 @@ async def _process_result(guild, channel, t: TableState):
 
     # Stats + achievements — one DB write per player instead of 6-8
     jackpot_hits: list[tuple] = [] # collected here, announced after _announce_winner
+    frenzy_misses: list = []       # Shiny Frenzy: players who pulled exactly 1 shiny (didn't qualify)
     achievement_announces: list[str] = [] # same pattern, collected then sent after hand result
+    chaos_kick_bans: dict[int, int] = {}  # user_id -> ban seconds override (Execution, future events)
     try:
         sp_map = {sp.user_id: sp for sp in (result.showdown_players or [])}
 
@@ -1829,24 +2153,107 @@ async def _process_result(guild, channel, t: TableState):
                 await db.log_currency_event(p.user_id, "Hand", net, f"Hand #{t.game.hand_num} at {t.name}")
 
             # Check for newly unlocked cosmetics (now 1 read + 1 write internally)
-            newly = await db.check_achievements(p.user_id, won=won, pot_won=pot_won)
+            newly = list(await db.check_achievements(p.user_id, won=won, pot_won=pot_won))
+
+            # Card Borders cosmetic, win at chaos table unlocks the "chaos" border.
+            if won and t.chaos_modifiers:
+                if await db.unlock_cosmetic(p.user_id, "border", "chaos"):
+                    newly.append(("border", "chaos"))
+
             if not newly:
                 continue
 
             lines = [f"🎉 <@{p.user_id}> unlocked new cosmetics!"]
             for kind, cid in newly:
-                catalog = db.TITLES if kind == "title" else db.WIN_MESSAGES
+                catalog = db.catalog_for_kind(kind)
                 item = catalog.get(cid, {})
                 display = item.get("display", cid)
                 rarity = db.RARITY_LABEL.get(item.get("rarity", "uncommon"), "")
-                icon = "🎖️" if kind == "title" else "💬"
+                icon = {"title": "🎖️", "winmsg": "💬", "border": "🖼️"}.get(kind, "🎁")
                 lines.append(f"  {icon} **{display}** *{rarity}*")
             achievement_announces.append("\n".join(lines))
 
         # ── Jackpot split payout ──────────────────────────────────────────────
         folded_ids = getattr(result, "folded_ids", set())
-        jackpot_hits = await jackpot.process_jackpot_hits(result.showdown_players or [], result.community,
-                                                          folded_ids)
+        winner_ids = {w.user_id for w in (result.winners or [])}
+        frenzy_active = "shiny_frenzy" in t.chaos_modifiers
+        jackpot_hits, frenzy_misses = await jackpot.process_jackpot_hits(
+            result.showdown_players or [], result.community, folded_ids, winner_ids, frenzy=frenzy_active
+        )
+
+        # Execution
+        # Routed through the exact same pending_leaves/rejoin_cooldown machinery as a voluntary leave with adjustable time
+        
+        # w/ Losers' Hand
+        # `t.chaos_modifiers` is passed through so pick_execution_victim can detect Losers' Hand and target the best hand
+        if "execution" in t.chaos_modifiers and result.showdown_players:
+            exec_mod = chaos.get("execution")
+            victim = chaos.pick_execution_victim(evaluator, hand_eval, result, t.chaos_modifiers)
+            if (victim and victim.user_id not in t.game.pending_leaves
+                    and random.random() < exec_mod.params["kick_chance"]):
+                uid = victim.user_id
+                if uid not in t.game.kicked_users:
+                    t.game.kicked_users.append(uid)
+                t.game.pending_leaves.append(uid)
+                t.leave_cooldown_pending.add(uid)
+                chaos_kick_bans[uid] = exec_mod.params["ban_seconds"]
+                try:
+                    embed = discord.Embed(
+                        title="💀 Execution",
+                        description=f"Unlucky! <@{uid}> had the worst hand and got kicked.",
+                        color=0xE74C3C,
+                    )
+                    await channel.send(embed=embed)
+                except (discord.HTTPException, discord.Forbidden) as e:
+                    print(f"[Error] Failed to announce Execution kick: {e}")
+
+        # Ragebait
+        # reveal the cursed player, credit the jackpot
+        if "ragebait" in t.chaos_modifiers and getattr(result, "ragebait_target", None):
+            rb_uid = result.ragebait_target
+            if result.ragebait_jackpot > 0:
+                await db.adjust_jackpot(result.ragebait_jackpot)
+            try:
+                embed = discord.Embed(
+                    title="😤 Ragebait",
+                    description=f"<@{rb_uid}> was cursed!" + (
+                        f"\nWell... they won the hand, but **{result.ragebait_jackpot}** chips "
+                        f"were generously donated to the jackpot (totally voluntary)"
+                        if result.ragebait_jackpot > 0 else ""
+                    ),
+                    color=0xE74C3C,
+                )
+                await channel.send(embed=embed)
+            except (discord.HTTPException, discord.Forbidden) as e:
+                print(f"[Error] Failed to announce Ragebait reveal: {e}")
+
+        # 2/7 offsuit bonus on win only
+        if (t.chaos_mode and len(result.winners or []) == 1 and not result.winner_ranks
+                and "triple_hole" not in t.chaos_modifiers):
+            bluffer = result.winners[0]
+            if _is_27_offsuit(bluffer.hole_cards):
+                collected = 0
+                for other in t.game.players:
+                    if other.user_id == bluffer.user_id:
+                        continue
+                    take = min(BLUFF_27_BONUS, other.chips)
+                    if take > 0:
+                        other.chips -= take
+                        collected += take
+                if collected > 0:
+                    bluffer.chips += collected
+                    try:
+                        await channel.send(
+                            f"🤡 <@{bluffer.user_id}> took it down with **2-7 offsuit** and bluffed "
+                            f"the whole table off their hands! Skims **{collected}** chip(s) off "
+                            f"everyone else's stack."
+                        )
+                    except (discord.HTTPException, discord.Forbidden) as e:
+                        print(f"[Error] Failed to announce 2-7 bluff bonus: {e}")
+
+        # 67 title
+        if t.chaos_mode and any(_has_six_and_seven(w.hole_cards) for w in (result.winners or [])):
+            t.sixseven_bait_active = True
 
     except Exception as e:
         print(f"[poker] stats/achievement error: {e}")
@@ -1884,10 +2291,14 @@ async def _process_result(guild, channel, t: TableState):
                 if total_to_return > 0:
                     await db.return_chips(uid, total_to_return)
                 await db.clear_chips_in_play(uid)
-            # Voluntary leaves and AFK kicks get a 10-minute rejoin cooldown.
-            # Chip-kicked players (below BB) are NOT in leave_cooldown_pending.
+            # Voluntary leaves and AFK kicks get a 10-minute rejoin cooldown,
+            # payable like every other kick. Chip-kicked players (below BB)
+            # are NOT in leave_cooldown_pending.
             if uid in t.leave_cooldown_pending:
-                t.rejoin_cooldowns[uid] = time.time() + config.REGULAR_REJOIN_COOLDOWN
+                apply_global_lock(uid, config.REGULAR_REJOIN_COOLDOWN, payable=True)
+        # chaos kicks
+        for uid, ban_seconds in chaos_kick_bans.items():
+            apply_global_lock(uid, ban_seconds, payable=True)
         # Remove them from game.players now so the post-hand embed is clean.
         # _process_pending in start_hand will find pending_leaves already empty and skip.
         for uid in list(t.game.pending_leaves):
@@ -1944,6 +2355,15 @@ async def _process_result(guild, channel, t: TableState):
             print(f"[poker] jackpot log error: {e}")
             traceback.print_exc()
 
+    for p in frenzy_misses:
+        try:
+            await channel.send(
+                f"✨ <@{p.user_id}> pulled one shiny card.. so close!"
+            )
+        except Exception as e:
+            print(f"[poker] frenzy miss announce error: {e}")
+            traceback.print_exc()
+
     for msg_text in achievement_announces:
         try:
             await channel.send(msg_text)
@@ -1966,10 +2386,14 @@ async def _process_result(guild, channel, t: TableState):
             print(f"⚠️ Recovered from Discord API crash during reveal: {e}")
             traceback.print_exc()
 
+    # Random event
+    if t.game.was_runout_hand:
+        await _maybe_fire_random_event(channel, t, "")
+
     t.game._hand_result = None
 
     # 2. THEN check if we need to close the table or schedule the next hand
-    await _handle_egirl_saro(channel, t)
+    await _handle_shiny_cards(channel, t)
 
     if t.closing:
         await _close_table(channel, t)
@@ -1980,6 +2404,23 @@ async def _process_result(guild, channel, t: TableState):
             schedule_next_hand(t, channel)
 
 # ── Showdown reveal (muck / show) ─────────────────────────────────────────────
+
+def _hand_rank_display(hole_cards: list, community: list, community2: list | None,
+                        double_board_active: bool) -> str:
+    """
+    shows hand's rank on each board for double board
+    """
+    parts = []
+    if len(hole_cards) + len(community) >= 5:
+        score = hand_eval.evaluate_any(evaluator, hole_cards, community)
+        rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+        parts.append(f"Board 1: {rank}" if double_board_active else rank)
+    if double_board_active and community2 and len(hole_cards) + len(community2) >= 5:
+        score2 = hand_eval.evaluate_any(evaluator, hole_cards, community2)
+        rank2 = evaluator.class_to_string(evaluator.get_rank_class(score2))
+        parts.append(f"Board 2: {rank2}")
+    return f" — *{', '.join(parts)}*" if parts else ""
+
 
 class ShowdownRevealView(discord.ui.View):
     """Non-winners can show or muck after a showdown. Winners are auto-shown by the engine."""
@@ -2008,18 +2449,21 @@ class ShowdownRevealView(discord.ui.View):
             await interaction.response.send_message("❌ No cards found.", ephemeral=True);
             return
 
-        # FIX: Only calculate poker hand rank if there are enough community cards (Flop or later)
-        if len(self.result.community) >= 3:
-            score = evaluator.evaluate(sp.hole_cards, self.result.community)
-            rank_str = f" — *{evaluator.class_to_string(evaluator.get_rank_class(score))}*"
-        else:
-            rank_str = ""
+        # FIX: Only calculate poker hand rank once there are enough total cards to
+        # rank (5+). Usually that means the flop is out, but under the "Reverse"
+        # chaos modifier the board can have just 1-2 cards on a real street.
+        rank_str = _hand_rank_display(sp.hole_cards, self.result.community,
+                                       getattr(self.result, "community2", None),
+                                       bool(getattr(self.result, "community2", None)))
 
-        shiny = " ✨" if sp.egirl_saro else ""
+        shiny = " ✨" if sp.shiny_ids else ""
         caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{shiny}{rank_str}"
         if USE_IMAGES:
             await interaction.response.defer()
-            file = await asyncio.to_thread(card_images.make_strip, sp.hole_cards, 0, False, sp.egirl_saro)
+            cosmetics = await db.get_cosmetics(interaction.user.id)
+            file = await asyncio.to_thread(
+                card_images.make_strip, sp.hole_cards, 0, False, sp.shiny_ids,
+                border_id=cosmetics.get("active_border"), cute_mode="cute_mode" in self.t.chaos_modifiers)
             await interaction.followup.send(caption, file=file)
         else:
             await interaction.response.send_message(caption)
@@ -2054,7 +2498,10 @@ async def _reveal_phase(channel, t: TableState, result):
             elif auto_action == "show":
                 caption = f"👁️ **{winner.display_name}** shows: {hand_str(winner.hole_cards)}"
                 if USE_IMAGES:
-                    file = await asyncio.to_thread(card_images.make_strip, winner.hole_cards, 0, False, winner.egirl_saro)
+                    cosmetics = await db.get_cosmetics(winner.user_id)
+                    file = await asyncio.to_thread(
+                        card_images.make_strip, winner.hole_cards, 0, False, winner.shiny_ids,
+                        border_id=cosmetics.get("active_border"), cute_mode="cute_mode" in t.chaos_modifiers)
                     await channel.send(caption, file=file)
                 else:
                     await channel.send(caption)
@@ -2078,16 +2525,58 @@ async def _reveal_phase(channel, t: TableState, result):
 
     # ── 2. Contested Showdown ─────────────────────────────
     winner_ids = {w.user_id for w in result.winners}
+    double_board_active = bool(result.community2)
+    pot_results = result.pot_results or []
+    pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results))]
+    ranks = result.winner_ranks or {}
+    ranks2 = result.winner_ranks2 or {}
+
+    # Per winner, the board(s) they ACTUALLY won and the rank they won it
+    # with — never a fresh re-evaluation against board 1 alone. Under
+    # Double Board the same hole cards can rank completely differently on
+    # each board (or even tie/lose on one while winning the other), so
+    # this only ever attributes a rank to a winner for a board a pot
+    # result says they won — exactly the same source of truth the Hand
+    # Results embed already uses, so the two can never disagree again.
+    winner_board_ranks: dict[int, list[tuple[int, str]]] = {}
+    for (_, pot_winners), (_, board_num) in zip(pot_results, pot_result_meta):
+        board_ranks = ranks2 if board_num == 2 else ranks
+        for pw in pot_winners:
+            rank = board_ranks.get(pw.user_id)
+            if not rank:
+                continue
+            entry = (board_num, rank)
+            lst = winner_board_ranks.setdefault(pw.user_id, [])
+            if entry not in lst:
+                lst.append(entry)
+
+    def _winner_rank_str(uid: int, hole_cards: list, community: list) -> str:
+        won = winner_board_ranks.get(uid, [])
+        if won:
+            if len(won) == 1 or not double_board_active:
+                return f" — *{won[0][1]}*"
+            parts = ", ".join(f"Board {bn}: {r}" for bn, r in sorted(won))
+            return f" — *{parts}*"
+        # Fallback for the rare case a winner isn't in either ranks dict
+        # (shouldn't happen — every entry in result.winners comes from a
+        # pot_results winners list) — re-derive against board 1 rather
+        # than show nothing.
+        if len(hole_cards) + len(community) >= 5:
+            score = hand_eval.evaluate_any(evaluator, hole_cards, community)
+            return f" — *{evaluator.class_to_string(evaluator.get_rank_class(score))}*"
+        return ""
 
     # A. Automatically reveal winners' cards directly to the channel (No buttons)
     for w in result.winners:
         if w.hole_cards:
-            score = evaluator.evaluate(w.hole_cards, result.community)
-            rank_str = evaluator.class_to_string(evaluator.get_rank_class(score))
-            shiny = " ✨" if w.egirl_saro else ""
-            caption = f"🏆 **{w.display_name}** wins and shows: {hand_str(w.hole_cards)}{shiny} — *{rank_str}*"
+            rank_str = _winner_rank_str(w.user_id, w.hole_cards, result.community)
+            shiny = " ✨" if w.shiny_ids else ""
+            caption = f"🏆 **{w.display_name}** wins and shows: {hand_str(w.hole_cards)}{shiny}{rank_str}"
             if USE_IMAGES:
-                file = await asyncio.to_thread(card_images.make_strip, w.hole_cards, 0, False, w.egirl_saro)
+                cosmetics = await db.get_cosmetics(w.user_id)
+                file = await asyncio.to_thread(
+                    card_images.make_strip, w.hole_cards, 0, False, w.shiny_ids,
+                    border_id=cosmetics.get("active_border"), cute_mode="cute_mode" in t.chaos_modifiers)
                 await channel.send(caption, file=file)
             else:
                 await channel.send(caption)
@@ -2105,14 +2594,13 @@ async def _reveal_phase(channel, t: TableState, result):
         if auto_action == "muck":
             continue
         elif auto_action == "show":
-            if len(result.community) >= 3:
-                score = evaluator.evaluate(p.hole_cards, result.community)
-                rank_str = f" — *{evaluator.class_to_string(evaluator.get_rank_class(score))}*"
-            else:
-                rank_str = ""
+            rank_str = _hand_rank_display(p.hole_cards, result.community, result.community2, double_board_active)
             caption = f"👁️ **{p.display_name}** shows: {hand_str(p.hole_cards)}{rank_str}"
             if USE_IMAGES:
-                file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, False, p.egirl_saro)
+                cosmetics = await db.get_cosmetics(p.user_id)
+                file = await asyncio.to_thread(
+                    card_images.make_strip, p.hole_cards, 0, False, p.shiny_ids,
+                    border_id=cosmetics.get("active_border"), cute_mode="cute_mode" in t.chaos_modifiers)
                 await channel.send(caption, file=file)
             else:
                 await channel.send(caption)
@@ -2378,10 +2866,7 @@ class AllInConfirmView(discord.ui.View):
             if part.strip():
                 slog(self.t, part)
 
-        if self.t.game._hand_result:
-            await _process_result(self.guild, self.channel, self.t)
-        else:
-            await refresh(self.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+        await _handle_post_action(self.guild, self.channel, self.t)
 
         self.stop()
 
@@ -2437,15 +2922,27 @@ class RaisePickerView(discord.ui.View):
 
         g = t.game
         cp = g.current_player()
+        hidden_pot = "hidden_pot" in getattr(t, "chaos_modifiers", [])
         if cp:
             call_amt = g.call_amount(cp)
             min_raise_amt = g.last_raise_size if g.last_raise_size > 0 else g.BIG_BLIND
-            pot_third = max(call_amt, g.pot // 3)
-            pot_half = max(call_amt, g.pot // 2)
 
             self.btn_min_raise.label = f"Min +{min_raise_amt}"
-            self.btn_third_pot.label = f"1/3 Pot +{pot_third}"
-            self.btn_half_pot.label = f"1/2 Pot +{pot_half}"
+            if hidden_pot:
+                # Chaos: Hidden Pot — 1/3 Pot and 1/2 Pot are computed
+                # straight off g.pot, and raise amounts stay visible under
+                # this modifier (that's the whole point — see its
+                # description), so offering these presets would let anyone
+                # back-calculate the pot from the raise that goes out.
+                # Dropped entirely rather than just relabeled — Min and All
+                # In don't depend on the pot, so they're unaffected.
+                self.remove_item(self.btn_third_pot)
+                self.remove_item(self.btn_half_pot)
+            else:
+                pot_third = max(call_amt, g.pot // 3)
+                pot_half = max(call_amt, g.pot // 2)
+                self.btn_third_pot.label = f"1/3 Pot +{pot_third}"
+                self.btn_half_pot.label = f"1/2 Pot +{pot_half}"
             self.btn_all_in.label = f"All In"
 
     async def _do_raise(self, interaction: discord.Interaction, raise_amount: int):
@@ -2560,12 +3057,22 @@ class RejoinConfirmView(discord.ui.View):
     @discord.ui.button(label="Pay fee & join", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
-        # Re-check in case the cooldown expired while the prompt was open
-        live_expiry = self.t.rejoin_cooldowns.get(uid)
-        if not live_expiry or time.time() >= live_expiry:
-            self.t.rejoin_cooldowns.pop(uid, None)
+        # Re-check in case the lock expired — or changed — while the prompt was open
+        lock = get_global_lock(uid)
+        if not lock:
             await interaction.response.edit_message(
                 content="✅ Your cooldown already expired — click **Join** to rejoin normally!",
+                view=None,
+            )
+            self.stop()
+            return
+        if not lock["payable"]:
+            # A non-payable ban landed on top of the payable kick this
+            # prompt was originally shown for (e.g. the Giveaway random
+            # event fired while they had this open) — no fee can buy past
+            # that, so pull the offer rather than let them pay for nothing.
+            await interaction.response.edit_message(
+                content="❌ You've since been banned — no fee can bypass that. You'll need to wait it out.",
                 view=None,
             )
             self.stop()
@@ -2616,8 +3123,8 @@ class JoinModal(discord.ui.Modal, title="Buy In"):
 
         # Double check cooldown
         if self.rejoin_fee == 0:
-            expiry = self.t.rejoin_cooldowns.get(interaction.user.id)
-            if expiry and time.time() < expiry:
+            lock = get_global_lock(interaction.user.id)
+            if lock:
                 await interaction.response.send_message(
                     "❌ You are currently on a rejoin cooldown. Use the **Join** button to check bypass options.",
                     ephemeral=True
@@ -2658,6 +3165,1367 @@ class LeaveConfirmView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="❌ Leave cancelled.", view=None)
         self.stop()
+
+# Random events
+
+def _random_event_ping(t: TableState) -> str:
+    # mention everyone at table
+    ids = [p.user_id for p in t.game.players]
+    if not ids:
+        return ""
+    return " ".join(f"<@{uid}>" for uid in ids)
+
+
+async def _announce_random_event(channel, t: TableState, event_id: str, trigger_point: str | None = None, *, description: str | None = None, view=None):
+    # standard msg
+    embed = chaos.build_event_embed(event_id, trigger_point, description=description)
+    try:
+        return await channel.send(content=_random_event_ping(t), embed=embed, view=view)
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to announce random event '{event_id}': {e}")
+        return None
+
+
+async def _run_random_event(channel, t: TableState, event_id: str, trigger_point: str | None = None):
+    handler = _RANDOM_EVENT_HANDLERS.get(event_id)
+    if not handler:
+        return
+    try:
+        await handler(channel, t, trigger_point)
+    except Exception as e:
+        print(f"[Error] Random event '{event_id}' crashed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _maybe_fire_random_event(channel, t: TableState, trigger_point: str):
+    # chaos.RANDOM_EVENT_CHANCE chance
+    # chance to appear during flop/turn/river/first_reveal
+    if not t.chaos_mode:
+        return
+    if not chaos.should_random_event_fire():
+        return
+    event_id = chaos.pick_event_id()
+    if event_id:
+        asyncio.create_task(_run_random_event(channel, t, event_id, trigger_point))
+
+
+async def _handle_random_event_message(message: discord.Message, t: TableState):
+    # msg check
+    ev = t.active_random_event
+    if not ev:
+        return
+    if ev["type"] == "egirl_lover":
+        await _handle_egirl_lover_message(message, t)
+    elif ev["type"] == "number_guess":
+        await _handle_number_guess_message(message, t)
+
+
+# standard response
+EVENT_JOIN_SUCCESS = "✅ You have successfully joined!"
+EVENT_JOIN_ALREADY = "❌ You have already joined."
+EVENT_JOIN_MISSED = "❌ You missed this event."
+
+
+def _event_expired(expiry: float) -> bool:
+    return time.time() >= expiry
+
+
+async def _send_event_result(channel, announce_msg, embed: discord.Embed):
+    # result embed as a reply to original embed
+    # fallback for fails
+    if announce_msg is not None:
+        try:
+            await announce_msg.reply(embed=embed, mention_author=False)
+            return
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            pass
+    try:
+        await channel.send(embed=embed)
+    except (discord.HTTPException, discord.Forbidden):
+        pass
+
+
+# egirl lover
+
+_EGIRL_LOVER_ORDINALS = ("first", "second", "third")
+
+
+def _ordinal(place: int) -> str:
+    return _EGIRL_LOVER_ORDINALS[place - 1] if place <= len(_EGIRL_LOVER_ORDINALS) else f"{place}th"
+
+
+async def _award_egirl_lover_prize(uid: int) -> str:
+    # picks one unowned cosmetic from pool, if all owned fallsback to consolation_chips
+    gp = chaos.EVENTS_BY_ID["egirl_lover"].params
+    pool = gp["cosmetic_pool"]
+    try:
+        cosmetics = await db.get_cosmetics(uid)
+        owned = {("title", tid) for tid in cosmetics["unlocked_titles"]} | \
+                {("winmsg", mid) for mid in cosmetics["unlocked_win_msgs"]}
+    except Exception as e:
+        print(f"[Error] egirl_lover ownership lookup failed for {uid}: {e}")
+        owned = set()
+    available = [item for item in pool if item not in owned]
+
+    if not available:
+        chips = gp["consolation_chips"]
+        try:
+            await db.return_chips(uid, chips)
+            await db.log_house_revenue(-chips, source="chaos_event")
+            await db.log_currency_event(uid, "Random Event", chips, "egirl lover")
+        except Exception as e:
+            print(f"[Error] egirl_lover consolation payout failed for {uid}: {e}")
+        return f"got **{chips}** chips"
+
+    kind, cosmetic_id = random.choice(available)
+    try:
+        await db.unlock_cosmetic(uid, kind, cosmetic_id)
+    except Exception as e:
+        print(f"[Error] egirl_lover cosmetic unlock failed for {uid}: {e}")
+    if kind == "title":
+        display = db.TITLES.get(cosmetic_id, {}).get("display", cosmetic_id)
+        return f"unlocked title **{display}**"
+    else:
+        display = db.WIN_MESSAGES.get(cosmetic_id, {}).get("display", cosmetic_id)
+        return f"unlocked win message **{display}**"
+
+
+async def _run_egirl_lover(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["egirl_lover"].params
+    phrase = gp["phrase"]
+    needed = gp["winners_needed"]
+    t.active_random_event = {"type": "egirl_lover", "phrase": phrase.lower(), "winners": [], "announce_msg": None}
+    msg = await _announce_random_event(
+        channel, t, "egirl_lover", trigger_point,
+        description=f"Type in chat!:\n> {phrase}\n\n"
+                     f"First **{needed}** people win!",
+    )
+    if t.active_random_event is not None and t.active_random_event.get("type") == "egirl_lover":
+        t.active_random_event["announce_msg"] = msg
+
+    await asyncio.sleep(60)
+    ev = t.active_random_event
+    if ev and ev.get("type") == "egirl_lover":
+        t.active_random_event = None
+        # still post result if ended
+        if ev["winners"]:
+            lines = "\n".join(f"**{_ordinal(i + 1)}** — <@{w['uid']}> {w['prize_desc']}"
+                               for i, w in enumerate(ev["winners"]))
+            desc = f"Time ran out with only **{len(ev['winners'])}/{needed}** spots filled:\n{lines}"
+        else:
+            desc = "Nobody really loves <@412651268142792704> I guess"
+        await _send_event_result(channel, ev.get("announce_msg"),
+                                  chaos.build_event_result_embed("egirl_lover", desc, no_result=True))
+
+
+async def _handle_egirl_lover_message(message: discord.Message, t: TableState):
+    ev = t.active_random_event
+    gp = chaos.EVENTS_BY_ID["egirl_lover"].params
+    if message.content.strip().lower() != ev["phrase"]:
+        return
+
+    uid = message.author.id
+    if any(w["uid"] == uid for w in ev["winners"]):
+        return  # don't repeat winners
+
+    prize_desc = await _award_egirl_lover_prize(uid)
+    ev["winners"].append({"uid": uid, "prize_desc": prize_desc})
+
+    # react with check on message
+    try:
+        await message.add_reaction("✅")
+    except (discord.HTTPException, discord.Forbidden):
+        pass
+
+    needed = gp["winners_needed"]
+    if len(ev["winners"]) >= needed:
+        t.active_random_event = None
+        lines = "\n".join(f"**{_ordinal(i + 1)}** — <@{w['uid']}> {w['prize_desc']}"
+                           for i, w in enumerate(ev["winners"]))
+        await _send_event_result(message.channel, ev.get("announce_msg"),
+                                  chaos.build_event_result_embed("egirl_lover", lines))
+
+
+# Guess the Number
+
+async def _run_number_guess(channel, t: TableState, trigger_point: str | None = None):
+    target = random.randint(1, 25)
+    t.active_random_event = {"type": "number_guess", "target": target, "announce_msg": None}
+    msg = await _announce_random_event(
+        channel, t, "number_guess", trigger_point,
+        description="I'm thinking of a number between **1-25**. First correct guess in chat wins!",
+    )
+    if t.active_random_event is not None and t.active_random_event.get("type") == "number_guess":
+        t.active_random_event["announce_msg"] = msg
+
+    await asyncio.sleep(45)
+    ev = t.active_random_event
+    if ev and ev.get("type") == "number_guess":
+        t.active_random_event = None
+        await _send_event_result(channel, ev.get("announce_msg"), chaos.build_event_result_embed(
+            "number_guess", f"Nobody guessed the right number. The number was **{target}**.", no_result=True))
+
+
+async def _handle_number_guess_message(message: discord.Message, t: TableState):
+    ev = t.active_random_event
+    content = message.content.strip()
+    if content.isdigit() and int(content) == ev["target"]:
+        t.active_random_event = None
+        gp = chaos.EVENTS_BY_ID["number_guess"].params
+        prize = random.randint(gp["min_prize"], gp["max_prize"])
+        try:
+            await db.return_chips(message.author.id, prize)
+            await db.log_house_revenue(-prize, source="chaos_event")
+            await db.log_currency_event(message.author.id, "Random Event", prize, "Guess the Number")
+        except Exception as e:
+            print(f"[Error] number_guess payout failed: {e}")
+        await _send_event_result(message.channel, ev.get("announce_msg"), chaos.build_event_result_embed(
+            "number_guess",
+            f"<@{message.author.id}> guessed **{ev['target']}** correctly and won **{prize}** chips!"
+        ))
+
+
+# Think Fast
+
+class ThinkFastView(discord.ui.View):
+    def __init__(self, window: int = 30):
+        super().__init__(timeout=window)
+        self.expiry = time.time() + window
+        self.claimed = False
+        self.winner_uid: int | None = None
+
+    @discord.ui.button(label="⚡ Click Me!", style=discord.ButtonStyle.blurple)
+    async def click(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if _event_expired(self.expiry):
+            await interaction.response.send_message(EVENT_JOIN_MISSED, ephemeral=True)
+            return
+        if self.claimed:
+            if uid == self.winner_uid:
+                await interaction.response.send_message(EVENT_JOIN_ALREADY, ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Someone else already claimed this!", ephemeral=True)
+            return
+        gp = chaos.EVENTS_BY_ID["think_fast"].params
+        balance, _ = await db.get_wallet(uid)
+        if balance < gp["min_wallet"]:
+            await interaction.response.send_message(
+                f"❌ You need at least **{gp['min_wallet']}** chips in your wallet to try.", ephemeral=True)
+            return
+        self.claimed = True
+        self.winner_uid = uid
+        button.disabled = True
+
+        delta = random.randint(gp["min_delta"], gp["max_delta"])
+        if delta >= 0:
+            await db.return_chips(uid, delta)
+        else:
+            await db.deduct_chips(uid, min(-delta, balance))
+        try:
+            await db.log_house_revenue(-delta, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] think_fast revenue log failed: {e}")
+
+        title_note = ""
+        new_balance, _ = await db.get_wallet(uid)
+        if new_balance < 1:
+            try:
+                await db.unlock_cosmetic(uid, "title", gp["unlucky_title_id"])
+            except Exception as e:
+                print(f"[Error] think_fast title unlock failed: {e}")
+            title_note = " and got the 🥀 title!"
+
+        await interaction.response.send_message(EVENT_JOIN_SUCCESS, ephemeral=True)
+        try:
+            await interaction.message.edit(view=self)  # disables the button on the public announcement
+        except (discord.HTTPException, discord.NotFound):
+            pass
+        await _send_event_result(interaction.channel, interaction.message, chaos.build_event_result_embed(
+            "think_fast", f"<@{uid}> clicked first and got **{delta:+d}** chips{title_note}!"
+        ))
+        self.stop()
+
+
+async def _run_think_fast(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["think_fast"].params
+    await _announce_random_event(
+        channel, t, "think_fast", trigger_point,
+        description=f"First person to click the button gets between **{gp['min_delta']}** and **+{gp['max_delta']}** chips. "
+                     f"\nRequires **{gp['min_wallet']}+** chips in your wallet to try.",
+        view=ThinkFastView(),
+    )
+
+
+# Giveaway
+
+async def _run_giveaway_react(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["giveaway_react"].params
+    emoji = gp["react_emoji"]
+    window = 10
+    msg = await _announce_random_event(
+        channel, t, "giveaway_react", trigger_point,
+        description=f"React with {emoji} within **{window} seconds** for a shot at the prize!"
+                    f"\nWinner has 70% chance of **chips**, 30% odds of **90 minute ban**",
+    )
+    if msg is None:
+        return
+    try:
+        await msg.add_reaction(emoji)
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to react to giveaway prompt: {e}")
+        return
+
+    # Strip off any reaction that isn't the giveaway emoji the moment it
+    # lands, so a wrong emoji never actually "registers" on the message —
+    # it just gets removed again straight away. This is on top of (not a
+    # replacement for) the emoji filter below when tallying reactors; it's
+    # what stops a wrong-emoji react from ever having a chance to reach —
+    # or trip up — that part.
+    async def _strip_wrong_emoji(payload: discord.RawReactionActionEvent):
+        if payload.message_id != msg.id or bot_instance is None:
+            return
+        if payload.user_id == bot_instance.user.id:
+            return  # ignore the bot's own reaction
+        if str(payload.emoji) == emoji:
+            return  # the right emoji — leave it alone
+        try:
+            user = payload.member or bot_instance.get_user(payload.user_id) \
+                or await bot_instance.fetch_user(payload.user_id)
+            await msg.remove_reaction(payload.emoji, user)
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+            pass  # e.g. missing Manage Messages — not worth crashing the event over
+
+    if bot_instance is not None:
+        bot_instance.add_listener(_strip_wrong_emoji, "on_raw_reaction_add")
+
+    try:
+        await asyncio.sleep(window)
+    finally:
+        if bot_instance is not None:
+            bot_instance.remove_listener(_strip_wrong_emoji, "on_raw_reaction_add")
+
+    try:
+        fresh = await channel.fetch_message(msg.id)
+    except (discord.NotFound, discord.HTTPException):
+        return
+    try:
+        await fresh.clear_reactions()
+    except (discord.HTTPException, discord.Forbidden):
+        pass
+
+    reactors = []
+    try:
+        for reaction in fresh.reactions:
+            if str(reaction.emoji) != emoji:
+                continue  # any other emoji still on the message is simply ignored
+            async for user in reaction.users():
+                if not user.bot:
+                    reactors.append(user)
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to read giveaway reactors: {e}")
+        # fall through with whatever we collected (possibly none) rather
+        # than letting this bubble up and leave the event unresolved
+
+    if not reactors:
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "giveaway_react", "Nobody reacted in time.", no_result=True))
+        return
+
+    winner = random.choice(reactors)
+    if random.random() < gp["kick_chance"]:
+        # forced ban
+        # they still finish their current hand if at table
+        if t.game.get_player(winner.id):
+            if winner.id not in t.game.kicked_users:
+                t.game.kicked_users.append(winner.id)
+            if winner.id not in t.game.pending_leaves:
+                t.game.pending_leaves.append(winner.id)
+            # not added to t.leave_cooldown_pending, shouldn't be payable.
+            apply_global_lock(winner.id, gp["ban_seconds"], payable=False)
+        try:
+            await db.unlock_cosmetic(winner.id, "title", gp["kick_title_id"])
+        except Exception as e:
+            print(f"[Error] giveaway title unlock failed: {e}")
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "giveaway_react", f"<@{winner.id}> won a stinky ban and the 🦶 title!"))
+    else:
+        prize = random.randint(gp["min_prize"], gp["max_prize"])
+        await db.return_chips(winner.id, prize)
+        try:
+            await db.log_house_revenue(-prize, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] giveaway revenue log failed: {e}")
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "giveaway_react", f"<@{winner.id}> won the giveaway and won **{prize}** chips!"))
+
+
+# Redistribution
+
+class RedistributionView(discord.ui.View):
+    def __init__(self, amount: int, entrants: set, window: int):
+        super().__init__(timeout=window)
+        self.amount = amount
+        self.entrants = entrants
+        self.expiry = time.time() + window
+
+    @discord.ui.button(label="Enter", style=discord.ButtonStyle.green)
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if _event_expired(self.expiry):
+            await interaction.response.send_message(EVENT_JOIN_MISSED, ephemeral=True)
+            return
+        if uid in self.entrants:
+            await interaction.response.send_message(EVENT_JOIN_ALREADY, ephemeral=True)
+            return
+        balance, _ = await db.get_wallet(uid)
+        if balance < self.amount:
+            await interaction.response.send_message(
+                f"❌ You need **{self.amount}** chips in your wallet to enter.", ephemeral=True)
+            return
+        if not await db.deduct_chips(uid, self.amount):
+            await interaction.response.send_message("❌ Couldn't deduct chips. Try again.", ephemeral=True)
+            return
+        self.entrants.add(uid)
+        await interaction.response.send_message(EVENT_JOIN_SUCCESS, ephemeral=True)
+
+
+async def _run_redistribution(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["redistribution"].params
+    amount = random.choice(gp["buy_in_options"])
+    window = gp["window_seconds"]
+    entrants: set = set()
+    msg = await _announce_random_event(
+        channel, t, "redistribution", trigger_point,
+        description=f"Buy in for **{amount}** chips. \nAfter **{window}s**, the whole pool gets "
+                     f"redistributed randomly among everyone who entered.",
+        view=RedistributionView(amount, entrants, window),
+    )
+    if msg is None:
+        return
+
+    await asyncio.sleep(window)
+    try:
+        await msg.edit(view=None)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+    if not entrants:
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "redistribution", "Nobody entered.", no_result=True))
+        return
+
+    pool = amount * len(entrants)
+    entrants_list = list(entrants)
+    random.shuffle(entrants_list)
+    weights = [random.random() for _ in entrants_list]
+    total_w = sum(weights)
+    remaining = pool
+    payouts = []
+    for i, uid in enumerate(entrants_list):
+        share = remaining if i == len(entrants_list) - 1 else int(pool * weights[i] / total_w)
+        remaining -= share
+        payouts.append((uid, share))
+        if share > 0:
+            await db.return_chips(uid, share)
+
+    lines = "\n".join(f"<@{uid}> — **{share}**" for uid, share in payouts)
+    await _send_event_result(channel, msg, chaos.build_event_result_embed(
+        "redistribution",
+        f"Pool was **{pool}** chips with **{len(entrants)}** entries:\n{lines}"
+    ))
+
+
+# Chip Shower
+
+class ChipShowerView(discord.ui.View):
+    def __init__(self, window: int, max_claimers: int):
+        super().__init__(timeout=window + 3)
+        self.claimed_uids: set = set()
+        self.claims: list[tuple[int, int]] = []  # (uid, amount) — for the results embed
+        self.total_given = 0
+        self.expiry = time.time() + window
+        self.max_claimers = max_claimers
+
+    @discord.ui.button(label="🌧️ Grab Chips!", style=discord.ButtonStyle.green)
+    async def grab(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if _event_expired(self.expiry):
+            await interaction.response.send_message(EVENT_JOIN_MISSED, ephemeral=True)
+            return
+        if uid in self.claimed_uids:
+            await interaction.response.send_message(EVENT_JOIN_ALREADY, ephemeral=True)
+            return
+        if len(self.claimed_uids) >= self.max_claimers:
+            await interaction.response.send_message(
+                f"❌ Too late!", ephemeral=True)
+            return
+        self.claimed_uids.add(uid)
+        gp = chaos.EVENTS_BY_ID["chip_shower"].params
+        amount = random.randint(gp["min_prize"], gp["max_prize"])
+        self.claims.append((uid, amount))
+        self.total_given += amount
+        await db.return_chips(uid, amount)
+        await interaction.response.send_message(f"{EVENT_JOIN_SUCCESS} You reach out and **{amount}** chips fall into your wallet!",
+                                                  ephemeral=True)
+        if len(self.claimed_uids) >= self.max_claimers:
+            button.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+async def _run_chip_shower(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["chip_shower"].params
+    window = gp["window_seconds"]
+    max_claimers = gp["max_claimers"]
+    view = ChipShowerView(window, max_claimers)
+    msg = await _announce_random_event(
+        channel, t, "chip_shower", trigger_point,
+        description=f"It's raining chips! You have **{window} seconds** to grab some!",
+        view=view,
+    )
+    if msg is None:
+        return
+
+    await asyncio.sleep(window)
+    try:
+        await msg.edit(view=None)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+    if view.total_given > 0:
+        try:
+            await db.log_house_revenue(-view.total_given, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] chip_shower revenue log failed: {e}")
+        lines = "\n".join(f"<@{uid}> — **{amount}**" for uid, amount in view.claims)
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "chip_shower",
+            f"**{len(view.claimed_uids)}** people grabbed a total of **{view.total_given}** chips:\n{lines}"
+        ))
+    else:
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "chip_shower", "Nobody grabbed anything.", no_result=True))
+
+
+# Lottery
+
+class LotteryEntryModal(discord.ui.Modal, title="🎟️ Lottery Entry"):
+    amount = discord.ui.TextInput(label="Chips to enter with", max_length=8)
+
+    def __init__(self, entries: dict, expiry: float):
+        super().__init__()
+        self.entries = entries
+        self.expiry = expiry
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # checks modal
+        if _event_expired(self.expiry):
+            await interaction.response.send_message(EVENT_JOIN_MISSED, ephemeral=True)
+            return
+        chips = parse_chips(self.amount.value)
+        if chips is None or chips <= 0:
+            await interaction.response.send_message("❌ Enter a valid amount.", ephemeral=True)
+            return
+        if interaction.user.id in self.entries:
+            await interaction.response.send_message(EVENT_JOIN_ALREADY, ephemeral=True)
+            return
+        balance, _ = await db.get_wallet(interaction.user.id)
+        if chips > balance:
+            await interaction.response.send_message(f"❌ You only have **{balance}** chips in your wallet.", ephemeral=True)
+            return
+        if not await db.deduct_chips(interaction.user.id, chips):
+            await interaction.response.send_message("❌ Couldn't deduct chips, try again.", ephemeral=True)
+            return
+        self.entries[interaction.user.id] = chips
+        await interaction.response.send_message(f"{EVENT_JOIN_SUCCESS} Entered with **{chips}** chips.",
+                                                  ephemeral=True)
+
+
+class LotteryView(discord.ui.View):
+    def __init__(self, entries: dict, window: int):
+        super().__init__(timeout=window + 5)
+        self.entries = entries
+        self.expiry = time.time() + window
+
+    @discord.ui.button(label="🎟️ Enter!", style=discord.ButtonStyle.blurple)
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if _event_expired(self.expiry):
+            await interaction.response.send_message(EVENT_JOIN_MISSED, ephemeral=True)
+            return
+        await interaction.response.send_modal(LotteryEntryModal(self.entries, self.expiry))
+
+
+async def _run_lottery(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["lottery"].params
+    window = 30
+    entries: dict[int, int] = {}
+    msg = await _announce_random_event(
+        channel, t, "lottery", trigger_point,
+        description=(
+            f"Enter with any amount. Your chances of winning increase if you put in more chips!\n"
+            f"**{int(gp['tax_pct'] * 100)}%** of the pool is taxed to house revenue, "
+            f"**{int(gp['jackpot_pct'] * 100)}%** feeds the jackpot, the rest goes to the winner.\n\n"
+            f"**{window} seconds** to enter."
+        ),
+        view=LotteryView(entries, window),
+    )
+    if msg is None:
+        return
+
+    await asyncio.sleep(window)
+    try:
+        await msg.edit(view=None)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+    if not entries:
+        await _send_event_result(channel, msg, chaos.build_event_result_embed(
+            "lottery", "Nobody entered.", no_result=True))
+        return
+
+    total = sum(entries.values())
+    r = random.uniform(0, total)
+    cum = 0
+    winner_uid = list(entries.keys())[-1]
+    for uid, amt in entries.items():
+        cum += amt
+        if r <= cum:
+            winner_uid = uid
+            break
+
+    tax = math.ceil(total * gp["tax_pct"])
+    jackpot_cut = math.ceil(total * gp["jackpot_pct"])
+    winnings = total - tax - jackpot_cut
+    await db.return_chips(winner_uid, winnings)
+    try:
+        await db.log_house_revenue(tax, source="chaos_event")
+    except Exception as e:
+        print(f"[Error] lottery tax log failed: {e}")
+    try:
+        await db.adjust_jackpot(jackpot_cut)
+    except Exception as e:
+        print(f"[Error] lottery jackpot log failed: {e}")
+    await _send_event_result(channel, msg, chaos.build_event_result_embed(
+        "lottery",
+        f"<@{winner_uid}> entered with **{entries[winner_uid]}** chips and won **{winnings}** chips! "
+        f"Total entries: **{total}** chips."
+    ))
+
+
+# Double or Nothing
+
+class DoubleOrNothingLoopView(discord.ui.View):
+    def __init__(self, user_id: int, current_amount: int, announce_msg, player_states: dict,
+                 round_num: int = 1, ephemeral_msg=None):
+        super().__init__(timeout=30)
+        self.user_id = user_id
+        self.current_amount = current_amount
+        self.announce_msg = announce_msg  # so busted/cashed-out can reply to the original announcement
+        self.player_states = player_states  # shared with DoubleOrNothingStartView
+        self.round_num = round_num
+        self.ephemeral_msg = ephemeral_msg  # the actual ephemeral message this view is attached to can still edit it
+
+
+    @discord.ui.button(label="Double it! 🎭", style=discord.ButtonStyle.red)
+    async def double(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your round.", ephemeral=True)
+            return
+        gp = chaos.EVENTS_BY_ID["double_or_nothing"].params
+        if random.random() < gp["double_chance"]:
+            self.current_amount *= 2
+
+            # Hard cap on rounds, hitting forces an automatic cash-out right here instead of offering another round.
+            if self.round_num >= gp["max_rounds"]:
+                self.player_states[self.user_id] = "cashed_out"
+                await db.return_chips(self.user_id, self.current_amount)
+                try:
+                    await db.log_house_revenue(-self.current_amount, source="chaos_event")
+                except Exception as e:
+                    print(f"[Error] double_or_nothing revenue log failed: {e}")
+                await interaction.response.edit_message(
+                    content=f"🏆 Auto-cashed out with **{self.current_amount}** chips.", view=None)
+                await _send_event_result(interaction.channel, self.announce_msg, chaos.build_event_result_embed(
+                    "double_or_nothing",
+                    f"<@{self.user_id}> cashed out with **{self.current_amount}** chips!"
+                ))
+                self.stop()
+                return
+                
+            new_view = DoubleOrNothingLoopView(self.user_id, self.current_amount, self.announce_msg, self.player_states, self.round_num + 1, self.ephemeral_msg)
+            await interaction.response.edit_message(
+                content=f"🎯 **Success!** You're at **{self.current_amount}** chips. Double again or cash out?",
+                view=new_view,
+            )
+        else:
+            self.player_states[self.user_id] = "busted"
+            await interaction.response.edit_message(
+                content=f"💥 **Busted!**", view=None)
+            await _send_event_result(interaction.channel, self.announce_msg, chaos.build_event_result_embed(
+                "double_or_nothing", f"<@{self.user_id}> busted.",
+                no_result=True))
+        self.stop()
+
+    @discord.ui.button(label="Cash Out 💰", style=discord.ButtonStyle.grey)
+    async def cash_out(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your round.", ephemeral=True)
+            return
+        self.player_states[self.user_id] = "cashed_out"
+        await db.return_chips(self.user_id, self.current_amount)
+        try:
+            await db.log_house_revenue(-self.current_amount, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] double_or_nothing revenue log failed: {e}")
+        await interaction.response.edit_message(
+            content=f"💰 **Cashed out with {self.current_amount} chips!**", view=None)
+        await _send_event_result(interaction.channel, self.announce_msg, chaos.build_event_result_embed(
+            "double_or_nothing", f"<@{self.user_id}> cashed out with **{self.current_amount}** chips!"))
+        self.stop()
+        
+    async def on_timeout(self):
+        # 30s inaction gets cashed 
+        if self.player_states.get(self.user_id) != "playing":
+            return  # already resolved
+        self.player_states[self.user_id] = "cashed_out"
+        try:
+            await db.return_chips(self.user_id, self.current_amount)
+            await db.log_house_revenue(-self.current_amount, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] double_or_nothing timeout auto-cashout failed: {e}")
+        if self.ephemeral_msg:
+            try:
+                await self.ephemeral_msg.edit(
+                    content=f"⏰ **Time's up!** Auto-cashed out **{self.current_amount}** chips.", view=None)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        try:
+            await _send_event_result(self.announce_msg.channel, self.announce_msg, chaos.build_event_result_embed(
+                "double_or_nothing",
+                f"<@{self.user_id}> cashed out with **{self.current_amount}** chips!"
+            ))
+        except Exception as e:
+            print(f"[Error] double_or_nothing timeout announce failed: {e}")
+
+
+
+
+class DoubleOrNothingStartView(discord.ui.View):
+    def __init__(self, window: int):
+        super().__init__(timeout=window)
+        # Per-user: "playing", "busted", or "cashed_out".
+        self.player_states: dict[int, str] = {}
+        self.expiry = time.time() + window
+
+    @discord.ui.button(label="🎯 Start!", style=discord.ButtonStyle.green)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if _event_expired(self.expiry):
+            await interaction.response.send_message(EVENT_JOIN_MISSED, ephemeral=True)
+            return
+        if uid in self.player_states:
+            # 
+            if self.player_states[uid] == "busted":
+                await interaction.response.send_message("❌ You already lost! No second tries this event.",
+                                                          ephemeral=True)
+            else:
+                await interaction.response.send_message(EVENT_JOIN_ALREADY, ephemeral=True)
+            return
+
+        gp = chaos.EVENTS_BY_ID["double_or_nothing"].params
+        seed = gp["seed_chips"]
+        balance, _ = await db.get_wallet(uid)
+        if balance < seed:
+            await interaction.response.send_message(
+                f"❌ You need **{seed}** chips in your wallet to buy in.", ephemeral=True)
+            return
+        if not await db.deduct_chips(uid, seed):
+            await interaction.response.send_message("❌ Couldn't deduct chips, try again.", ephemeral=True)
+            return
+        try:
+            await db.log_house_revenue(seed, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] double_or_nothing entry revenue log failed: {e}")
+
+        self.player_states[uid] = "playing"
+        await interaction.response.send_message(EVENT_JOIN_SUCCESS, ephemeral=True)
+        
+        loop_view = DoubleOrNothingLoopView(uid, seed, interaction.message, self.player_states)
+        ephemeral_msg = await interaction.followup.send(
+            f"🎯 <@{uid}> bought in for **{seed}** chips! Double it or cash out?",
+            view=loop_view, ephemeral=True, wait=True,
+        )
+        loop_view.ephemeral_msg = ephemeral_msg
+
+async def _run_double_or_nothing(channel, t: TableState, trigger_point: str | None = None):
+    gp = chaos.EVENTS_BY_ID["double_or_nothing"].params
+    window = gp["window_seconds"]
+    msg = await _announce_random_event(
+        channel, t, "double_or_nothing", trigger_point,
+        description=f"Buy in for **{gp['seed_chips']}** chips, then it's a 50/50 to double or lose it "
+                     f"all each round. **{window}s** to buy in.",
+        view=DoubleOrNothingStartView(window),
+    )
+    if msg is None:
+        return
+    await asyncio.sleep(window)
+    try:
+        await msg.edit(view=None)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+
+
+_RANDOM_EVENT_HANDLERS = {
+    "egirl_lover": _run_egirl_lover,
+    "number_guess": _run_number_guess,
+    "think_fast": _run_think_fast,
+    "giveaway_react": _run_giveaway_react,
+    "redistribution": _run_redistribution,
+    "chip_shower": _run_chip_shower,
+    "lottery": _run_lottery,
+    "double_or_nothing": _run_double_or_nothing,
+}
+
+
+# Community Auction
+
+COMMUNITY_AUCTION_WINDOW_SECONDS = 40
+
+
+class CommunityAuctionBidModal(discord.ui.Modal, title="🔨 Place Your Bid"):
+    amount = discord.ui.TextInput(label="Bid amount", max_length=6)
+
+    def __init__(self, t: TableState, board_num: int, card_idx: int, bids: dict, board_label: str):
+        super().__init__()
+        self.t = t
+        self.board_num = board_num
+        self.card_idx = card_idx
+        self.bids = bids  # (user_id, board_num) -> (card_idx, amount, source) shared across the whole auction
+        self.board_label = board_label  # e.g. "Board 1 Card 3", or just "Card 3" outside Double Board
+
+    async def on_submit(self, interaction: discord.Interaction):
+        chips = parse_chips(self.amount.value)
+        if chips is None or chips <= 0:
+            await interaction.response.send_message("❌ Enter a valid bid amount.", ephemeral=True)
+            return
+        p = self.t.game.get_player(interaction.user.id)
+        if not p:
+            await interaction.response.send_message("❌ You're not seated at this table.", ephemeral=True)
+            return
+
+        # Bids draw from the wallet first, fall back to table chips
+        wallet_balance, _ = await db.get_wallet(interaction.user.id)
+        if wallet_balance > 0:
+            source, available = "wallet", wallet_balance
+        else:
+            source, available = "table", p.chips
+
+        if available <= 0:
+            await interaction.response.send_message("❌ You have **0** chips to bid with.", ephemeral=True)
+            return
+        if chips > available:
+            where = "in your wallet" if source == "wallet" else "at the table"
+            await interaction.response.send_message(f"❌ You only have **{available}** chips {where}.", ephemeral=True)
+            return
+
+        # One active bid at a time per board
+        self.bids[(interaction.user.id, self.board_num)] = (self.card_idx, chips, source)
+        where = "your wallet" if source == "wallet" else "your table chips"
+        await interaction.response.send_message(
+            f"🔨 Bid placed: **{chips}** chips on **{self.board_label}**. "
+            f"Placing another bid on this board will replace this one.", ephemeral=True)
+
+
+class CommunityAuctionView(discord.ui.View):
+    def __init__(self, t: TableState, bids: dict, n_cards_board1: int, n_cards_board2: int = 0):
+        super().__init__(timeout=COMMUNITY_AUCTION_WINDOW_SECONDS + 5)
+        self.t = t
+        self.bids = bids
+        self.double_board = n_cards_board2 > 0
+        for i in range(n_cards_board1):
+            label = f"B1 · Card {i + 1}" if self.double_board else f"Card {i + 1}"
+            self.add_item(self._make_button(1, i, label, row=0))
+        for i in range(n_cards_board2):
+            self.add_item(self._make_button(2, i, f"B2 · Card {i + 1}", row=1))
+
+    def _make_button(self, board_num: int, idx: int, label: str, row: int) -> discord.ui.Button:
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            board_label = f"Board {board_num} Card {idx + 1}" if self.double_board else f"Card {idx + 1}"
+            await interaction.response.send_modal(
+                CommunityAuctionBidModal(self.t, board_num, idx, self.bids, board_label))
+
+        btn.callback = callback
+        return btn
+
+
+async def _resolve_auction_bids_for_board(channel, t: TableState, community: list, blind_idx: set,
+                                           bids_for_board: dict[int, tuple[int, int, str]],
+                                           board_tag: str) -> bool:
+    # Resolves one  board's worth of auction bids
+    if not bids_for_board:
+        return False
+
+    # The single highest bid amount on this  board
+    global_best = max(amount for _, amount, _ in bids_for_board.values())
+
+    # Every card on this board that received a bid at that top amount, ties qualify
+    winning_cards: dict[int, list[int]] = {}
+    for uid, (card_idx, amount, source) in bids_for_board.items():
+        if amount == global_best:
+            winning_cards.setdefault(card_idx, []).append(uid)
+
+    replaced_any = False
+    for card_idx, uids in winning_cards.items():
+        if card_idx >= len(community) or not t.game.deck.cards:
+            continue  # state changed underneath us or deck exhausted skip safely
+
+        # Reverify each bidder can still cover their bid
+        payers: list[tuple["PokerPlayer", str]] = []
+        for uid in uids:
+            p = t.game.get_player(uid)
+            if not p:
+                continue
+            _, _, source = bids_for_board[uid]
+            if source == "wallet":
+                wallet_balance, _ = await db.get_wallet(uid)
+                if wallet_balance >= global_best:
+                    payers.append((p, source))
+            else:
+                if p.chips >= global_best:
+                    payers.append((p, source))
+        if not payers:
+            continue  # nobody who tied at the top can actually still afford it
+
+        old_card = community[card_idx]
+        new_card = t.game.deck.draw(1)[0]
+        community[card_idx] = new_card
+        replaced_any = True
+
+        for p, source in payers:
+            if source == "wallet":
+                await db.deduct_chips(p.user_id, global_best)
+            else:
+                p.chips -= global_best
+            try:
+                await db.log_house_revenue(global_best, source="chaos_event")
+            except Exception as e:
+                print(f"[Error] Failed to log Community Auction revenue: {e}")
+
+        old_label = "❓🌫" if card_idx in blind_idx else card_str(old_card)
+        new_label = "❓🌫" if card_idx in blind_idx else card_str(new_card)
+        names = " and ".join(f"<@{p.user_id}>" for p, _ in payers)
+        label = f"{board_tag} card #{card_idx + 1}" if board_tag else f"card #{card_idx + 1}"
+        try:
+            await channel.send(
+                f"🔨 {names} bet **{global_best}** chips, {label} got replaced "
+                f"from **{old_label}** to **{new_label}**!"
+            )
+        except (discord.HTTPException, discord.Forbidden) as e:
+            print(f"[Error] Failed to announce Community Auction replacement: {e}")
+
+    return replaced_any
+
+
+async def _run_community_auction(channel, t: TableState):
+    double_board_active = "double_board" in t.chaos_modifiers
+    bids: dict[tuple[int, int], tuple[int, int, str]] = {}  # (user_id, board_num) -> (card_idx, amount, source)
+
+    board1 = list(t.game.community)
+    blind1 = t.game.blinded_community_idx
+    card_lines1 = "  ".join(
+        f"**{i + 1}.** {'❓🌫' if i in blind1 else card_str(c)}" for i, c in enumerate(board1)
+    )
+
+
+    if double_board_active:
+        board2 = list(t.game.community2)
+        blind2 = t.game.blinded_community2_idx
+        card_lines2 = "  ".join(
+            f"**{i + 1}.** {'🌫️❓' if i in blind2 else card_str(c)}" for i, c in enumerate(board2)
+        )
+        description = (
+            f"**Board 1:** {card_lines1}\n**Board 2:** {card_lines2}\n\n"
+            f"Bid your chips to replace a card you don't like! "
+            f"Only the single **highest bid on each board** actually pays and gets replaced.\n\n"
+            f"**{COMMUNITY_AUCTION_WINDOW_SECONDS} seconds** to bid."
+        )
+    else:
+        blind2 = set()
+        description = (
+            f"{card_lines1}\n\nBid your chips to replace a card you don't like! "
+            f"Only the single **highest bid across all 5 cards** actually pays and gets replaced.\n\n"
+            f"**{COMMUNITY_AUCTION_WINDOW_SECONDS} seconds** to bid."
+        )
+
+    embed = discord.Embed(title="🔨 Community Card Auction", description=description, color=0xE67E22)
+    try:
+        msg = await channel.send(
+            embed=embed,
+            view=CommunityAuctionView(t, bids, len(board1), len(board2) if double_board_active else 0),
+        )
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to send Community Auction prompt: {e}")
+        return
+
+    await asyncio.sleep(COMMUNITY_AUCTION_WINDOW_SECONDS)
+    try:
+        await msg.edit(view=None)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+
+    if not bids:
+        return
+
+    if double_board_active:
+        bids_b1 = {uid: v for (uid, board_num), v in bids.items() if board_num == 1}
+        bids_b2 = {uid: v for (uid, board_num), v in bids.items() if board_num == 2}
+        replaced1 = await _resolve_auction_bids_for_board(
+            channel, t, t.game.community, blind1, bids_b1, "Board 1")
+        replaced2 = await _resolve_auction_bids_for_board(
+            channel, t, t.game.community2, blind2, bids_b2, "Board 2")
+        replaced_any = replaced1 or replaced2
+    else:
+        bids_flat = {uid: v for (uid, board_num), v in bids.items()}
+        replaced_any = await _resolve_auction_bids_for_board(
+            channel, t, t.game.community, blind1, bids_flat, "")
+
+    if replaced_any:
+        # Board image still shows the pre-auction cards until this
+        await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
+
+
+# Gamble the Gamble
+
+GAMBLE_WINDOW_SECONDS = 75
+
+_GAMBLE_RANK_ALIASES = {
+    "A": "A", "ACE": "A",
+    "K": "K", "KING": "K",
+    "Q": "Q", "QUEEN": "Q",
+    "J": "J", "JACK": "J",
+    "T": "T", "10": "T", "TEN": "T",
+    **{str(n): str(n) for n in range(2, 10)},
+}
+_GAMBLE_SUIT_ALIASES = {
+    "S": "s", "SPADE": "s", "SPADES": "s", "♠": "s", "♠️": "s",
+    "H": "h", "HEART": "h", "HEARTS": "h", "♥": "h", "♥️": "h",
+    "D": "d", "DIAMOND": "d", "DIAMONDS": "d", "♦": "d", "♦️": "d",
+    "C": "c", "CLUB": "c", "CLUBS": "c", "♣": "c", "♣️": "c",
+}
+
+
+class GambleTheGambleModal(discord.ui.Modal, title="🎲 Gamble the Gamble"):
+    rank = discord.ui.TextInput(label="Rank (A, 2-9, 10/T, J, Q, K)", max_length=5)
+    suit = discord.ui.TextInput(label="Suit (Spades/Hearts/Diamonds/Clubs)", max_length=10)
+    amount = discord.ui.TextInput(label="Bet amount", max_length=6)
+
+    def __init__(self, t: TableState, bets: dict, deadline: float):
+        super().__init__()
+        self.t = t
+        self.bets = bets
+        self.deadline = deadline
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if time.time() > self.deadline:
+            await interaction.response.send_message(
+                "❌ Betting window has closed.", ephemeral=True)
+            return
+            
+        rank_char = _GAMBLE_RANK_ALIASES.get(self.rank.value.strip().upper())
+        suit_char = _GAMBLE_SUIT_ALIASES.get(self.suit.value.strip().upper())
+        if not rank_char or not suit_char:
+            await interaction.response.send_message(
+                "❌ Invalid entry.", ephemeral=True)
+            return
+
+        gp = chaos.get("gamble_the_gamble").params
+        chips = parse_chips(self.amount.value)
+        if chips is None or chips <= 0:
+            await interaction.response.send_message("❌ Enter a valid bet amount.", ephemeral=True)
+            return
+        if chips > gp["max_bet"]:
+            await interaction.response.send_message(f"❌ Max bet is **{gp['max_bet']}** chips.", ephemeral=True)
+            return
+
+        p = self.t.game.get_player(interaction.user.id)
+        if not p:
+            p = next((pj for pj in self.t.game.pending_joins if pj.user_id == interaction.user.id), None)
+        if not p:
+            await interaction.response.send_message("❌ You're not seated at this table.", ephemeral=True)
+            return
+        if interaction.user.id in self.bets:
+            await interaction.response.send_message("❌ You've already placed a bet this round.", ephemeral=True)
+            return
+        if chips > p.chips:
+            await interaction.response.send_message(f"❌ You only have **{p.chips}** chips at the table.", ephemeral=True)
+            return
+
+        p.chips -= chips  # deducted now; paid back out (with any winnings) once resolved
+        self.bets[interaction.user.id] = (rank_char, suit_char, chips)
+        await interaction.response.send_message(
+            f"🎲 Bet placed: **{chips}** chips on **{rank_char}{SUIT_EMOJI.get(suit_char, '')}**. Good luck!",
+            ephemeral=True)
+
+
+class GambleTheGambleView(discord.ui.View):
+    def __init__(self, t: TableState, bets: dict, deadline: float):
+        super().__init__(timeout=GAMBLE_WINDOW_SECONDS + 5)
+        self.t = t
+        self.bets = bets
+        self.deadline = deadline
+
+    @discord.ui.button(label="🎲 Place Bet", style=discord.ButtonStyle.blurple)
+    async def place_bet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(GambleTheGambleModal(self.t, self.bets, self.deadline))
+
+
+async def _run_gamble_the_gamble(channel, t: TableState) -> dict:
+    
+    bets: dict[int, tuple] = {}
+    deadline = time.time() + GAMBLE_WINDOW_SECONDS
+    gp = chaos.get("gamble_the_gamble").params
+    embed = discord.Embed(
+        title="🎲 Gamble the Gamble",
+        description=(
+            f"Before hands are dealt, bet up to **{gp['max_bet']}** chips on a rank and suit!\n\n"
+            f"**{gp['exact_mult']}x** back if you nail both rank AND suit\n"
+            f"**{gp['split_mult']}x** back if you get rank on one card and suit on another\n"
+            f"**{gp['rank_mult']}x** back for the rank only\n"
+            f"**{gp['suit_mult']}x** back for the suit only\n\n"
+            f"**{GAMBLE_WINDOW_SECONDS} seconds** to place a bet."
+        ),
+        color=0x2ECC71,
+    )
+    try:
+        msg = await channel.send(embed=embed, view=GambleTheGambleView(t, bets, deadline))
+    except (discord.HTTPException, discord.Forbidden) as e:
+        print(f"[Error] Failed to send Gamble the Gamble prompt: {e}")
+        return bets
+
+    await asyncio.sleep(GAMBLE_WINDOW_SECONDS)
+    try:
+        await msg.edit(view=None)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+    return bets
+
+
+async def _resolve_gamble_the_gamble(channel, t: TableState, bets: dict):
+    # checks whole hand
+    if not bets:
+        return
+    gp = chaos.get("gamble_the_gamble").params
+
+    for uid, (rank_char, suit_char, amount) in bets.items():
+        p = t.game.get_player(uid)
+        if not p or not p.hole_cards:
+            continue  # if they left before the deal, bet chips stay deducted
+            
+        mult, result_text = 0, "didn't guess right"
+        exact_hit = False
+        rank_hit = False
+        suit_hit = False
+        for card in p.hole_cards:
+            actual_rank = Card.STR_RANKS[Card.get_rank_int(card)]
+            actual_suit = Card.INT_SUIT_TO_CHAR_SUIT[Card.get_suit_int(card)]
+            rank_match = rank_char == actual_rank
+            suit_match = suit_char == actual_suit
+
+            if rank_match and suit_match:
+                exact_hit = True
+                break  # can't beat an exact match — stop looking
+            rank_hit = rank_hit or rank_match
+            suit_hit = suit_hit or suit_match
+
+        if exact_hit:
+            mult, result_text = gp["exact_mult"], "guessed the right suit and number"
+        elif rank_hit and suit_hit:
+            mult, result_text = gp["split_mult"], "guessed the right number on one card and the right suit on another"
+        elif rank_hit:
+            mult, result_text = gp["rank_mult"], "guessed the right number"
+        elif suit_hit:
+            mult, result_text = gp["suit_mult"], "guessed the right suit"
+
+        # int(), not round() — mult can now be fractional (suit_mult=0.5),
+        # and a naive float payout would leave p.chips holding a fractional
+        # chip count for odd bet amounts (e.g. 501 * 0.5 = 250.5).
+        payout = int(amount * mult)
+        if payout > 0:
+            p.chips += payout
+        net = payout - amount
+
+        try:
+            await db.log_house_revenue(-net, source="chaos_event")
+        except Exception as e:
+            print(f"[Error] Failed to log Gamble the Gamble revenue: {e}")
+        try:
+            await channel.send(
+                f"🎲 <@{uid}> {result_text} — {'+' if net >= 0 else ''}{net} chips!"
+            )
+        except (discord.HTTPException, discord.Forbidden) as e:
+            print(f"[Error] Failed to announce Gamble the Gamble result: {e}")
+
+
+# Uno Reverse swap button
+
+class UnoSwapView(discord.ui.View):
+    """Shown in the ephemeral 'My Cards' response when the clicking player
+    holds an unused Uno Reverse card and it's still early enough to use it
+    button disables after use"""
+
+    def __init__(self, t: TableState, channel):
+        super().__init__(timeout=120)
+        self.t = t
+        self.channel = channel
+
+    @discord.ui.button(label="🔄 Swap Hands", style=discord.ButtonStyle.blurple)
+    async def swap(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ok, msg, target = self.t.game.swap_hands(interaction.user.id)
+        if not ok:
+            await interaction.response.edit_message(content=msg, view=None)
+            self.stop()
+            return
+        button.disabled = True
+        await interaction.response.edit_message(content=f"✅ {msg}", view=self)
+        try:
+            await self.channel.send(msg)
+        except (discord.HTTPException, discord.Forbidden) as e:
+            print(f"[Error] Failed to announce Uno swap: {e}")
+        self.stop()
+
+# Pulled out of GameView.btn_hole 
+async def send_my_cards(t: TableState, interaction: discord.Interaction):
+    p = t.game.get_player(interaction.user.id)
+    if not p or not p.hole_cards:
+        await interaction.response.send_message("❌ No cards right now.", ephemeral=True)
+        return
+
+    # can't see hand before blind
+    game = t.game
+    if ("bomb_pot" in game.chaos_modifiers and game.street.name == "PREFLOP"
+            and not p.all_in and p.bet < game.current_bet):
+        await interaction.response.send_message(
+            "💣 **Bomb Pot** -- call or fold before you can see your hand.", ephemeral=True)
+        return
+
+    # Classified Report
+    # see next seats hand
+    target = p
+    classified_note = ""
+    if "classified_report" in t.chaos_modifiers:
+        players = t.game.players
+        try:
+            idx = players.index(p)
+        except ValueError:
+            idx = None
+        if idx is not None and len(players) > 1:
+            target = players[(idx + 1) % len(players)]
+            classified_note = f"🕵️ You have <@{target.user_id}>'s hand.\n"
+        # 1 player fallback to own hand cuz idk
+
+    # Blindness
+    blind_idx = t.game.blinded_hole_idx.get(target.user_id)
+    blind_positions = {blind_idx} if blind_idx is not None else set()
+    if blind_positions:
+        card_labels = [
+            "❓🌫" if i in blind_positions else card_str(c)
+            for i, c in enumerate(target.hole_cards)
+        ]
+        cards_text = "  ".join(card_labels)
+    else:
+        cards_text = hand_str(target.hole_cards)
+
+    strength = ""
+    visible_hole = [c for i, c in enumerate(target.hole_cards) if i not in blind_positions]
+    # remove strength, could add smth to calc strengh with only the revealed cards too
+    # no card emoji indicators
+    visible_board1 = [c for i, c in enumerate(t.game.community)
+                       if i not in t.game.blinded_community_idx]
+    double_board_active = "double_board" in t.game.chaos_modifiers
+    if double_board_active:
+        # Double board show the ranking against each board separately
+        visible_board2 = [c for i, c in enumerate(t.game.community2)
+                           if i not in t.game.blinded_community2_idx]
+        board_lines = []
+        for board_num, board in ((1, visible_board1), (2, visible_board2)):
+            if len(visible_hole) + len(board) >= 5:
+                score = hand_eval.evaluate_any(evaluator, visible_hole, board)
+                rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+                pct = round((1 - score / 7462) * 100, 1)
+                board_lines.append(f"**Board {board_num}:** {rank} (top {100 - pct:.0f}%)")
+        if board_lines:
+            strength = "\n" + "\n".join(board_lines)
+    elif len(visible_hole) + len(visible_board1) >= 5:
+        score = hand_eval.evaluate_any(evaluator, visible_hole, visible_board1)
+        rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+        pct = round((1 - score / 7462) * 100, 1)
+        strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
+
+    shiny = " ✨" if target.shiny_ids else ""
+    # always reflects the clicking user's own card
+    uno_note = ""
+    uno_view = discord.utils.MISSING
+    if p.uno_color:
+        uno_note = f"\n{UNO_COLOR_EMOJI.get(p.uno_color, '🔄')} You have a **{p.uno_color.title()} Uno Reverse** card!"
+        if t.game.street.name in ("PREFLOP", "FLOP", "TURN"):
+            uno_view = UnoSwapView(t, interaction.channel)
+        else:
+            what = "flop" if "reverse" in t.game.chaos_modifiers else "river"
+            uno_note += f"\n*(too late to swap now! The {what}'s already out)*"
+
+    # Bounty gets own private target
+    # Classified Report shouldn't override
+    bounty_note = ""
+    if "bounty" in t.chaos_modifiers:
+        hunt_target = t.game.bounty_targets.get(p.user_id)
+        if hunt_target is not None:
+            bounty_note = f"\n🎯💰 Get <@{hunt_target}> to fold to you and claim their chips!"
+
+    if classified_note:
+        caption = f"{classified_note}{strength}\n**Cards:** {cards_text}{shiny}{uno_note}{bounty_note}"
+    else:
+        caption = f"Your hole cards — {target.chips} {get_chip_emoji(t)} at table{strength}\n**Cards:** {cards_text}{shiny}{uno_note}{bounty_note}"
+
+    if USE_IMAGES:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            # Card Borders cosmetic
+            target_cosmetics = await db.get_cosmetics(target.user_id)
+            # Card Size preference — this response is ephemeral (only the
+            # clicking user sees it), so it's safe to size it for their
+            # screen specifically, regardless of whose hand is being shown.
+            viewer_pref = await db.get_player_preference(interaction.user.id)
+            compact = viewer_pref.get("card_size") == "compact"
+            file = await asyncio.to_thread(
+                card_images.make_strip, target.hole_cards, 0, True, target.shiny_ids, blind_positions,
+                p.uno_color,  # your own Uno Reverse card, appended to whichever hand you're viewing
+                "cute_mode" in t.chaos_modifiers,
+                border_id=target_cosmetics.get("active_border"),
+                compact=compact,
+            )
+            await interaction.followup.send(caption, file=file, view=uno_view, ephemeral=True)
+        except Exception as e:
+            print(f"🚨 [ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(caption, view=uno_view, ephemeral=True)  # text-only fallback
+        return
+
+    await interaction.response.send_message(caption, view=uno_view, ephemeral=True)
+
+
+class AuctionCardsOnlyView(discord.ui.View):
+    # let players still view hand during auction
+    def __init__(self, t: TableState):
+        super().__init__(timeout=None)
+        self.t = t
+
+    @discord.ui.button(label="My Cards", style=discord.ButtonStyle.grey)
+    async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_my_cards(self.t, interaction)
+
 
 # ── Game View ─────────────────────────────────────────────────────────────────
 
@@ -2719,10 +4587,7 @@ class GameView(discord.ui.View):
             if part.strip():
                 slog(self.t, part)
 
-        if self.t.game._hand_result:
-            await _process_result(interaction.guild, interaction.channel, self.t)
-        else:
-            await refresh(interaction.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
+        await _handle_post_action(interaction.guild, interaction.channel, self.t)
 
     @discord.ui.button(label="Join", style=discord.ButtonStyle.green, row=0)
     async def btn_join(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2755,16 +4620,24 @@ class GameView(discord.ui.View):
         max_w     = settings.get("max_wallet", 0)
         bal       = await db.get_balance(uid)
 
-        # ── Rejoin cooldown check ─────────────────────────────────────────────
-        expiry = self.t.rejoin_cooldowns.get(uid)
-        if expiry and time.time() < expiry:
+        # ── Rejoin lock check (cross-table — see global_rejoin_locks) ──────────
+        lock = get_global_lock(uid)
+        if lock:
+            expiry = lock["expiry"]
+            if not lock["payable"]:
+                # A ban (e.g. the Giveaway random event) — no fee bypasses this.
+                await interaction.response.send_message(
+                    f"❌ You're temporarily banned. It expires <t:{int(expiry)}:R>.",
+                    ephemeral=True,
+                )
+                return
 
             # 🚨 NEW: Fee is dynamically set to 2x the table's current Big Blind
             fee = self.t.game.BIG_BLIND * config.REJOIN_FEE_MULTIPLIER
 
             if fee > 0 and bal >= fee and bal - fee >= min_w:
                 await interaction.response.send_message(
-                    f"⏳ You recently left this table.\n"
+                    f"⏳ You recently left a table.\n"
                     f"Your cooldown expires <t:{int(expiry)}:R>.\n\n"
                     f"Pay **{fee}** {get_chip_emoji(self.t)} to the **Jackpot** to bypass and rejoin now?",
                     view=RejoinConfirmView(self.t, fee, expiry, bal, min_w, max_w),
@@ -2778,14 +4651,13 @@ class GameView(discord.ui.View):
                     elif bal - fee < min_w:
                         bypass_note = f"\n*(After the **{fee}** {get_chip_emoji(self.t)} fee you'd be below the **{min_w}** chip minimum)*"
                 await interaction.response.send_message(
-                    f"⏳ You recently left this table.\n"
+                    f"⏳ You recently left a table.\n"
                     f"Your cooldown expires <t:{int(expiry)}:R>.{bypass_note}",
                     ephemeral=True,
                 )
             return
 
-        # Clear any expired entry
-        self.t.rejoin_cooldowns.pop(uid, None)
+        clear_global_lock(uid)
 
         if bal < min_w:
             await interaction.response.send_message(
@@ -2902,50 +4774,54 @@ class GameView(discord.ui.View):
         min_raise_amt = g.last_raise_size if g.last_raise_size > 0 else g.BIG_BLIND
         pot_third = max(call_amt, g.pot // 3) if p else 0
         pot_half = max(call_amt, g.pot // 2) if p else 0
+        pot_display = "🙈 hidden" if "hidden_pot" in self.t.chaos_modifiers else f"{g.pot} {get_chip_emoji(self.t)}"
         await interaction.followup.send(
-            f"**Raise options** — Pot: {g.pot} {get_chip_emoji(self.t)}  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n",
+            f"**Raise options** — Pot: {pot_display}  |  Call: {call_amt}  |  Stack: {p.chips if p else '?'}\n",
             view=view, ephemeral=True)
 
     @discord.ui.button(label="Fold", style=discord.ButtonStyle.red, row=1)
     async def btn_fold(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
         if not self.t.game.is_turn(uid):
-            # Treat an early Fold click as a one-shot "Fold Any" premove.
-            # This is intentionally not a toggle: repeated clicks while waiting
-            # simply keep the same premove armed, avoiding lag/double-click issues.
-            p = self.t.game.get_player(uid)
-            if not p or p.folded or p.all_in:
-                await interaction.response.send_message("❌ You can't fold right now.", ephemeral=True)
-                return
-            p.premove = {"action": "fold_any"}
-            await interaction.response.send_message(
-                "⚡ **Fold Any premove set.** It will fold on your next turn if bet > 0",
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ It's not your turn.", ephemeral=True)
             return
 
         p = self.t.game.get_player(uid)
 
-        # Prevent accidental folds of Flush or higher (only works if Flop is out)
+        # Prevent accidental folds of Flush or higher (only works if there are
+        # enough total cards to rank a hand — under "Reverse" the board can
+        # have just 1-2 cards on a real street, unlike the usual 3+).
+        # Chaos: Blindness — this must never evaluate off cards the player
+        # can't actually see: their own smudged hole card, or any smudged
+        # community card (community blindness hides that card from
+        # EVERYONE, not just this player). Left unfiltered, "You currently
+        # have a Flush!" would hand back exactly the information Blindness
+        # is supposed to be withholding. Filter both out first, same as
+        # the My Cards strength preview does.
         is_strong_hand = False
-        if p and p.hole_cards and len(self.t.game.community) >= 3:
-            score = evaluator.evaluate(p.hole_cards, self.t.game.community)
-            rank_class = evaluator.get_rank_class(score)
+        if p and p.hole_cards:
+            blind_hole_idx = self.t.game.blinded_hole_idx.get(uid)
+            visible_hole = [c for i, c in enumerate(p.hole_cards) if i != blind_hole_idx]
+            visible_board = [c for i, c in enumerate(self.t.game.community)
+                              if i not in self.t.game.blinded_community_idx]
+            if len(visible_hole) + len(visible_board) >= 5:
+                score = hand_eval.evaluate_any(evaluator, visible_hole, visible_board)
+                rank_class = evaluator.get_rank_class(score)
 
-            # Treys rank classes: 1 (Straight Flush), 2 (Quads), 3 (Full House), 4 (Flush)
-            if rank_class <= 4:
-                is_strong_hand = True
-                rank_name = evaluator.class_to_string(rank_class)
+                # Treys rank classes: 1 (Straight Flush), 2 (Quads), 3 (Full House), 4 (Flush)
+                if rank_class <= 4:
+                    is_strong_hand = True
+                    rank_name = evaluator.class_to_string(rank_class)
 
-                # Pass `self` so the confirm view can access `_do_action`
-                view = FoldConfirmView(self)
+                    # Pass `self` so the confirm view can access `_do_action`
+                    view = FoldConfirmView(self)
 
-                await interaction.response.send_message(
-                    f"⚠️ **Are you sure you want to fold?**\nYou currently have a **{rank_name}**!",
-                    view=view,
-                    ephemeral=True
-                )
-                return
+                    await interaction.response.send_message(
+                        f"⚠️ **Are you sure you want to fold?**\nYou currently have a **{rank_name}**!",
+                        view=view,
+                        ephemeral=True
+                    )
+                    return
 
         # If not Flush or better, check Fold confirmation preference based on pot size
         if not is_strong_hand:
@@ -2973,34 +4849,7 @@ class GameView(discord.ui.View):
 
     @discord.ui.button(label="My Cards", style=discord.ButtonStyle.grey, row=2)
     async def btn_hole(self, interaction: discord.Interaction, button: discord.ui.Button):
-        p = self.t.game.get_player(interaction.user.id)
-        if not p or not p.hole_cards:
-            await interaction.response.send_message("❌ No cards right now.", ephemeral=True)
-            return
-
-        strength = ""
-        if self.t.game.community:
-            score = evaluator.evaluate(p.hole_cards, self.t.game.community)
-            rank = evaluator.class_to_string(evaluator.get_rank_class(score))
-            pct = round((1 - score / 7462) * 100, 1)
-            strength = f"\n**Hand:** {rank} (top {100 - pct:.0f}%)"
-
-        shiny = " ✨" if p.egirl_saro else ""
-        caption = f"Your hole cards — {p.chips} {get_chip_emoji(self.t)} at table{strength}\n**Cards:** {hand_str(p.hole_cards)}{shiny}"
-
-        if USE_IMAGES:
-            await interaction.response.defer(ephemeral=True)
-            try:
-                file = await asyncio.to_thread(card_images.make_strip, p.hole_cards, 0, True, p.egirl_saro)
-                await interaction.followup.send(caption, file=file, ephemeral=True)
-            except Exception as e:
-                print(f"🚨 [ERROR] {e}")
-                import traceback
-                traceback.print_exc()
-                await interaction.followup.send(caption, ephemeral=True)  # text-only fallback
-            return
-
-        await interaction.response.send_message(caption, ephemeral=True)
+        await send_my_cards(self.t, interaction)
 
     @discord.ui.button(label="Rankings", style=discord.ButtonStyle.grey, row=2)
     async def btn_rankings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3082,8 +4931,10 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
     """Build the /poker titles embed and its interactive select-menu view on separate pages."""
     owned_titles = set(cosmetics["unlocked_titles"])
     owned_msgs = set(cosmetics["unlocked_win_msgs"])
+    owned_borders = set(cosmetics.get("unlocked_borders", []))
     active_t = cosmetics.get("active_title")
     active_m = cosmetics.get("active_win_msg")
+    active_b = cosmetics.get("active_border")
 
     embed = discord.Embed(color=0x9b59b6)
 
@@ -3122,7 +4973,7 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 embed.add_field(name="\u200b", value="\n".join(chunk)[:1024], inline=False)
 
     # ── WIN MESSAGES PAGE ──────────────────────────────────────────────────────
-    else:
+    elif page == "winmsgs":
         visible_winmsgs = db.get_visible_cosmetics_for_user(user_id, owned_msgs, db.WIN_MESSAGES)
         embed.title = f"💬 Win Messages ({len(owned_msgs)}/{len(visible_winmsgs)} unlocked)"
         m_lines = []
@@ -3147,20 +4998,53 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
             for chunk in m_chunks:
                 embed.add_field(name="\u200b", value="\n".join(chunk)[:1024], inline=False)
 
-    embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
-    view = CosmeticsView(user_id, owned_titles, owned_msgs, active_t, active_m, page)
+    # ── CARD BORDERS PAGE ──────────────────────────────────────────────────────
+    else:
+        visible_borders = db.get_visible_cosmetics_for_user(user_id, owned_borders, db.BORDERS)
+        embed.title = f"🖼️ Card Borders ({len(owned_borders)}/{len(visible_borders)} unlocked)"
+        b_lines = []
+        for bid, info in visible_borders.items():
+            rarity = db.RARITY_LABEL.get(info["rarity"], "")
+            display_str = f"{info['display']} - {rarity}" if rarity else f"{info['display']}"
+            if bid in owned_borders:
+                equipped = "  ◀ **equipped**" if bid == active_b else ""
+                desc = f" — *{info['description']}*" if info.get('description') else ""
+                b_lines.append(f"✅ {display_str}{desc}{equipped}")
+            else:
+                desc = info['description'] if info['rarity'] != 'legendary' else "???"
+                b_lines.append(f"🔒 {display_str} — *{desc}*")
+
+        chunk_size = 10
+        b_chunks = [b_lines[i:i + chunk_size] for i in range(0, len(b_lines), chunk_size)]
+
+        if not b_chunks:
+            embed.add_field(name="\u200b", value="None yet.", inline=False)
+        else:
+            for chunk in b_chunks:
+                embed.add_field(name="\u200b", value="\n".join(chunk)[:1024], inline=False)
+        embed.set_footer(text="Equipped borders show on your hole cards for My Cards and at showdown.")
+
+    if page != "borders":
+        embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
+    view = CosmeticsView(user_id, owned_titles, owned_msgs, owned_borders, active_t, active_m, active_b, page)
     return embed, view
 
 class CosmeticsView(discord.ui.View):
     """Attach Select menus and a page toggle button to /poker titles."""
+
+    _ALL_PAGES = ["titles", "winmsgs", "borders"]
+    _PAGE_META = {"titles": ("View Titles", "🎖️"), "winmsgs": ("View Win Messages", "💬"),
+                  "borders": ("View Card Borders", "🖼️")}
 
     def __init__(
         self,
         user_id: int,
         owned_titles: set[str],
         owned_msgs: set[str],
+        owned_borders: set[str],
         active_title: str | None,
         active_msg: str | None,
+        active_border: str | None,
         page: str = "titles"
     ):
         super().__init__(timeout=120)
@@ -3184,12 +5068,7 @@ class CosmeticsView(discord.ui.View):
             title_select.callback = self._on_title_select
             self.add_item(title_select)
 
-            # Pagination Button
-            switch_btn = discord.ui.Button(label="View Win Messages", style=discord.ButtonStyle.primary, row=1, emoji="💬")
-            switch_btn.callback = self._on_switch
-            self.add_item(switch_btn)
-
-        else:
+        elif self.page == "winmsgs":
             # ── Win-message select ─────────────────────────────────────────────
             msg_opts = [discord.SelectOption(label="— Remove win message —", value="none", emoji="❌")]
             for mid in owned_msgs:
@@ -3205,10 +5084,38 @@ class CosmeticsView(discord.ui.View):
             msg_select.callback = self._on_msg_select
             self.add_item(msg_select)
 
-            # Pagination Button
-            switch_btn = discord.ui.Button(label="View Titles", style=discord.ButtonStyle.primary, row=1, emoji="🎖️")
-            switch_btn.callback = self._on_switch
+        else:
+            # ── Card Border select ───────────────────────────────────────────────
+            border_opts = [discord.SelectOption(label="— Remove border —", value="none", emoji="❌")]
+            for bid in owned_borders:
+                info = db.BORDERS.get(bid)
+                if info:
+                    border_opts.append(discord.SelectOption(
+                        label=info["display"], value=bid, default=(bid == active_border)
+                    ))
+
+            border_select = discord.ui.Select(
+                placeholder="🖼️ Equip a card border…", options=border_opts[:25], custom_id="cosmetics:border", row=0
+            )
+            border_select.callback = self._on_border_select
+            self.add_item(border_select)
+
+        # Pagination — one button per OTHER page (not the one you're on),
+        # so both alternatives are always one click away instead of
+        # cycling titles → win messages → borders → titles via a single
+        # "next" button.
+        for target_page in self._ALL_PAGES:
+            if target_page == self.page:
+                continue
+            label, emoji = self._PAGE_META[target_page]
+            switch_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=1, emoji=emoji)
+            switch_btn.callback = self._make_switch_callback(target_page)
             self.add_item(switch_btn)
+
+    def _make_switch_callback(self, target_page: str):
+        async def _callback(interaction: discord.Interaction):
+            await self._on_switch(interaction, target_page)
+        return _callback
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -3216,11 +5123,10 @@ class CosmeticsView(discord.ui.View):
             return False
         return True
 
-    async def _on_switch(self, interaction: discord.Interaction):
+    async def _on_switch(self, interaction: discord.Interaction, target_page: str):
         if not await self._guard(interaction): return
-        new_page = "winmsgs" if self.page == "titles" else "titles"
         cosmetics = await db.get_cosmetics(self.user_id)
-        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=new_page)
+        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=target_page)
         new_view.message = self.message
         await interaction.response.edit_message(embed=embed, view=new_view)
 
@@ -3248,6 +5154,19 @@ class CosmeticsView(discord.ui.View):
         label = db.WIN_MESSAGES[mid]["display"] if mid else "removed"
         await interaction.response.edit_message(
             content=f"✅ Win message set to **{label}**." if mid else "✅ Win message removed.",
+            embed=embed, view=new_view)
+
+    async def _on_border_select(self, interaction: discord.Interaction):
+        if not await self._guard(interaction): return
+        chosen = interaction.data["values"][0]
+        bid = None if chosen == "none" else chosen
+        await db.set_active_border(self.user_id, bid)
+        cosmetics = await db.get_cosmetics(self.user_id)
+        embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
+        new_view.message = self.message
+        label = db.BORDERS[bid]["display"] if bid else "removed"
+        await interaction.response.edit_message(
+            content=f"✅ Card border set to **{label}**." if bid else "✅ Card border removed.",
             embed=embed, view=new_view)
 
     async def on_timeout(self):
@@ -3323,6 +5242,21 @@ async def _autocomplete_winmsg(
     return choices[:25]
 
 
+async def _autocomplete_border(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Only shows card borders the user has already unlocked."""
+    cosmetics = await db.get_cosmetics(interaction.user.id)
+    owned = set(cosmetics.get("unlocked_borders", []))
+    choices = [app_commands.Choice(name="— Remove card border —", value="none")]
+    for bid in owned:
+        info = db.BORDERS.get(bid)
+        if info and current.lower() in info["display"].lower():
+            choices.append(app_commands.Choice(name=info["display"], value=bid))
+    return choices[:25]
+
+
 async def _autocomplete_grant_cosmetic(
         interaction: discord.Interaction,
         current: str,
@@ -3335,6 +5269,8 @@ async def _autocomplete_grant_cosmetic(
         catalog = db.TITLES
     elif kind == "winmsg":
         catalog = db.WIN_MESSAGES
+    elif kind == "border":
+        catalog = db.BORDERS
     else:
         # If they haven't selected a kind yet, return empty to force them to pick one first
         return []
@@ -3372,7 +5308,29 @@ class PokerCog(commands.Cog):
             return
         key = (message.guild.id, message.channel.id)
         t = get_table(key)
-        if not t or t.game.street == Street.WAITING:
+        if not t:
+            return
+
+        # ── Random events: message-based ones (phrase chant, number guess)
+        # are checked independently of hand state, since an event can
+        # still be resolving between hands.
+        if t.active_random_event:
+            await _handle_random_event_message(message, t)
+
+        # ── Chaos: "67" title bait — also checked independently of hand
+        # state, since the whole point is it's open between hands (from
+        # right after a 6-7 win until the next hand starts).
+        if t.sixseven_bait_active and SIXSEVEN_PATTERN.search(message.content):
+            try:
+                if await db.unlock_cosmetic(message.author.id, "title", "gen_alpha"):
+                    await message.channel.send(
+                        f"💀 <@{message.author.id}> said it. Unlocked the **gen alpha** title."
+                    )
+            except Exception as e:
+                print(f"[poker] 67 bait unlock error: {e}")
+                traceback.print_exc()
+
+        if t.game.street == Street.WAITING:
             return
 
         t.msg_count += 1
@@ -3447,10 +5405,10 @@ class PokerCog(commands.Cog):
     async def before_daily_backup(self):
         await self.bot.wait_until_ready()
 
-    poker = app_commands.Group(name="poker", description="Texas Hold'em poker", guild_ids=[config.GUILD_ID])
-    pokerset = app_commands.Group(name="pokerset", description="Configure poker settings", guild_ids=[config.GUILD_ID])
-    pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands", guild_ids=[config.GUILD_ID])
-    pokeradmin = app_commands.Group(name="pokeradmin", description="Poker economy and admin commands", guild_ids=[config.GUILD_ID])
+    poker = app_commands.Group(name="poker", description="Texas Hold'em poker")
+    pokerset = app_commands.Group(name="pokerset", description="Configure poker settings")
+    pokermgr = app_commands.Group(name="pokermgr", description="Poker manager commands")
+    pokeradmin = app_commands.Group(name="pokeradmin", description="Poker economy and admin commands")
 
     @poker.command(name="ping", description="Check the bot's latency")
     async def ping(self, interaction: discord.Interaction):
@@ -3472,11 +5430,6 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ A table is already running in this channel. Close it first.", ephemeral=True)
             return
 
-        for (gid, cid), t in tables.items():
-            if gid == interaction.guild_id and not getattr(t, 'is_tournament', False):
-                await interaction.followup.send(
-                    f"❌ A regular poker table is already running in <#{cid}>. Close it first.", ephemeral=True);
-                return
         t = TableState(name, interaction.user.id, interaction.user.name)
         tables[(interaction.guild_id, interaction.channel_id)] = t
         settings = await db.get_settings(interaction.guild_id)
@@ -3578,6 +5531,11 @@ class PokerCog(commands.Cog):
                 await interaction.followup.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}",
                                                 ephemeral=True)
                 return
+        else:
+            bb = t.game.BIG_BLIND
+            active = [p for p in t.game.players if (p.chips + p.pending_rebuy) >= bb]
+            pending_with_chips = [p for p in t.game.pending_joins if (p.chips + p.pending_rebuy) >= bb]
+            await _roll_chaos_for_hand(interaction.channel, t, settings, len(active) + len(pending_with_chips))
 
         slog_clear(t)
         success, msg = t.game.start_hand()
@@ -3585,6 +5543,13 @@ class PokerCog(commands.Cog):
         if not success:
             await interaction.followup.send(msg, ephemeral=True);
             return
+
+        t.sixseven_bait_active = False  # Chaos: "67" bait window closes the moment the next hand actually starts
+        await _announce_bounty_if_active(interaction.channel, t)
+
+        if t.pending_gamble_bets:
+            await _resolve_gamble_the_gamble(interaction.channel, t, t.pending_gamble_bets)
+            t.pending_gamble_bets = {}
 
         t.msg_count = 0
         await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'start')
@@ -3636,6 +5601,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
+            apply_global_lock(user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
             await interaction.followup.send(f"🦵 **{user.display_name}** has been kicked from the waiting list.")
             return
 
@@ -3646,6 +5612,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
+            apply_global_lock(user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
             await interaction.followup.send(
                 f"🦵 **{user.display_name}** has been kicked and removed from the table.")
             await refresh(interaction.channel, t)
@@ -3655,6 +5622,11 @@ class PokerCog(commands.Cog):
             t.game.kicked_users.append(user.id)
         if user.id not in t.game.pending_leaves:
             t.game.pending_leaves.append(user.id)
+        # Applied now rather than routed through leave_cooldown_pending —
+        # this is unambiguously a kick regardless of which pending-leave
+        # bucket it'd otherwise land in, so there's no need to wait for
+        # _process_result's generic drain to decide the duration.
+        apply_global_lock(user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
 
         if not p.folded:
             ok, fold_msg = t.game.force_fold(user.id)
@@ -3669,10 +5641,7 @@ class PokerCog(commands.Cog):
         await interaction.followup.send(
             f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.")
 
-        if t.game._hand_result:
-            await _process_result(interaction.guild, interaction.channel, t)
-        else:
-            await refresh(interaction.channel, t)
+        await _handle_post_action(interaction.guild, interaction.channel, t)
 
     @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)")
@@ -3700,74 +5669,77 @@ class PokerCog(commands.Cog):
                                     interaction.user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
 
-        kicked_from = ""
+        kicked_from = []
 
-        # Grab the single active table for this server (excluding tournament tables)
-        active = next(((cid, table) for (gid, cid), table in tables.items() if gid == interaction.guild_id and not getattr(table, 'is_tournament', False)), None)
+        # Every live, non-tournament table in this guild — a server-wide ban
+        # (table_name=None) is applied to ALL of them, not just one; a
+        # named ban only to the one whose name matches. Multiple regular
+        # tables can be running at once in different channels, so this can
+        # no longer just grab "the" active table.
+        guild_tables = [(cid, tbl) for (gid, cid), tbl in tables.items()
+                         if gid == interaction.guild_id and not getattr(tbl, 'is_tournament', False)]
+        if table_name:
+            guild_tables = [(cid, tbl) for cid, tbl in guild_tables if tbl.name.lower() == table_name.lower()]
 
-        if active:
-            cid, t = active
-            if table_name is None or t.name.lower() == table_name.lower():
-                if user.id not in t.game.banned_users:
-                    t.game.banned_users.append(user.id)
+        for cid, t in guild_tables:
+            if user.id not in t.game.banned_users:
+                t.game.banned_users.append(user.id)
 
-                p = t.game.get_player(user.id)
-                pj = next((x for x in t.game.pending_joins if x.user_id == user.id), None)
+            p = t.game.get_player(user.id)
+            pj = next((x for x in t.game.pending_joins if x.user_id == user.id), None)
 
-                # Kick from waiting list
-                if pj:
-                    t.game.pending_joins.remove(pj)
-                    total_to_return = pj.chips + pj.pending_rebuy
+            # Kick from waiting list
+            if pj:
+                t.game.pending_joins.remove(pj)
+                total_to_return = pj.chips + pj.pending_rebuy
+                if total_to_return > 0:
+                    await db.return_chips(user.id, total_to_return)
+                await db.clear_chips_in_play(user.id)
+
+            # Kick from active table
+            if p:
+                if t.game.street == Street.WAITING and not t.game._hand_result:
+                    t.game.players.remove(p)
+                    total_to_return = p.chips + p.pending_rebuy
                     if total_to_return > 0:
                         await db.return_chips(user.id, total_to_return)
                     await db.clear_chips_in_play(user.id)
+                else:
+                    if user.id not in t.game.kicked_users:
+                        t.game.kicked_users.append(user.id)
+                    if user.id not in t.game.pending_leaves:
+                        t.game.pending_leaves.append(user.id)
 
-                # Kick from active table
-                if p:
+                    if not p.folded:
+                        ok, fold_msg = t.game.force_fold(user.id)
+                        if ok:
+                            parts = fold_msg.split("\n")
+                            if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                                slog_clear(t)
+                            for part in parts:
+                                if part.strip():
+                                    slog(t, part)
+
+            if p or pj:
+                kicked_from.append(t.name)
+                ch = interaction.guild.get_channel(cid)
+                if ch:
                     if t.game.street == Street.WAITING and not t.game._hand_result:
-                        t.game.players.remove(p)
-                        total_to_return = p.chips + p.pending_rebuy
-                        if total_to_return > 0:
-                            await db.return_chips(user.id, total_to_return)
-                        await db.clear_chips_in_play(user.id)
+                        await ch.send(f"🔨 **{user.display_name}** has been banned and removed from the table.")
+                        await refresh(ch, t)
                     else:
-                        if user.id not in t.game.kicked_users:
-                            t.game.kicked_users.append(user.id)
-                        if user.id not in t.game.pending_leaves:
-                            t.game.pending_leaves.append(user.id)
+                        await ch.send(
+                            f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
+                        await _handle_post_action(interaction.guild, ch, t)
 
-                        if not p.folded:
-                            ok, fold_msg = t.game.force_fold(user.id)
-                            if ok:
-                                parts = fold_msg.split("\n")
-                                if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
-                                    slog_clear(t)
-                                for part in parts:
-                                    if part.strip():
-                                        slog(t, part)
-
-                if p or pj:
-                    kicked_from = f" Kicked from: {t.name}."
-                    ch = interaction.guild.get_channel(cid)
-                    if ch:
-                        if t.game._hand_result:
-                            await ch.send(
-                                f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
-                            await _process_result(interaction.guild, ch, t)
-                        elif t.game.street == Street.WAITING:
-                            await ch.send(f"🔨 **{user.display_name}** has been banned and removed from the table.")
-                            await refresh(ch, t)
-                        else:
-                            await ch.send(
-                                f"🔨 **{user.display_name}** has been banned and will be removed after this hand.")
-                            await refresh(ch, t)
+        kicked_note = f" Kicked from: {', '.join(kicked_from)}." if kicked_from else ""
 
         if not added:
-            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kicked_from}",
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kicked_note}",
                                             ephemeral=True)
         else:
-            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kicked_from}",
-                                            ephemeral=not kicked_from)
+            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{kicked_note}",
+                                            ephemeral=not kicked_note)
 
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
@@ -3779,19 +5751,44 @@ class PokerCog(commands.Cog):
         removed = await db.unban_player(interaction.guild_id, user.id, table_name)
         scope = f"table **{table_name}**" if table_name else "all tables"
 
-        active = next(((cid, table) for (gid, cid), table in tables.items() if gid == interaction.guild_id), None)
+        # Same multi-table handling as /pokermgr ban — see its comment.
+        guild_tables = [(cid, tbl) for (gid, cid), tbl in tables.items()
+                         if gid == interaction.guild_id and not getattr(tbl, 'is_tournament', False)]
+        if table_name:
+            guild_tables = [(cid, tbl) for cid, tbl in guild_tables if tbl.name.lower() == table_name.lower()]
 
-        if active:
-            cid, t = active
-            if table_name is None or t.name.lower() == (table_name or "").lower():
-                if user.id in t.game.banned_users:
-                    t.game.banned_users.remove(user.id)
+        for cid, t in guild_tables:
+            if user.id in t.game.banned_users:
+                t.game.banned_users.remove(user.id)
 
         # FIXED: Send publicly
         if removed:
             await interaction.followup.send(f"✅ **{user.display_name}** unbanned from {scope}.", ephemeral=False)
         else:
             await interaction.followup.send(f"ℹ️ **{user.display_name}** had no bans for {scope}.", ephemeral=False)
+
+    @pokermgr.command(name="unlock", description="[Manager] Clear a player's active rejoin cooldown/ban early")
+    @app_commands.describe(user="Player to unlock")
+    async def unlock(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_manager(interaction):
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
+            return
+
+        # This only ever touches global_rejoin_locks — the temporary,
+        # cross-table cooldown/ban a kick or a random event applies (see
+        # apply_global_lock). It does NOT touch a persistent /pokermgr ban
+        # (that's db.is_banned/poker_bans, its own separate system with
+        # its own /pokermgr unban) — a manager reaching for "unlock" on
+        # someone with a real ban stays blocked, on purpose.
+        lock = get_global_lock(user.id)
+        if not lock:
+            await interaction.followup.send(f"ℹ️ **{user.display_name}** has no active cooldown or ban.", ephemeral=True)
+            return
+
+        kind = "kick cooldown" if lock["payable"] else "ban"
+        clear_global_lock(user.id)
+        await interaction.followup.send(f"🔓 Cleared **{user.display_name}**'s {kind} early — they can rejoin any table now.")
 
     @pokermgr.command(name="forcefold", description="[Manager] Force a player to fold their hand")
     @app_commands.describe(user="Player to force fold")
@@ -3829,10 +5826,7 @@ class PokerCog(commands.Cog):
         slog(t, msg)
         await interaction.followup.send(f"✅ Force folded **{user.display_name}**.")
 
-        if t.game._hand_result:
-            await _process_result(interaction.guild, interaction.channel, t)
-        else:
-            await refresh(interaction.channel, t)
+        await _handle_post_action(interaction.guild, interaction.channel, t)
 
     # ── Player commands ───────────────────────────────────────────────────
 
@@ -4189,43 +6183,78 @@ class PokerCog(commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=False)
 
-    @pokerset.command(name="table", description="[Manager] Apply a global Stakes & Buy-in preset")
-    @app_commands.describe(size="Choose the table size preset")
-    @app_commands.choices(size=[
-        app_commands.Choice(name="Small Table (5/10 Blinds, 50 to 1b Buy-in)", value="small"),
-        app_commands.Choice(name="Medium Table (15/30 Blinds, 150 to 3k Buy-in)", value="medium"),
-        app_commands.Choice(name="High Table (25/50 Blinds, 250 to 5k Buy-in)", value="high"),
-    ])
-    async def set_preset(self, interaction: discord.Interaction, size: app_commands.Choice[str]):
-        # 1. Manager Check
-        if not await is_manager(interaction):
-            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True)
-            return
+    class _TableSizeModal(discord.ui.Modal, title="Set Table Size"):
+        size = discord.ui.TextInput(
+            label="Table size (Small / Medium / High)",
+            placeholder="Small, Medium, or High",
+            max_length=16,
+        )
 
-        await interaction.response.defer(ephemeral=False)
+        def __init__(self, cog: "PokerCog"):
+            super().__init__()
+            self.cog = cog
 
-        # 2. Assign values based on selection
-        if size.value == "small":
+        async def on_submit(self, interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=False)
+            await self.cog._apply_table_size(interaction, self.size.value)
+
+    async def _apply_table_size(self, interaction: discord.Interaction, size: str):
+        # `size` is free text (not a fixed choice list) specifically so the
+        # hidden Chaos preset can be reached by typing "soahc" — it never
+        # shows up as a suggestion, and now that this whole value comes
+        # through a modal rather than a visible slash-command parameter, it
+        # never appears in Discord's public "[Manager] used /pokerset table"
+        # invocation indicator either (modal submissions aren't part of
+        # that — only the bare command name is).
+        raw = (size or "").strip().lower()
+        is_chaos = raw == chaos.UNLOCK_PHRASE
+
+        if raw == "small":
             sb, bb, min_b, max_b = 5, 10, 50, 1000
-        elif size.value == "medium":
+            preset_name = "Small Table"
+        elif raw == "medium":
             sb, bb, min_b, max_b = 15, 30, 150, 3000
-        elif size.value == "high":
+            preset_name = "Medium Table"
+        elif raw == "high":
             sb, bb, min_b, max_b = 25, 50, 250, 5000
+            preset_name = "High Table"
+        elif is_chaos:
+            base = chaos.CHAOS_BASE_SETTINGS
+            sb, bb, min_b, max_b = base["small_blind"], base["big_blind"], base["min_wallet"], base["max_wallet"]
+            preset_name = "🎲 Chaos Table"
+        else:
+            await interaction.followup.send("❌ Not a valid table size. Choose Small, Medium, or High.")
+            return
 
         await db.set_settings(
             interaction.guild_id,
             small_blind=sb,
             big_blind=bb,
             min_wallet=min_b,
-            max_wallet=max_b
+            max_wallet=max_b,
+            table_mode="chaos" if is_chaos else "normal",
         )
 
         # 4. Confirmation
-        preset_name = size.name.split(" (")[0]  # Cleans up the string to just "Small Table"
-        await interaction.followup.send(
-            f"✅Applied: **{preset_name}**\n"
-            f"Blinds: {sb}/{bb} | Buy-in: {min_b} to {max_b}"
-        )
+        if is_chaos:
+            await interaction.followup.send(
+                f"✅ Applied: **🎲 Chaos Table**\n"
+                f"Blinds: {sb}/{bb} | Buy-in: {min_b} to {max_b}\n"
+            )
+        else:
+            await interaction.followup.send(
+                f"✅Applied: **{preset_name}**\n"
+                f"Blinds: {sb}/{bb} | Buy-in: {min_b} to {max_b}"
+            )
+
+    @pokerset.command(name="table", description="[Manager] Apply a global Stakes & Buy-in preset")
+    async def set_preset(self, interaction: discord.Interaction):
+        # 1. Manager check — must happen BEFORE the modal, since a modal has
+        # to be the interaction's first response.
+        if not await is_manager(interaction):
+            await interaction.response.send_message("❌ Poker Managers only.", ephemeral=True)
+            return
+        await interaction.response.send_modal(self._TableSizeModal(self))
 
     @pokerset.command(name="blinds", description="[Manager] Set small and big blind amounts")
     @app_commands.describe(small="Small blind", big="Big blind")
@@ -5090,12 +7119,34 @@ class PokerCog(commands.Cog):
             return
         await interaction.followup.send(f"✅ Win message set to **{db.WIN_MESSAGES[msg_id]['display']}**!", ephemeral=True)
 
-    @pokeradmin.command(name="grant_cosmetic", description="[Admin] Grant a title or win message to any player")
+    @poker.command(name="equipborder", description="Equip one of your unlocked card borders")
+    @app_commands.describe(border_id="Your unlocked card border — pick from the list")
+    @app_commands.autocomplete(border_id=_autocomplete_border)
+    async def equipborder(self, interaction: discord.Interaction, border_id: str):
+        await interaction.response.defer(ephemeral=True)
+        if border_id == "none":
+            await db.set_active_border(interaction.user.id, None)
+            await interaction.followup.send("✅ Card border removed.", ephemeral=True)
+            return
+        if border_id not in db.BORDERS:
+            await interaction.followup.send("❌ Unknown card border. Use `/poker titles` to see your options.", ephemeral=True)
+            return
+        ok = await db.set_active_border(interaction.user.id, border_id)
+        if not ok:
+            info = db.BORDERS[border_id]
+            desc = info['description'] if info['rarity'] != 'legendary' else "???"
+            await interaction.followup.send(
+                f"❌ You haven't unlocked **{info['display']}** yet.\n*{desc}*", ephemeral=True)
+            return
+        await interaction.followup.send(f"✅ Card border set to **{db.BORDERS[border_id]['display']}**!", ephemeral=True)
+
+    @pokeradmin.command(name="grant_cosmetic", description="[Admin] Grant a title, win message, or card border to any player")
     @app_commands.describe(user="The player to receive the cosmetic", kind="Type of cosmetic",
                            cosmetic_id="Search for the cosmetic")
     @app_commands.choices(kind=[
         app_commands.Choice(name="Title", value="title"),
         app_commands.Choice(name="Win Message", value="winmsg"),
+        app_commands.Choice(name="Card Border", value="border"),
     ])
     @app_commands.autocomplete(cosmetic_id=_autocomplete_grant_cosmetic)
     async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.Member, kind: str, cosmetic_id: str):
@@ -5104,25 +7155,25 @@ class PokerCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         k = kind.strip().lower()
-        if k not in ("title", "winmsg"):
-            await interaction.followup.send("❌ `kind` must be `title` or `winmsg`.", ephemeral=True); return
-        catalog = db.TITLES if k == "title" else db.WIN_MESSAGES
+        if k not in ("title", "winmsg", "border"):
+            await interaction.followup.send("❌ `kind` must be `title`, `winmsg`, or `border`.", ephemeral=True); return
+        catalog = db.catalog_for_kind(k)
         cid = cosmetic_id.strip().lower()
         if cid not in catalog:
             valid = ", ".join(f"`{x}`" for x in catalog)
             await interaction.followup.send(f"❌ Unknown ID `{cid}`.\nValid: {valid}", ephemeral=True); return
         newly = await db.unlock_cosmetic(user.id, k, cid)
         display = catalog[cid]["display"]
-        cmd = "equiptitle" if k == "title" else "equipwinmsg"
+        cmd = {"title": "equiptitle", "winmsg": "equipwinmsg", "border": "equipborder"}[k]
         if newly:
             await interaction.followup.send(
                 f"✅ Granted **{display}** to {user.mention}.\nThey can equip it with `/poker {cmd}`", ephemeral=True)
         else:
             await interaction.followup.send(f"ℹ️ {user.mention} already owns **{display}**.", ephemeral=True)
 
-    @pokeradmin.command(name="makecustom", description="[Admin] Create a custom title or win message")
+    @pokeradmin.command(name="makecustom", description="[Admin] Create a custom title, win message, or card border")
     @app_commands.describe(
-        kind="'title' or 'winmsg'",
+        kind="'title', 'winmsg', or 'border'",
         cosmetic_id="Unique ID",
         display="Display text",
         description="Optional description",
@@ -5256,48 +7307,27 @@ class PokerCog(commands.Cog):
             traceback.print_exc()
             await interaction.followup.send(f"❌ Backup failed: {e}", ephemeral=True)
 
-    @poker.command(
-        name="drawcards",
-        description="Draw cards to test image sizes"
-    )
-    @app_commands.describe(
-        number="Number of cards to draw",
-        infinite="Use a fresh deck for every card (Default: False)"
-    )
-    async def draw_cards(
-            self,
-            interaction: discord.Interaction,
-            number: app_commands.Range[int, 1, 10],
-            infinite: bool = False,
-    ):
+    @poker.command(name="testcards", description="[Dev] Generate a random 2-card hand to test image sizes")
+    async def test_cards(self, interaction: discord.Interaction):
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
+            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+            return
+
+        # 1. Defer so the bot has time to process the image
         await interaction.response.defer(ephemeral=False)
 
         from treys import Deck
 
-        if infinite:
-            # Each card comes from its own fresh deck.
-            cards = []
-            for _ in range(number):
-                deck = Deck()
-                cards.extend(deck.draw(1))
-        else:
-            # All cards come from the same deck.
-            deck = Deck()
-            cards = deck.draw(number)
+        # 2. Draw 2 random cards
+        deck = Deck()
+        cards = deck.draw(2)
 
-        file = await asyncio.to_thread(
-            card_images.make_strip,
-            cards,
-            0,
-            True
-        )
+        # 3. Stitch them using your image settings
+        # (Using asyncio.to_thread just like your real bot does to prevent lag)
+        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True)
 
-        await interaction.followup.send(
-            f"🃏 Drew **{number}** card{'s' if number != 1 else ''}"
-            f"{' (infinite deck)' if infinite else ''}: "
-            f"\n {hand_str(cards)}",
-            file=file
-        )
+        # 4. Send the result!
+        await interaction.followup.send(f"🃏 Test Hand: {hand_str(cards)}", file=file)
 
     @poker.command(name="currencylog", description="View recent chip transactions")
     @app_commands.describe(minimum="Only show transactions with this many chips or more", user="Player to check (Admins/Devs only, leave blank for yourself)")
@@ -5327,7 +7357,12 @@ class PokerCog(commands.Cog):
         else:
             await interaction.response.send_message("❌ Tutorial is not available.", ephemeral=True)
 
-    @poker.command(name="preferences", description="Configure your auto-rebuy, auto-showdown, and confirmation settings")
+    # Moved from `poker` to `pokerset` — Discord caps a command group at 25
+    # subcommands, and `poker` was at 26. `preferences` is genuinely a
+    # settings command ("Configure poker settings" is pokerset's own
+    # description), so this is the natural one to relocate rather than
+    # spinning up a brand new subgroup. Command becomes /pokerset preferences.
+    @pokerset.command(name="preferences", description="Configure your auto-rebuy, auto-showdown, and confirmation settings")
     async def preferences_cmd(self, interaction: discord.Interaction):
         view = PreferencesView(interaction.user)
         await view.init_data()
@@ -5534,10 +7569,7 @@ class PokerCog(commands.Cog):
                             slog(t, part.strip())
 
             # Advance the UI
-            if t.game._hand_result:
-                await _process_result(interaction.guild, interaction.channel, t)
-            else:
-                await refresh(interaction.channel, t, cosmetics_cache=getattr(t, 'cosmetics_cache', {}))
+            await _handle_post_action(interaction.guild, interaction.channel, t)
 
     @pokermgr.command(name="dealerhours", description="[Manager] Show minutes hosted per dealer between two UTC dates")
     @app_commands.describe(start="Start date (required)",
@@ -5594,55 +7626,6 @@ class PokerCog(commands.Cog):
         view = ChangelogView(caller=interaction.user,commits=commits,search=search,)
 
         await interaction.followup.send(view=view,ephemeral=True,)
-
-    # ── User-install top-level aliases ─────────────────────────────────────
-
-    @app_commands.command(name="stats", description="View your poker stats")
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.describe(hidden="Hide the stats message from others? (Default: False)")
-    async def user_stats(self, interaction: discord.Interaction, hidden: bool = False):
-        await self.stats.callback(self, interaction, hidden)
-
-    @app_commands.command(name="leaderboard", description="Top poker players by net chips")
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def user_leaderboard(self, interaction: discord.Interaction):
-        await self.leaderboard.callback(self, interaction)
-
-    @app_commands.command(name="jackpot", description="View the current casino jackpot!")
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def user_jackpot(self, interaction: discord.Interaction):
-        await self.jackpot_cmd.callback(self, interaction)
-
-    @app_commands.command(
-        name="drawcards",
-        description="Draw cards to test image sizes"
-    )
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(
-        guilds=True,
-        dms=True,
-        private_channels=True
-    )
-    @app_commands.describe(
-        number="Number of cards to draw",
-        infinite="Use a fresh deck for every card (Default: False)"
-    )
-    async def user_drawcards(
-            self,
-            interaction: discord.Interaction,
-            number: app_commands.Range[int, 1, 10],
-            infinite: bool = False,
-    ):
-        await self.draw_cards.callback(self, interaction, number, infinite)
-
-    @app_commands.command(name="myactivity", description="Check your poker activity status")
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def user_myactivity(self, interaction: discord.Interaction):
-        await self.myactivity.callback(self, interaction)
 
 
 class StatsView(discord.ui.View):
@@ -6748,5 +8731,7 @@ def get_git_changelog() -> list[dict]:
 async def setup(bot):
     if not hasattr(bot, "poker_tables"):
         bot.poker_tables = tables
+    if not hasattr(bot, "poker_global_locks"):
+        bot.poker_global_locks = global_rejoin_locks
     asyncio.create_task(_migrate_active_tables(bot))
     await bot.add_cog(PokerCog(bot))

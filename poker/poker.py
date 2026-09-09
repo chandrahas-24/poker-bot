@@ -216,8 +216,12 @@ def expires_at_str(seconds: int | None) -> str | None:
     return (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M UTC")
 
 
+MOD_DM_FOOTER_TEXT = "Open a ticket to appeal this action."
+
+
 async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
-                       duration_label: str | None, moderator: discord.Member, guild_name: str):
+                       duration_label: str | None, moderator: discord.Member, guild_name: str,
+                       duration_field: str = "Expires"):
     """Best-effort DM to a user affected by a kick/ban. Never raises."""
     emoji = "🔨" if action.lower() == "ban" else "🦵"
     embed = discord.Embed(
@@ -226,9 +230,10 @@ async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
     )
     embed.add_field(name="Server", value=guild_name, inline=True)
     if duration_label:
-        embed.add_field(name="Duration", value=duration_label, inline=True)
-    embed.add_field(name="Moderator", value=moderator.name, inline=True)
-    embed.add_field(name="Reason", value=reason or "None.", inline=False)
+        embed.add_field(name=duration_field, value=duration_label, inline=True)
+    embed.add_field(name="Moderator", value=moderator.display_name, inline=True)
+    embed.add_field(name="Reason", value=reason or "No reason given.", inline=False)
+    embed.set_footer(text=MOD_DM_FOOTER_TEXT)
     try:
         await user.send(embed=embed)
     except discord.Forbidden:
@@ -238,14 +243,19 @@ async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
 
 
 def format_mod_message(emoji: str, verb: str, user: discord.Member, location: str,
-                        duration_label: str | None, reason: str | None, extra_line: str | None = None) -> str:
+                        duration_label: str | None, reason: str | None, extra_line: str | None = None,
+                        duration_field: str = "Expires") -> str:
     lines = [f"{emoji} <@{user.id}> {verb} from {location}."]
     if duration_label:
-        lines.append(f"Duration: {duration_label}")
+        lines.append(f"{duration_field}: {duration_label}")
     lines.append(f"Reason: {reason or 'No reason given'}")
     if extra_line:
         lines.append(extra_line)
     return "\n".join(lines)
+
+
+def discord_timestamp(epoch_seconds: int, style: str = "R") -> str:
+    return f"<t:{epoch_seconds}:{style}>"
 
 
 def _task_catcher(task: asyncio.Task):
@@ -3716,10 +3726,10 @@ class PokerCog(commands.Cog):
             return
 
         cooldown_seconds = None
-        duration_label = None
+        duration_display = None
         if duration and duration.strip():
             try:
-                cooldown_seconds, duration_label = parse_duration(duration)
+                cooldown_seconds, _ = parse_duration(duration)
             except ValueError as e:
                 await interaction.followup.send(f"❌ {e}", ephemeral=True)
                 return
@@ -3728,6 +3738,7 @@ class PokerCog(commands.Cog):
                     "❌ A kick can't be permanent — give a duration like `10m`, `2h`, `1d`, or leave it blank.",
                     ephemeral=True)
                 return
+            duration_display = discord_timestamp(int(time.time() + cooldown_seconds))
 
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
@@ -3748,7 +3759,8 @@ class PokerCog(commands.Cog):
 
         if cooldown_seconds is not None:
             t.rejoin_cooldowns[user.id] = time.time() + cooldown_seconds
-        await send_mod_dm(user, "kick", reason, duration_label, interaction.user, interaction.guild.name)
+        await send_mod_dm(user, "kick", reason, duration_display, interaction.user, interaction.guild.name,
+                          duration_field="Expires")
 
         # Kick from waiting list
         if pj:
@@ -3757,7 +3769,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_label, reason))
+            await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_display, reason, duration_field="Expires"))
             return
 
         # Kick from table
@@ -3767,7 +3779,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_label, reason))
+            await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_display, reason, duration_field="Expires"))
             await refresh(interaction.channel, t)
             return
 
@@ -3786,7 +3798,7 @@ class PokerCog(commands.Cog):
                     if part.strip():
                         slog(t, part)
 
-        await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_label, reason))
+        await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_display, reason, duration_field="Expires"))
 
         if t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, t)
@@ -3804,10 +3816,11 @@ class PokerCog(commands.Cog):
             return
 
         try:
-            ban_seconds, duration_label = parse_duration(duration)
+            ban_seconds, _ = parse_duration(duration)
         except ValueError as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
+        duration_display = discord_timestamp(int(time.time() + ban_seconds)) if ban_seconds is not None else "Never"
 
         # Check if current channel table is a tournament table
         key = (interaction.guild_id, interaction.channel_id)
@@ -3829,7 +3842,8 @@ class PokerCog(commands.Cog):
         scope = f"table **{table_name}**" if table_name else "**all tables** (server-wide)"
 
         if added:
-            await send_mod_dm(user, "ban", reason, duration_label, interaction.user, interaction.guild.name)
+            await send_mod_dm(user, "ban", reason, duration_display, interaction.user, interaction.guild.name,
+                              duration_field="Expires")
 
         kicked_from = ""
         kicked_from_table = None
@@ -3902,7 +3916,8 @@ class PokerCog(commands.Cog):
             location = table_name if table_name else "all tables"
             extra_line = f"Kicked from: {kicked_from_table}" if kicked_from_table else None
             await interaction.followup.send(
-                format_mod_message("🔨", "banned", user, location, duration_label, reason, extra_line),
+                format_mod_message("🔨", "banned", user, location, duration_display, reason, extra_line,
+                                   duration_field="Expires"),
                 ephemeral=not kicked_from)
 
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")

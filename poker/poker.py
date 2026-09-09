@@ -221,14 +221,14 @@ async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
     """Best-effort DM to a user affected by a kick/ban. Never raises."""
     emoji = "🔨" if action.lower() == "ban" else "🦵"
     embed = discord.Embed(
-        title=f"{emoji} You've been {action.lower()}ed",
+        title=f"{emoji} You've been {action.lower()}ed from poker",
         color=0xED4245,
     )
     embed.add_field(name="Server", value=guild_name, inline=True)
     if duration_label:
         embed.add_field(name="Duration", value=duration_label, inline=True)
-    embed.add_field(name="Moderator", value=moderator.display_name, inline=True)
-    embed.add_field(name="Reason", value=reason or "No reason given.", inline=False)
+    embed.add_field(name="Moderator", value=moderator.name, inline=True)
+    embed.add_field(name="Reason", value=reason or "None.", inline=False)
     try:
         await user.send(embed=embed)
     except discord.Forbidden:

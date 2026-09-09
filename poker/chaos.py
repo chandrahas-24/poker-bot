@@ -64,7 +64,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="➕🃏",
         description="Everyone gets **3 hole cards** instead of 2.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="pairmageddon",
@@ -72,7 +72,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="👯",
         description="Every player is dealt a **pocket pair**",
         weight=1.0,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="double_board",
@@ -80,7 +80,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="😈😈",
         description="**Two separate community boards** at once",
         weight=0.8,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="uno_reverse",
@@ -89,7 +89,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="Some hands come with a wild **Uno Reverse card**. Can be consumed "
                      "to randomly swap hands with another player any time before the river.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
         params={"chance": 0.40},
     ),
     ChaosModifier(
@@ -99,7 +99,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="One card in everyone's hand is unreadable, "
                      "along with each community card at a **50% chance**",
         weight=1.0,
-        implemented=False,
+        implemented=True,
         params={"chance": 0.50},
     ),
     ChaosModifier(
@@ -110,7 +110,7 @@ MODIFIERS: list[ChaosModifier] = [
                      "kicked from the table.",
         weight=0.6,
         min_players=4,
-        implemented=False,
+        implemented=True,
         params={"kick_chance": 0.6, "ban_seconds": 600},
     ),
     ChaosModifier(
@@ -120,7 +120,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="Blinds drop to **5/10** and bets are capped at **200 chips** "
                      "per street for this hand.",
         weight=0.6,
-        implemented=False,
+        implemented=True,
         params={"small_blind": 5, "big_blind": 10, "max_bet_per_street": 200},
     ),
     ChaosModifier(
@@ -129,7 +129,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🕵️",
         description="You can see the **next player's** hole cards, but not your own.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="bounty",
@@ -139,7 +139,7 @@ MODIFIERS: list[ChaosModifier] = [
                      "fold and claim the chips they put in -- but only if you don't win the pot.",
         weight=0.7,
         min_players=3,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="community_auction",
@@ -148,7 +148,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="Right after the river, bid your stack to **replace a community "
                      "card** of your choice. Only winners' bid gets taken",
         weight=1.0,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="reshuffle",
@@ -157,7 +157,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="On the flop, turn, and river, there's a **40% chance** every hand "
                      "gets redealt.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
         params={"chance": 0.40},
     ),
     ChaosModifier(
@@ -166,7 +166,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🎰",
         description="Call, raise, or fold preflop, then straight to showdown.",
         weight=0.7,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="rising_tide",
@@ -174,7 +174,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🌊",
         description="Minimum bets escalate: **30 / 60 / 90 / 120** chips.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
         params={"PREFLOP": 30, "FLOP": 60, "TURN": 90, "RIVER": 120},
     ),
     ChaosModifier(
@@ -185,7 +185,7 @@ MODIFIERS: list[ChaosModifier] = [
                      "your own hand** to actually cash in the jackpot or cosmetics.",
         weight=0.65,
         min_players=8,
-        implemented=False,
+        implemented=True,
         params={"chance": 0.25, "min_shinies": 2},
     ),
     ChaosModifier(
@@ -195,7 +195,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="Before cards are dealt, bet up to **1000 chips** on a rank and suit "
                      "for a side-payout.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
         params={"max_bet": 2000, "exact_mult": 10, "split_mult": 3, "rank_mult": 2, "suit_mult": 0.5},
     ),
     ChaosModifier(
@@ -205,7 +205,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="The board comes out **backwards**: the river first, then the "
                      "turn, then the first three cards together.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="leaky_jackpot",
@@ -214,7 +214,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="The jackpot springs a leak... **2.5%** drains straight into "
                      "this hand's pot.",
         weight=0.2,
-        implemented=False,
+        implemented=True,
         params={"leak_pct": 0.025},
     ),
     ChaosModifier(
@@ -224,7 +224,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="Every time a new community card is revealed, **every card in "
                      "play** has a **15% chance** to swap suits.",
         weight=1.0,
-        implemented=False,
+        implemented=True,
         params={"chance": 0.15},
     ),
     ChaosModifier(
@@ -234,7 +234,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="You can't see the pot size or who's folded or checked but "
                      "raise amounts stay visible",
         weight=1.0,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="ragebait",
@@ -244,7 +244,7 @@ MODIFIERS: list[ChaosModifier] = [
                      "of the hand). If they win, they only keep **15%** of it: **5%** "
                      "goes to tax and **80%** floods the jackpot.",
         weight=0.6,
-        implemented=False,
+        implemented=True,
         params={"tax_pct": 0.05, "player_pct": 0.15},
     ),
     ChaosModifier(
@@ -253,7 +253,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="💣",
         description="No raising preflop",
         weight=0.7,
-        implemented=False,
+        implemented=True,
     ),
     ChaosModifier(
         id="cute_mode",
@@ -269,7 +269,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🙃",
         description="The **worst hand wins**!",
         weight=0.7,
-        implemented=False,
+        implemented=True,
     ),
 ]
 

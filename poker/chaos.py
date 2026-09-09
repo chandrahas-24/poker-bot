@@ -192,7 +192,7 @@ MODIFIERS: list[ChaosModifier] = [
         id="gamble_the_gamble",
         name="Gamble the Gamble",
         emoji="🎲",
-        description="Before cards are dealt, bet up to **1000 chips** on a rank and suit "
+        description="Before cards are dealt, bet up to **2000 chips** on a rank and suit "
                      "for a side-payout.",
         weight=1.0,
         implemented=True,

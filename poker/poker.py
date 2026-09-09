@@ -217,7 +217,7 @@ def expires_at_str(seconds: int | None) -> str | None:
 
 
 async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
-                       duration_label: str, moderator: discord.Member, guild_name: str):
+                       duration_label: str | None, moderator: discord.Member, guild_name: str):
     """Best-effort DM to a user affected by a kick/ban. Never raises."""
     emoji = "🔨" if action.lower() == "ban" else "🦵"
     embed = discord.Embed(
@@ -225,7 +225,8 @@ async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
         color=0xED4245,
     )
     embed.add_field(name="Server", value=guild_name, inline=True)
-    embed.add_field(name="Duration", value=duration_label, inline=True)
+    if duration_label:
+        embed.add_field(name="Duration", value=duration_label, inline=True)
     embed.add_field(name="Moderator", value=moderator.display_name, inline=True)
     embed.add_field(name="Reason", value=reason or "No reason given.", inline=False)
     try:
@@ -234,6 +235,17 @@ async def send_mod_dm(user: discord.Member, action: str, reason: str | None,
         pass
     except Exception as e:
         print(f"[Moderation DM Error] Failed to DM {user.id}: {e}")
+
+
+def format_mod_message(emoji: str, verb: str, user: discord.Member, location: str,
+                        duration_label: str | None, reason: str | None, extra_line: str | None = None) -> str:
+    lines = [f"{emoji} <@{user.id}> {verb} from {location}."]
+    if duration_label:
+        lines.append(f"Duration: {duration_label}")
+    lines.append(f"Reason: {reason or 'No reason given'}")
+    if extra_line:
+        lines.append(extra_line)
+    return "\n".join(lines)
 
 
 def _task_catcher(task: asyncio.Task):
@@ -3695,7 +3707,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="kick", description="[Manager] Kick a player — force folds them and removes after hand")
     @app_commands.describe(user="Player to kick", reason="Reason for the kick",
-                           duration="Rejoin cooldown, e.g. 10m, 2h, 1d (default: standard cooldown)")
+                           duration="Optional rejoin cooldown, e.g. 10m, 2h, 1d (leave blank for none)")
     async def kick(self, interaction: discord.Interaction, user: discord.Member,
                    reason: str = None, duration: str = None):
         await interaction.response.defer(ephemeral=False)
@@ -3703,6 +3715,8 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
             return
 
+        cooldown_seconds = None
+        duration_label = None
         if duration and duration.strip():
             try:
                 cooldown_seconds, duration_label = parse_duration(duration)
@@ -3711,13 +3725,9 @@ class PokerCog(commands.Cog):
                 return
             if cooldown_seconds is None:
                 await interaction.followup.send(
-                    "❌ A kick can't be permanent — give a duration like `10m`, `2h`, `1d`, or leave it blank for the default cooldown.",
+                    "❌ A kick can't be permanent — give a duration like `10m`, `2h`, `1d`, or leave it blank.",
                     ephemeral=True)
                 return
-        else:
-            cooldown_seconds = config.REGULAR_REJOIN_COOLDOWN
-            mins = cooldown_seconds // 60
-            duration_label = f"{mins} minute{'s' if mins != 1 else ''}"
 
         key = (interaction.guild_id, interaction.channel_id)
         t = get_table(key)
@@ -3736,8 +3746,8 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"❌ **{user.display_name}** is not at the table.", ephemeral=True);
             return
 
-        reason_note = f" — *{reason}*" if reason else ""
-        t.rejoin_cooldowns[user.id] = time.time() + cooldown_seconds
+        if cooldown_seconds is not None:
+            t.rejoin_cooldowns[user.id] = time.time() + cooldown_seconds
         await send_mod_dm(user, "kick", reason, duration_label, interaction.user, interaction.guild.name)
 
         # Kick from waiting list
@@ -3747,7 +3757,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            await interaction.followup.send(f"🦵 **{user.display_name}** has been kicked from the waiting list.{reason_note}")
+            await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_label, reason))
             return
 
         # Kick from table
@@ -3757,8 +3767,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            await interaction.followup.send(
-                f"🦵 **{user.display_name}** has been kicked and removed from the table.{reason_note}")
+            await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_label, reason))
             await refresh(interaction.channel, t)
             return
 
@@ -3777,8 +3786,7 @@ class PokerCog(commands.Cog):
                     if part.strip():
                         slog(t, part)
 
-        await interaction.followup.send(
-            f"🦵 **{user.display_name}** has been kicked — force folded and will be removed after this hand.{reason_note}")
+        await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_label, reason))
 
         if t.game._hand_result:
             await _process_result(interaction.guild, interaction.channel, t)
@@ -3824,6 +3832,7 @@ class PokerCog(commands.Cog):
             await send_mod_dm(user, "ban", reason, duration_label, interaction.user, interaction.guild.name)
 
         kicked_from = ""
+        kicked_from_table = None
 
         # Grab the single active table for this server (excluding tournament tables)
         active = next(((cid, table) for (gid, cid), table in tables.items() if gid == interaction.guild_id and not getattr(table, 'is_tournament', False)), None)
@@ -3871,6 +3880,7 @@ class PokerCog(commands.Cog):
 
                 if p or pj:
                     kicked_from = f" Kicked from: {t.name}."
+                    kicked_from_table = t.name
                     ch = interaction.guild.get_channel(cid)
                     if ch:
                         if t.game._hand_result:
@@ -3889,9 +3899,11 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"ℹ️ **{user.display_name}** was already banned from {scope}.{kicked_from}",
                                             ephemeral=True)
         else:
-            detail = f" *({duration_label}{f' — {reason}' if reason else ''})*"
-            await interaction.followup.send(f"🔨 **{user.display_name}** banned from {scope}.{detail}{kicked_from}",
-                                            ephemeral=not kicked_from)
+            location = table_name if table_name else "all tables"
+            extra_line = f"Kicked from: {kicked_from_table}" if kicked_from_table else None
+            await interaction.followup.send(
+                format_mod_message("🔨", "banned", user, location, duration_label, reason, extra_line),
+                ephemeral=not kicked_from)
 
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")

@@ -7425,6 +7425,7 @@ class PokerCog(commands.Cog):
     @app_commands.describe(skin_id="Your unlocked card skin — pick from the list")
     @app_commands.autocomplete(skin_id=_autocomplete_skin)
     async def equipskin(self, interaction: discord.Interaction, skin_id: str):
+        await interaction.response.defer(ephemeral=True)
         if skin_id == "none":
             await db.set_active_skin(interaction.user.id, None)
             await interaction.followup.send("✅ Card skin removed.", ephemeral=True)
@@ -7436,9 +7437,13 @@ class PokerCog(commands.Cog):
             return
 
         ok = await db.set_active_skin(interaction.user.id, skin_id)
-        if ok:
+        if not ok:
             info = db.SKINS[skin_id]
-            await interaction.followup.send(f"✅ Card skin set to **{db.SKINS[skin_id]['display']}**!", ephemeral=True)
+            desc = info.get('description', '')
+            await interaction.followup.send(
+                f"❌ You haven't unlocked **{info['display']}** yet.\n*{desc}*", ephemeral=True)
+            return
+        await interaction.followup.send(f"✅ Card skin set to **{db.SKINS[skin_id]['display']}**!", ephemeral=True)
 
     @pokeradmin.command(name="grant_cosmetic", description="[Admin] Grant a title, win message, or card skin to any player")
     @app_commands.describe(user="The player to receive the cosmetic", kind="Type of cosmetic",
@@ -7474,7 +7479,7 @@ class PokerCog(commands.Cog):
 
     @pokeradmin.command(name="makecustom", description="[Admin] Create a custom title or win message")
     @app_commands.describe(
-        kind="'title', 'winmsg', or 'border'",
+        kind="'title' or 'winmsg'",
         cosmetic_id="Unique ID",
         display="Display text",
         description="Optional description",

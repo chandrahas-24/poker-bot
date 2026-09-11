@@ -585,6 +585,20 @@ async def global_channel_restriction(interaction: discord.Interaction) -> bool:
     if not interaction.command:
         return True
 
+    # Several commands (equiptitle, equipwinmsg, equipskin, grant_cosmetic,
+    # dealerhours) have autocomplete-enabled options. Discord fires an
+    # autocomplete-type interaction on every keystroke in those fields, and
+    # this interaction_check runs for those too — but an autocomplete
+    # interaction can ONLY be answered with an autocomplete result (Discord
+    # response type 8), never a regular message. Trying to send_message()
+    # a rejection on one throws "In type: Value must be one of {8}" — which
+    # is exactly the flood of errors this was causing in any restricted or
+    # lockdown channel. Autocomplete doesn't execute anything by itself
+    # (the real command invocation gets its own interaction_check call
+    # afterward), so it's safe to just let it through untouched here.
+    if interaction.type is discord.InteractionType.autocomplete:
+        return True
+
     LOCKDOWN_CHANNELS = config.LOCKDOWN_CHANNELS
     RESTRICTED_CHANNELS = config.RESTRICTED_CHANNELS
 

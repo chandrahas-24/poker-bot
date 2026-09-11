@@ -10,6 +10,7 @@ from treys import Card, Evaluator
 
 import config
 from . import card_images
+from . import database as db
 
 evaluator = Evaluator()
 
@@ -556,7 +557,10 @@ class AIGameView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         try:
             hole_ints = [Card.new(c) for c in self.session.hole_cards]
-            file = await asyncio.to_thread(card_images.make_strip, hole_ints, 0, True)
+            # Ephemeral response — safe to honor the viewer's Card Size preference.
+            viewer_pref = await db.get_player_preference(interaction.user.id)
+            compact = viewer_pref.get("card_size") == "compact"
+            file = await asyncio.to_thread(card_images.make_strip, hole_ints, 0, True, compact=compact)
             await interaction.followup.send(content="Your hole cards:", file=file, ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Error displaying cards: {e}", ephemeral=True)

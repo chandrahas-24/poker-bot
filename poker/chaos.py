@@ -184,7 +184,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="Shiny-card odds jump to **25%**, but you need **2+ shinies in "
                      "your own hand** to actually cash in the jackpot or cosmetics.",
         weight=1.0,
-        min_players=6,
+        min_players=4,
         implemented=True,
         params={"chance": 0.5, "min_shinies": 2},
     ),
@@ -426,7 +426,7 @@ EVENTS: list[ChaosEvent] = [
 
 EVENTS_BY_ID: dict[str, ChaosEvent] = {e.id: e for e in EVENTS}
 
-RANDOM_EVENT_CHANCE = 0.15  # independent chance, PER TRIGGER POINT (see below)
+RANDOM_EVENT_CHANCE = 0.08  # independent chance, PER TRIGGER POINT (see below)
 
 def should_random_event_fire(rng: random.Random | None = None) -> bool:
     # call once per trigger point

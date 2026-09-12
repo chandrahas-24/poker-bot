@@ -508,7 +508,7 @@ async def reload(ctx, cog_name: str = None):
 
     # Map target cog/helpers to reload
     if cog_name_lower == "poker":
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation"]
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.chaos", "poker.card_images", "poker.jackpot", "poker.taxation"]
         cogs_to_reload = ["poker.poker"]
     elif cog_name_lower == "eventlog":
         helpers_to_reload = ["config", "eventlog.eventlog_database"]
@@ -526,7 +526,7 @@ async def reload(ctx, cog_name: str = None):
         helpers_to_reload = ["config"]
         cogs_to_reload = ["highlight"]
     elif cog_name_lower is None:
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.chaos", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
         cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "highlight"]
     else:
         # Check if it is a loaded extension

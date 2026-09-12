@@ -3657,8 +3657,7 @@ class ThinkFastView(discord.ui.View):
             print(f"[Error] think_fast revenue log failed: {e}")
 
         title_note = ""
-        new_balance, _ = await db.get_wallet(uid)
-        if new_balance < 1:
+        if delta < 0:
             try:
                 await db.unlock_cosmetic(uid, "title", gp["unlucky_title_id"])
             except Exception as e:

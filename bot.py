@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
@@ -22,6 +23,37 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, allowed_mentions=discord.AllowedMentions(users=True))
 bot.startup_complete = False
+
+
+# ── Global slash-command error handler ────────────────────────────────────────
+# Without this, any raised error inside a command (including a stale/expired
+# interaction that Discord already invalidated) prints as a raw
+# CommandInvokeError traceback and looks like a crash. Most of the ones worth
+# distinguishing here are interactions that expired before we could respond —
+# nothing else can be sent back to Discord for those, so just log and move on.
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = error.__cause__ or error
+
+    if isinstance(original, discord.NotFound) and original.code == 10062:
+        # "Unknown interaction" — the interaction token was already invalid
+        # by the time we tried to respond (bot restart replaying a backlog,
+        # a gateway hiccup, etc). There's no interaction left to reply to.
+        print(f"⚠️  Stale interaction for /{interaction.command.qualified_name if interaction.command else '?'} "
+              f"(user {interaction.user.id}) — Discord had already expired it before we could respond.")
+        return
+
+    print(f"🚨 [Command Error] /{interaction.command.qualified_name if interaction.command else '?'}: {original!r}")
+    traceback.print_exception(type(original), original, original.__traceback__)
+
+    try:
+        message = "❌ Something went wrong running that command."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 # ── Donation listener config ──────────────────────────────────────────────────
 DONATION_BOT_ID  = 270904126974590976

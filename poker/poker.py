@@ -6258,7 +6258,8 @@ class PokerCog(commands.Cog):
             caller_rank = await db.get_player_rank(caller_id)
 
         # Generate PNG
-        image_data = generate_leaderboard_image(
+        image_data = await asyncio.to_thread(
+            generate_leaderboard_image,
             rows=rows,
             caller_id=caller_id,
             caller_row=caller_row,

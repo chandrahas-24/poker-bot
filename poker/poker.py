@@ -2372,7 +2372,7 @@ async def _process_result(guild, channel, t: TableState):
             # Card Skins cosmetic: winning at a chaos table unlocks the "chaos" skin.
             # If Cute Mode was also active this hand, the winner additionally has a
             # 20% chance to unlock the "cute" skin (if they haven't already).
-            if "chaos" in t.chaos_modifiers:
+            if t.chaos_mode:
                 if await db.unlock_cosmetic(p.user_id, "skin", "chaos"):
                     newly.append(("skin", "chaos"))
                 if "cute_mode" in t.chaos_modifiers:

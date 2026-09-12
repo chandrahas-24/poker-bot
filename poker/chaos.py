@@ -366,7 +366,7 @@ EVENTS: list[ChaosEvent] = [
         implemented=True,
         description="Guess the secret number between 1-25",
         # logs as negative revenue
-        params={"min_prize": 50, "max_prize": 150},
+        params={"min_prize": 25, "max_prize": 75},
     ),
     ChaosEvent(
         id="think_fast",
@@ -374,7 +374,7 @@ EVENTS: list[ChaosEvent] = [
         emoji="⚡",
         implemented=True,
         description="First person to click the button gets between -100 and +200 chips.",
-        params={"min_delta": -100, "max_delta": 200, "min_wallet": 100, "unlucky_title_id": "wilted_flower"},
+        params={"min_delta": -50, "max_delta": 100, "min_wallet": 50, "unlucky_title_id": "wilted_flower"},
     ),
     ChaosEvent(
         id="giveaway_react",
@@ -383,7 +383,7 @@ EVENTS: list[ChaosEvent] = [
         implemented=True,
         description="React within 10 seconds for a shot at the giveaway "
                      "70% chance of **chips**, 30% odds of **90 minute ban** ",
-        params={"kick_chance": 0.3, "ban_seconds": 5400, "min_prize": 20, "max_prize": 50,
+        params={"kick_chance": 0.3, "ban_seconds": 5400, "min_prize": 10, "max_prize": 200,
                 "react_emoji": "🤑", "kick_title_id": "foot"},
     ),
     ChaosEvent(
@@ -392,7 +392,7 @@ EVENTS: list[ChaosEvent] = [
         emoji="💸",
         implemented=True,
         description="After 15 seconds, the pool gets randomly redistributed among everyone who entered.",
-        params={"buy_in_options": [100, 250, 500, 1000], "window_seconds": 15},
+        params={"buy_in_options": [25, 50, 100, 500], "window_seconds": 15},
     ),
     ChaosEvent(
         id="chip_shower",
@@ -426,7 +426,7 @@ EVENTS: list[ChaosEvent] = [
 
 EVENTS_BY_ID: dict[str, ChaosEvent] = {e.id: e for e in EVENTS}
 
-RANDOM_EVENT_CHANCE = 0.25  # independent chance, PER TRIGGER POINT (see below)
+RANDOM_EVENT_CHANCE = 0.15  # independent chance, PER TRIGGER POINT (see below)
 
 def should_random_event_fire(rng: random.Random | None = None) -> bool:
     # call once per trigger point

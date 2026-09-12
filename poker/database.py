@@ -1550,6 +1550,7 @@ BORDERS: dict[str, dict] = {
 # Card Skins
 SKINS: dict[str, dict] = {
     "chaos": {
+        "display": "🃏 Chaos",
         "variant": "overlay",
         "overlay_red": "joker_red.png",
         "overlay_black": "joker_black.png",

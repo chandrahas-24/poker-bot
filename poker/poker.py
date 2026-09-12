@@ -4733,6 +4733,8 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
                 "cute_mode" in t.chaos_modifiers,
                 border_id=target_cosmetics.get("active_border"),
                 compact=compact,
+                skin_id=target_cosmetics.get("active_skin"),
+                skin_batman_card=_skin_render_args(target, target_cosmetics.get("active_skin")),
             )
             await interaction.followup.send(caption, file=file, view=uno_view, ephemeral=True)
         except Exception as e:
@@ -5227,29 +5229,29 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
             for chunk in m_chunks:
                 embed.add_field(name="\u200b", value="\n".join(chunk)[:1024], inline=False)
 
-        # ── CARD SKINS PAGE ────────────────────────────────────────────────────────
-        if page == "skins":
-            visible_skins = db.get_visible_cosmetics_for_user(user_id, owned_skins, db.SKINS)
-            embed.title = f"🎨 Card Skins ({len(owned_skins)}/{len(visible_skins)} unlocked)"
-            s_lines = []
-            for sid, info in visible_skins.items():
-                display_str = f"**{info['display']}**"
-                desc = f" — *{info['desc']}*" if 'desc' in info else ""
-                if sid in owned_skins:
-                    equipped = "  ◀ **equipped**" if sid == active_sk else ""
-                    s_lines.append(f"✅ {display_str}{desc}{equipped}")
-                else:
-                    s_lines.append(f"🔒 {display_str} — *{desc}*")
-
-            chunk_size = 15
-            s_chunks = [s_lines[i:i + chunk_size] for i in range(0, len(s_lines), chunk_size)]
-            if not s_chunks:
-                embed.description = "*No card skins available yet.*"
+    # ── CARD SKINS PAGE ────────────────────────────────────────────────────────
+    elif page == "skins":
+        visible_skins = db.get_visible_cosmetics_for_user(user_id, owned_skins, db.SKINS)
+        embed.title = f"🎨 Card Skins ({len(owned_skins)}/{len(visible_skins)} unlocked)"
+        s_lines = []
+        for sid, info in visible_skins.items():
+            display_str = f"**{info['display']}**"
+            desc = f" — *{info['desc']}*" if 'desc' in info else ""
+            if sid in owned_skins:
+                equipped = "  ◀ **equipped**" if sid == active_sk else ""
+                s_lines.append(f"✅ {display_str}{desc}{equipped}")
             else:
-                for chunk in s_chunks:
-                    embed.add_field(name="\u200b", value="\n".join(chunk), inline=False)
+                s_lines.append(f"🔒 {display_str} — *{desc}*")
 
-            embed.set_footer(text="Equipped skins show on your hole cards for My Cards and at showdown.")
+        chunk_size = 15
+        s_chunks = [s_lines[i:i + chunk_size] for i in range(0, len(s_lines), chunk_size)]
+        if not s_chunks:
+            embed.description = "*No card skins available yet.*"
+        else:
+            for chunk in s_chunks:
+                embed.add_field(name="\u200b", value="\n".join(chunk), inline=False)
+
+        embed.set_footer(text="Equipped skins show on your hole cards for My Cards and at showdown.")
 
     if page != "skins":
         embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
@@ -5334,7 +5336,7 @@ class CosmeticsView(discord.ui.View):
         for target_page in self._ALL_PAGES:
             if target_page == self.page:
                 continue
-            label, emoji = self._PAGE_META[target_page]
+            label, emoji = self._PAGE_INFO[target_page]
             switch_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=1, emoji=emoji)
             switch_btn.callback = self._make_switch_callback(target_page)
             self.add_item(switch_btn)

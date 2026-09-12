@@ -183,10 +183,10 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="✨",
         description="Shiny-card odds jump to **25%**, but you need **2+ shinies in "
                      "your own hand** to actually cash in the jackpot or cosmetics.",
-        weight=0.65,
-        min_players=8,
+        weight=0.75,
+        min_players=6,
         implemented=True,
-        params={"chance": 0.25, "min_shinies": 2},
+        params={"chance": 0.5, "min_shinies": 2},
     ),
     ChaosModifier(
         id="gamble_the_gamble",

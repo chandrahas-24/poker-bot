@@ -3738,10 +3738,6 @@ async def _run_giveaway_react(channel, t: TableState, trigger_point: str | None 
         fresh = await channel.fetch_message(msg.id)
     except (discord.NotFound, discord.HTTPException):
         return
-    try:
-        await fresh.clear_reactions()
-    except (discord.HTTPException, discord.Forbidden):
-        pass
 
     reactors = []
     try:
@@ -3755,6 +3751,11 @@ async def _run_giveaway_react(channel, t: TableState, trigger_point: str | None 
         print(f"[Error] Failed to read giveaway reactors: {e}")
         # fall through with whatever we collected (possibly none) rather
         # than letting this bubble up and leave the event unresolved
+
+    try:
+        await fresh.clear_reactions()
+    except (discord.HTTPException, discord.Forbidden):
+        pass
 
     if not reactors:
         await _send_event_result(channel, msg, chaos.build_event_result_embed(

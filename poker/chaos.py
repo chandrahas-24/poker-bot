@@ -154,11 +154,11 @@ MODIFIERS: list[ChaosModifier] = [
         id="reshuffle",
         name="Reshuffle",
         emoji="🔀",
-        description="On the flop, turn, and river, there's a **40% chance** every hand "
+        description="On the flop, turn, and river, there's a **20% chance** every hand "
                      "gets redealt.",
-        weight=1.0,
+        weight=0.8,
         implemented=True,
-        params={"chance": 0.40},
+        params={"chance": 0.20},
     ),
     ChaosModifier(
         id="all_in_showdown",

@@ -79,7 +79,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Double Trouble",
         emoji="😈😈",
         description="**Two separate community boards** at once",
-        weight=0.8,
+        weight=1.0,
         implemented=True,
     ),
     ChaosModifier(
@@ -213,7 +213,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="💧",
         description="The jackpot springs a leak... **2.5%** drains straight into "
                      "this hand's pot.",
-        weight=0.2,
+        weight=0.3,
         implemented=True,
         params={"leak_pct": 0.025},
     ),
@@ -243,7 +243,7 @@ MODIFIERS: list[ChaosModifier] = [
         description="One player is secretly **cursed** (revealed only at the end "
                      "of the hand). If they win, they only keep **15%** of it: **5%** "
                      "goes to tax and **80%** floods the jackpot.",
-        weight=0.6,
+        weight=1.0,
         implemented=True,
         params={"tax_pct": 0.05, "player_pct": 0.15},
     ),
@@ -252,7 +252,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Bomb Pot",
         emoji="💣",
         description="No raising preflop",
-        weight=0.7,
+        weight=0.8,
         implemented=True,
     ),
     ChaosModifier(
@@ -268,7 +268,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Losers' Hand",
         emoji="🙃",
         description="The **worst hand wins**!",
-        weight=0.7,
+        weight=1.0,
         implemented=True,
     ),
 ]

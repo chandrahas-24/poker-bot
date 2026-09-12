@@ -183,10 +183,10 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="✨",
         description="Shiny-card odds jump to **25%**, but you need **2+ shinies in "
                      "your own hand** to actually cash in the jackpot or cosmetics.",
-        weight=1.0,
+        weight=1.2,
         min_players=4,
         implemented=True,
-        params={"chance": 0.5, "min_shinies": 2},
+        params={"chance": 0.7, "min_shinies": 2},
     ),
     ChaosModifier(
         id="gamble_the_gamble",
@@ -194,7 +194,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🎲",
         description="Before cards are dealt, bet up to **2000 chips** on a rank and suit "
                      "for a side-payout.",
-        weight=0.8,
+        weight=0.5,
         implemented=True,
         params={"max_bet": 2000, "exact_mult": 10, "split_mult": 3, "rank_mult": 2, "suit_mult": 0.5},
     ),

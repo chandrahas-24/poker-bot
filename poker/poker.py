@@ -4267,24 +4267,30 @@ class CommunityAuctionBidModal(discord.ui.Modal, title="🔨 Place Your Bid"):
 
 
 class CommunityAuctionView(discord.ui.View):
-    def __init__(self, t: TableState, bids: dict, n_cards_board1: int, n_cards_board2: int = 0):
+    def __init__(self, t: TableState, bids: dict, n_cards_board1: int, n_cards_board2: int = 0,
+                 order1: list[int] | None = None, order2: list[int] | None = None):
         super().__init__(timeout=COMMUNITY_AUCTION_WINDOW_SECONDS + 5)
         self.t = t
         self.bids = bids
         self.double_board = n_cards_board2 > 0
+        # order1/order2 map visual button position -> actual index in the
+        # community list (identity unless Chaos: Reverse is active — see
+        # _auction_visual_order).
+        order1 = order1 if order1 is not None else list(range(n_cards_board1))
+        order2 = order2 if order2 is not None else list(range(n_cards_board2))
         for i in range(n_cards_board1):
             label = f"B1 · Card {i + 1}" if self.double_board else f"Card {i + 1}"
-            self.add_item(self._make_button(1, i, label, row=0))
+            self.add_item(self._make_button(1, order1[i], i + 1, label, row=0))
         for i in range(n_cards_board2):
-            self.add_item(self._make_button(2, i, f"B2 · Card {i + 1}", row=1))
+            self.add_item(self._make_button(2, order2[i], i + 1, f"B2 · Card {i + 1}", row=1))
 
-    def _make_button(self, board_num: int, idx: int, label: str, row: int) -> discord.ui.Button:
+    def _make_button(self, board_num: int, actual_idx: int, visual_num: int, label: str, row: int) -> discord.ui.Button:
         btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple, row=row)
 
         async def callback(interaction: discord.Interaction):
-            board_label = f"Board {board_num} Card {idx + 1}" if self.double_board else f"Card {idx + 1}"
+            board_label = f"Board {board_num} Card {visual_num}" if self.double_board else f"Card {visual_num}"
             await interaction.response.send_modal(
-                CommunityAuctionBidModal(self.t, board_num, idx, self.bids, board_label))
+                CommunityAuctionBidModal(self.t, board_num, actual_idx, self.bids, board_label))
 
         btn.callback = callback
         return btn
@@ -4292,10 +4298,16 @@ class CommunityAuctionView(discord.ui.View):
 
 async def _resolve_auction_bids_for_board(channel, t: TableState, community: list, blind_idx: set,
                                            bids_for_board: dict[int, tuple[int, int, str]],
-                                           board_tag: str) -> bool:
+                                           board_tag: str, order: list[int] | None = None) -> bool:
     # Resolves one  board's worth of auction bids
     if not bids_for_board:
         return False
+
+    # order maps visual position -> actual community index (identity unless
+    # Chaos: Reverse is active). Used only to translate card_idx back to the
+    # number players actually saw on the button, for the announcement text.
+    order = order if order is not None else list(range(len(community)))
+    actual_to_visual = {act: vis for vis, act in enumerate(order)}
 
     # The single highest bid amount on this  board
     global_best = max(amount for _, amount, _ in bids_for_board.values())
@@ -4346,7 +4358,8 @@ async def _resolve_auction_bids_for_board(channel, t: TableState, community: lis
         old_label = "❓🌫" if card_idx in blind_idx else card_str(old_card)
         new_label = "❓🌫" if card_idx in blind_idx else card_str(new_card)
         names = " and ".join(f"<@{p.user_id}>" for p, _ in payers)
-        label = f"{board_tag} card #{card_idx + 1}" if board_tag else f"card #{card_idx + 1}"
+        visual_num = actual_to_visual.get(card_idx, card_idx) + 1
+        label = f"{board_tag} card #{visual_num}" if board_tag else f"card #{visual_num}"
         try:
             await channel.send(
                 f"🔨 {names} bet **{global_best}** chips, {label} got replaced "
@@ -4358,22 +4371,40 @@ async def _resolve_auction_bids_for_board(channel, t: TableState, community: lis
     return replaced_any
 
 
+def _auction_visual_order(reverse_active: bool) -> list[int]:
+    """Visual position (0-4, left-to-right as shown on the board image) -> actual
+    index in the community list. Under Chaos: Reverse, the community list is
+    populated river-first/turn-second/flop-last (see engine.py's _next_street),
+    so this undoes that mapping — the same one _reverse_board_display() uses —
+    so 'Card #1' in the auction always means the same card shown in slot 1 of
+    the board image, regardless of what order it was actually dealt in."""
+    return [2, 3, 4, 1, 0] if reverse_active else [0, 1, 2, 3, 4]
+
+
 async def _run_community_auction(channel, t: TableState):
     double_board_active = "double_board" in t.chaos_modifiers
+    reverse_active = "reverse" in t.chaos_modifiers
+    order1 = _auction_visual_order(reverse_active)
     bids: dict[tuple[int, int], tuple[int, int, str]] = {}  # (user_id, board_num) -> (card_idx, amount, source)
 
     board1 = list(t.game.community)
     blind1 = t.game.blinded_community_idx
     card_lines1 = "  ".join(
-        f"**{i + 1}.** {'❓🌫' if i in blind1 else card_str(c)}" for i, c in enumerate(board1)
+        f"**{vis + 1}.** {'❓🌫' if act in blind1 else card_str(board1[act])}"
+        for vis, act in enumerate(order1)
     )
 
 
     if double_board_active:
+        # community2 is dealt street-by-street in lockstep with community
+        # (see engine.py's Double Board handling), so the same visual order
+        # applies to both boards.
+        order2 = order1
         board2 = list(t.game.community2)
         blind2 = t.game.blinded_community2_idx
         card_lines2 = "  ".join(
-            f"**{i + 1}.** {'🌫️❓' if i in blind2 else card_str(c)}" for i, c in enumerate(board2)
+            f"**{vis + 1}.** {'🌫️❓' if act in blind2 else card_str(board2[act])}"
+            for vis, act in enumerate(order2)
         )
         description = (
             f"**Board 1:** {card_lines1}\n**Board 2:** {card_lines2}\n\n"
@@ -4382,6 +4413,7 @@ async def _run_community_auction(channel, t: TableState):
             f"**{COMMUNITY_AUCTION_WINDOW_SECONDS} seconds** to bid."
         )
     else:
+        order2 = []
         blind2 = set()
         description = (
             f"{card_lines1}\n\nBid your chips to replace a card you don't like! "
@@ -4393,7 +4425,10 @@ async def _run_community_auction(channel, t: TableState):
     try:
         msg = await channel.send(
             embed=embed,
-            view=CommunityAuctionView(t, bids, len(board1), len(board2) if double_board_active else 0),
+            view=CommunityAuctionView(
+                t, bids, len(board1), len(board2) if double_board_active else 0,
+                order1, order2 if double_board_active else None,
+            ),
         )
     except (discord.HTTPException, discord.Forbidden) as e:
         print(f"[Error] Failed to send Community Auction prompt: {e}")
@@ -4412,14 +4447,14 @@ async def _run_community_auction(channel, t: TableState):
         bids_b1 = {uid: v for (uid, board_num), v in bids.items() if board_num == 1}
         bids_b2 = {uid: v for (uid, board_num), v in bids.items() if board_num == 2}
         replaced1 = await _resolve_auction_bids_for_board(
-            channel, t, t.game.community, blind1, bids_b1, "Board 1")
+            channel, t, t.game.community, blind1, bids_b1, "Board 1", order1)
         replaced2 = await _resolve_auction_bids_for_board(
-            channel, t, t.game.community2, blind2, bids_b2, "Board 2")
+            channel, t, t.game.community2, blind2, bids_b2, "Board 2", order2)
         replaced_any = replaced1 or replaced2
     else:
         bids_flat = {uid: v for (uid, board_num), v in bids.items()}
         replaced_any = await _resolve_auction_bids_for_board(
-            channel, t, t.game.community, blind1, bids_flat, "")
+            channel, t, t.game.community, blind1, bids_flat, "", order1)
 
     if replaced_any:
         # Board image still shows the pre-auction cards until this

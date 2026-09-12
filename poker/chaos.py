@@ -98,7 +98,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🙈",
         description="One card in everyone's hand is unreadable, "
                      "along with each community card at a **50% chance**",
-        weight=1.0,
+        weight=0.7,
         implemented=True,
         params={"chance": 0.50},
     ),
@@ -147,7 +147,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🔨",
         description="Right after the river, bid your stack to **replace a community "
                      "card** of your choice. Only winners' bid gets taken",
-        weight=1.0,
+        weight=0.7,
         implemented=True,
     ),
     ChaosModifier(
@@ -194,7 +194,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🎲",
         description="Before cards are dealt, bet up to **2000 chips** on a rank and suit "
                      "for a side-payout.",
-        weight=1.0,
+        weight=0.8,
         implemented=True,
         params={"max_bet": 2000, "exact_mult": 10, "split_mult": 3, "rank_mult": 2, "suit_mult": 0.5},
     ),

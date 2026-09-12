@@ -4218,7 +4218,7 @@ _RANDOM_EVENT_HANDLERS = {
 
 # Community Auction
 
-COMMUNITY_AUCTION_WINDOW_SECONDS = 40
+COMMUNITY_AUCTION_WINDOW_SECONDS = 30
 
 
 class CommunityAuctionBidModal(discord.ui.Modal, title="🔨 Place Your Bid"):
@@ -4462,7 +4462,7 @@ async def _run_community_auction(channel, t: TableState):
 
 # Gamble the Gamble
 
-GAMBLE_WINDOW_SECONDS = 75
+GAMBLE_WINDOW_SECONDS = 35
 
 _GAMBLE_RANK_ALIASES = {
     "A": "A", "ACE": "A",

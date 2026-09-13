@@ -63,7 +63,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Triple Threat",
         emoji="➕🃏",
         description="Everyone gets **3 hole cards** instead of 2.",
-        weight=1.2,
+        weight=10.0,
         implemented=True,
     ),
     ChaosModifier(
@@ -183,7 +183,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="✨",
         description="Shiny-card odds jump to **25%**, but you need **2+ shinies in "
                      "your own hand** to actually cash in the jackpot or cosmetics.",
-        weight=10.0,
+        weight=20.0,
         min_players=4,
         implemented=True,
         params={"chance": 1.0, "min_shinies": 2},

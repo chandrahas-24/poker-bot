@@ -1317,7 +1317,7 @@ TITLES: dict[str, dict] = {
         "hidden": True,
     },
 
-    "kissing_cat": {
+    "rawr": {
         "display": "rawr :3",
         "description": "means i love you in dinosaur",
         "rarity": "legendary",

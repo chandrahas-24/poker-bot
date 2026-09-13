@@ -63,7 +63,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Triple Threat",
         emoji="➕🃏",
         description="Everyone gets **3 hole cards** instead of 2.",
-        weight=1.0,
+        weight=10.0,
         implemented=True,
     ),
     ChaosModifier(
@@ -71,7 +71,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Pairmageddon",
         emoji="👯",
         description="Every player is dealt a **pocket pair**",
-        weight=1.0,
+        weight=0.7,
         implemented=True,
     ),
     ChaosModifier(
@@ -98,7 +98,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🙈",
         description="One card in everyone's hand is unreadable, "
                      "along with each community card at a **50% chance**",
-        weight=0.7,
+        weight=0.6,
         implemented=True,
         params={"chance": 0.50},
     ),
@@ -147,18 +147,18 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🔨",
         description="Right after the river, bid your stack to **replace a community "
                      "card** of your choice. Only winners' bid gets taken",
-        weight=0.7,
+        weight=0.8,
         implemented=True,
     ),
     ChaosModifier(
         id="reshuffle",
         name="Reshuffle",
         emoji="🔀",
-        description="On the flop, turn, and river, there's a **40% chance** every hand "
+        description="On the flop, turn, and river, there's a **20% chance** every hand "
                      "gets redealt.",
-        weight=1.0,
+        weight=0.8,
         implemented=True,
-        params={"chance": 0.40},
+        params={"chance": 0.20},
     ),
     ChaosModifier(
         id="all_in_showdown",
@@ -183,10 +183,10 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="✨",
         description="Shiny-card odds jump to **25%**, but you need **2+ shinies in "
                      "your own hand** to actually cash in the jackpot or cosmetics.",
-        weight=1.0,
-        min_players=6,
+        weight=20.0,
+        min_players=4,
         implemented=True,
-        params={"chance": 0.5, "min_shinies": 2},
+        params={"chance": 1.0, "min_shinies": 2},
     ),
     ChaosModifier(
         id="gamble_the_gamble",
@@ -194,7 +194,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🎲",
         description="Before cards are dealt, bet up to **2000 chips** on a rank and suit "
                      "for a side-payout.",
-        weight=0.8,
+        weight=0.4,
         implemented=True,
         params={"max_bet": 2000, "exact_mult": 10, "split_mult": 3, "rank_mult": 2, "suit_mult": 0.5},
     ),
@@ -222,10 +222,10 @@ MODIFIERS: list[ChaosModifier] = [
         name="Chameleon",
         emoji="🦎",
         description="Every time a new community card is revealed, **every card in "
-                     "play** has a **15% chance** to swap suits.",
+                     "play** has a **25% chance** to swap suits.",
         weight=1.0,
         implemented=True,
-        params={"chance": 0.15},
+        params={"chance": 0.25},
     ),
     ChaosModifier(
         id="hidden_pot",
@@ -260,7 +260,7 @@ MODIFIERS: list[ChaosModifier] = [
         name="Cute Mode",
         emoji="💕",
         description="Purely visual: every card gets a cute overlay.",
-        weight=1.0,
+        weight=0.5,
         implemented=True,
     ),
     ChaosModifier(
@@ -426,7 +426,7 @@ EVENTS: list[ChaosEvent] = [
 
 EVENTS_BY_ID: dict[str, ChaosEvent] = {e.id: e for e in EVENTS}
 
-RANDOM_EVENT_CHANCE = 0.15  # independent chance, PER TRIGGER POINT (see below)
+RANDOM_EVENT_CHANCE = 0.07  # independent chance, PER TRIGGER POINT (see below)
 
 def should_random_event_fire(rng: random.Random | None = None) -> bool:
     # call once per trigger point

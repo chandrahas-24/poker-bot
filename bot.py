@@ -502,43 +502,64 @@ async def reload(ctx, cog_name: str = None):
     import sys
     import importlib
 
-    cog_name_lower = cog_name.lower() if cog_name else None
     helpers_to_reload = []
     cogs_to_reload = []
 
-    # Map target cog/helpers to reload
-    if cog_name_lower == "poker":
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.chaos", "poker.card_images", "poker.jackpot", "poker.taxation"]
-        cogs_to_reload = ["poker.poker"]
-    elif cog_name_lower == "eventlog":
-        helpers_to_reload = ["config", "eventlog.eventlog_database"]
-        cogs_to_reload = ["eventlog.eventlog"]
-    elif cog_name_lower in ("tutorial", "tutorial_cog"):
-        helpers_to_reload = ["config", "poker.tutorial_db"]
-        cogs_to_reload = ["poker.tutorial_cog"]
-    elif cog_name_lower in ("ai", "pokerai"):
-        helpers_to_reload = ["config"]
-        cogs_to_reload = ["poker.pokerai"]
-    elif cog_name_lower in ("uno"):
-        helpers_to_reload = ["config"]
-        cogs_to_reload = ["uno.uno_cog"]
-    elif cog_name_lower in ("highlight", "hl"):
-        helpers_to_reload = ["config"]
-        cogs_to_reload = ["highlight"]
-    elif cog_name_lower is None:
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.chaos", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
+    def resolve_target(name_lower, name_raw):
+        """Returns (helpers, cogs) for a single target token."""
+        if name_lower == "poker":
+            return (["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation"],
+                     ["poker.poker"])
+        elif name_lower == "eventlog":
+            return (["config", "eventlog.eventlog_database"], ["eventlog.eventlog"])
+        elif name_lower in ("tutorial", "tutorial_cog"):
+            return (["config", "poker.tutorial_db"], ["poker.tutorial_cog"])
+        elif name_lower in ("ai", "pokerai"):
+            return (["config"], ["poker.pokerai"])
+        elif name_lower in ("uno",):
+            return (["config"], ["uno.uno_cog"])
+        elif name_lower in ("highlight", "hl"):
+            return (["config"], ["highlight"])
+        else:
+            # Generic fallback: any dotted path works here, not just the named
+            # targets above — no need to pre-register a module in this file.
+            ext_name = name_raw if name_raw in bot.extensions else (f"cogs.{name_raw}" if f"cogs.{name_raw}" in bot.extensions else None)
+            if ext_name:
+                # It's a registered cog/extension — reload it as one.
+                return ([], [name_raw])
+            elif name_raw in sys.modules:
+                # It's a plain helper module already imported somewhere (e.g. poker.chaos) —
+                # reload it in place. Anything doing `from . import <mod>` elsewhere picks
+                # up the change automatically since it holds a reference to this same module object.
+                return ([name_raw], [])
+            else:
+                # Never imported yet under this name — try a fresh import so a brand-new
+                # file can still be picked up without a restart.
+                importlib.import_module(name_raw)  # raises if truly not found
+                return ([name_raw], [])
+
+    if cog_name is None:
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
         cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "highlight"]
     else:
-        # Check if it is a loaded extension
-        ext_name = cog_name if cog_name in bot.extensions else (f"cogs.{cog_name}" if f"cogs.{cog_name}" in bot.extensions else None)
-        if ext_name:
-            cogs_to_reload = [cog_name]
-        else:
-            await ctx.send(f"❌ Unknown cog/extension `{cog_name}`.")
-            return
+        # Comma-separated list of targets — aliases, dotted helper modules, or cogs, any mix.
+        for token in [t.strip() for t in cog_name.split(",") if t.strip()]:
+            try:
+                h, c = resolve_target(token.lower(), token)
+            except Exception as e:
+                await ctx.send(f"❌ Unknown cog/module `{token}`:\n```python\n{e}\n```")
+                return
+            for x in h:
+                if x not in helpers_to_reload:
+                    helpers_to_reload.append(x)
+            for x in c:
+                if x not in cogs_to_reload:
+                    cogs_to_reload.append(x)
 
     # 2. Close database connections for helpers being reloaded to prevent locks/leaks
-    dbs_to_close = [h for h in helpers_to_reload if h in ("database", "tournament_db", "tutorial_db")]
+    #    Generic: any helper module currently holding an open `_db` handle, not just
+    #    the historically-known db module names.
+    dbs_to_close = [h for h in helpers_to_reload if h in sys.modules and getattr(sys.modules[h], "_db", None) is not None]
     closed_dbs = []
     for db_name in dbs_to_close:
         if db_name in sys.modules:
@@ -562,8 +583,8 @@ async def reload(ctx, cog_name: str = None):
                 await ctx.send(f"❌ Failed to reload helper `{helper}`:\n```python\n{e}\n```")
                 return
 
-    if "database" in reloaded_helpers:
-        await sys.modules["database"].load_custom_cosmetics()
+    if "poker.database" in reloaded_helpers:
+        await sys.modules["poker.database"].load_custom_cosmetics()
 
     # 4. Reload cogs
     reloaded_cogs = []

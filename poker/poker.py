@@ -7665,12 +7665,12 @@ class PokerCog(commands.Cog):
     @poker.command(name="drawcards", description="Draw cards from a 52 card deck")
     @app_commands.describe(number="Number of cards to draw",
                            infinite="Use a fresh deck for every card (Default: False)",
-                           shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)", name="X drew",
+                           name="X drew",
                            sort="Sort cards by rank or suit (Default: rank)")
     @app_commands.choices(
         sort=[app_commands.Choice(name="Rank", value="rank"), app_commands.Choice(name="Suit", value="suit")])
     async def draw_cards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
-                         infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0,
+                         infinite: bool = False,
                          name: str = "", sort: str = "rank"):
         await interaction.response.defer(ephemeral=False)
 
@@ -7694,15 +7694,11 @@ class PokerCog(commands.Cog):
         else:
             cards.sort(key=lambda card: (suit_order[Card.int_to_str(card)[1]], rank_order[Card.int_to_str(card)[0]]))
 
-        ace_of_spades = Card.new("As")
-        shiny = ace_of_spades in cards and random.random() < shiny_chance
-
-        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True, shiny)
+        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True)
 
         await interaction.followup.send(
             f"🃏 {name} drew **{number}** card{'s' if number != 1 else ''}"
-            f"{' (infinite deck)' if infinite else ''}: "
-            f"\n {hand_str(cards)}{' ✨' if shiny else ''}",
+            f"{' (infinite deck)' if infinite else ''}: ",
             file=file
         )
 
@@ -8030,14 +8026,14 @@ class PokerCog(commands.Cog):
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(number="Number of cards to draw",
                            infinite="Use a fresh deck for every card (Default: False)",
-                           shiny_chance="Chance for Ace of Spades to be shiny (0 to 1, Default: 0)", name="X drew",
+                           name="X drew",
                            sort="Sort cards by rank or suit (Default: rank)")
     @app_commands.choices(
         sort=[app_commands.Choice(name="Rank", value="rank"), app_commands.Choice(name="Suit", value="suit")])
     async def user_drawcards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
-                             infinite: bool = False, shiny_chance: app_commands.Range[float, 0.0, 1.0] = 0.0,
+                             infinite: bool = False,
                              name: str = "", sort: str = "rank"):
-        await self.draw_cards.callback(self, interaction, number, infinite, shiny_chance, name, sort)
+        await self.draw_cards.callback(self, interaction, number, infinite, name, sort)
 
     @app_commands.command(name="myactivity", description="Check your poker activity status")
     @app_commands.allowed_installs(guilds=False, users=True)

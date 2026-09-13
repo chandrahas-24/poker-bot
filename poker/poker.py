@@ -348,6 +348,17 @@ def cancel_timer(t: TableState):
     t.timer_street = None
     t.turn_deadline = 0.0
 
+def _lock_in_hand_result(t: TableState):
+    """Call immediately after any action that may have just set
+    t.game._hand_result, before any subsequent await. A pending
+    _auto_next_hand task firing in that window would call start_hand()
+    and wipe _hand_result back to None before _handle_post_action ever
+    sees it — silently dropping pot distribution, DB logging, and the
+    next-hand schedule. Cancelling here closes that race."""
+    if t.game._hand_result and t.auto_task and not t.auto_task.done():
+        t.auto_task.cancel()
+        t.auto_task = None
+
 def start_timer(t: TableState, channel):
     # Always (re)bind the callback to the currently-loaded code. This runs
     # on every single decision (start_timer fires after every refresh()),
@@ -421,6 +432,8 @@ async def _handle_forgiven_timeout(t: TableState, channel, user_id: int, p, stat
         # resolved the decision through another path. Do nothing.
         return
 
+    _lock_in_hand_result(t)
+
     state["daily_count"] += 1
     state["consecutive_count"] += 1
     await db.save_afk_state(user_id, state["daily_count"], state["daily_date"], state["consecutive_count"])
@@ -464,6 +477,7 @@ async def _handle_old_timeout(t: TableState, channel, user_id: int, p):
     if not p.folded:
         ok, fold_msg = t.game.force_fold(user_id)
         if ok:
+            _lock_in_hand_result(t)
             parts = fold_msg.split("\n")
             if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
                 slog_clear(t)
@@ -3083,6 +3097,8 @@ class AllInConfirmView(discord.ui.View):
             await interaction.edit_original_response(content=msg, view=None)
             self.stop()
             return
+
+        _lock_in_hand_result(self.t)
 
         # 3. Clean up the ephemeral prompt
         await interaction.edit_original_response(content="✅ You went all in!", view=None)
@@ -5960,6 +5976,7 @@ class PokerCog(commands.Cog):
         if not p.folded:
             ok, fold_msg = t.game.force_fold(user.id)
             if ok:
+                _lock_in_hand_result(t)
                 parts = fold_msg.split("\n")
                 if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
                     slog_clear(t)
@@ -6056,6 +6073,7 @@ class PokerCog(commands.Cog):
                     if not p.folded:
                         ok, fold_msg = t.game.force_fold(user.id)
                         if ok:
+                            _lock_in_hand_result(t)
                             parts = fold_msg.split("\n")
                             if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
                                 slog_clear(t)
@@ -6170,7 +6188,7 @@ class PokerCog(commands.Cog):
         if not ok:
             await interaction.followup.send(f"❌ {msg}", ephemeral=True);
             return
-
+        _lock_in_hand_result(t)
         slog(t, msg)
         await interaction.followup.send(f"✅ Force folded **{user.display_name}**.")
 

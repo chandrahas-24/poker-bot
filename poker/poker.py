@@ -557,9 +557,11 @@ async def _turn_timer(t: TableState, channel, user_id: int):
     state = await db.get_afk_state(user_id)
 
     if state["daily_count"] < DAILY_AFK_LIMIT:
-        await _handle_forgiven_timeout(t, channel, user_id, p, state)
+        resolve_task = asyncio.ensure_future(_handle_forgiven_timeout(t, channel, user_id, p, state))
     else:
-        await _handle_old_timeout(t, channel, user_id, p)
+        resolve_task = asyncio.ensure_future(_handle_old_timeout(t, channel, user_id, p))
+    resolve_task.add_done_callback(_task_catcher)
+    await asyncio.shield(resolve_task)
 
 # ── Auto next hand ────────────────────────────────────────────────────────────
 

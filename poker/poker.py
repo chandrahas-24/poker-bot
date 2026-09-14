@@ -41,7 +41,7 @@ DAILY_AFK_LIMIT        = config.DAILY_AFK_LIMIT
 CONSECUTIVE_AFK_LIMIT  = config.CONSECUTIVE_AFK_LIMIT
 TABLE_RESEND_MSGS       = config.TABLE_RESEND_MSGS
 
-# Chaos only
+# 2/7 offsuit bluff bonus + "67" title
 BLUFF_27_BONUS = 30  # chips taken from each other player's table stack
 
 def _is_27_offsuit(hole_cards: list[int]) -> bool:
@@ -2465,7 +2465,7 @@ async def _process_result(guild, channel, t: TableState):
                 print(f"[Error] Failed to announce Ragebait reveal: {e}")
 
         # 2/7 offsuit bonus on win only
-        if (t.chaos_mode and len(result.winners or []) == 1 and not result.winner_ranks
+        if (len(result.winners or []) == 1 and not result.winner_ranks
                 and "triple_hole" not in t.chaos_modifiers):
             bluffer = result.winners[0]
             if _is_27_offsuit(bluffer.hole_cards):
@@ -2489,7 +2489,7 @@ async def _process_result(guild, channel, t: TableState):
                         print(f"[Error] Failed to announce 2-7 bluff bonus: {e}")
 
         # 67 title
-        if t.chaos_mode and any(_has_six_and_seven(w.hole_cards) for w in (result.winners or [])):
+        if any(_has_six_and_seven(w.hole_cards) for w in (result.winners or [])):
             t.sixseven_bait_active = True
 
     except Exception as e:

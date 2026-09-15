@@ -4,6 +4,8 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+DONATION_CONVERSION_ENABLED = True
+
 # Load the secret tokens from .env
 load_dotenv()
 
@@ -12,22 +14,24 @@ DB_PATH = BASE_DIR / "data" / "poker" / "poker.db"
 TOURNAMENT_DB_PATH = BASE_DIR / "data" / "tournament" / "tournament.db"
 TUTORIAL_DB_PATH = BASE_DIR / "data" / "tutorial" / "tutorial.db"
 EVENTLOG_DB_PATH = BASE_DIR / "data" / "eventlog" / "eventlog_database.db"
+UNO_DB_PATH = BASE_DIR / "data" / "uno" / "uno.db"
 TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
 TOURNAMENT_STARTING_CHIPS = 5000
 
 # ── SERVER & CHANNELS ──
-GUILD_ID = 799685121582039141
-CASHOUT_CHANNEL_ID = 1479793953090830460
-INACTIVITY_CHANNEL_ID = 1479667673804701707
-ADD_CHIPS_CHANNELS = {1479792931505180845, 1479667673804701707}
-REMOVE_CHIPS_CHANNELS = {1479792931505180845, 1479667673804701707}
+GUILD_ID = 1477315683531624598
+CASHOUT_CHANNEL_ID = {1479793953090830460, 1485495899722354809}
+INACTIVITY_CHANNEL_ID = {1479667673804701707, 1485495899722354809}
+ADD_CHIPS_CHANNELS = {1479792931505180845, 1479667673804701707, 1485495899722354809}
+REMOVE_CHIPS_CHANNELS = {1479792931505180845, 1479667673804701707, 1485495899722354809}
 PAYOUT_MANAGER_ROLE = 1019909875913998388
 
 LOCKDOWN_CHANNELS = [799685122701000754]
 
 RESTRICTED_CHANNELS = {
-    1508645866712465479: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table"],  #allowed exceptions
-    1513018821982814270: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table"]
+    1508645866712465479: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table"],  #allowed exceptions
+    1513018821982814270: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table"],
+    1485495899722354809: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table", "poker wallet", "pokeradmin revenue", "pokeradmin salt", "pokeradmin adjustrevenue", "poker titles", "poker equipborder", "poker equiptitle", "poker equipwinmsg", "pokerset preferences"],
 }
 
 # ── ECONOMY & TAX ──
@@ -46,6 +50,12 @@ TUTORIAL_PLAY_CHANNEL = 1479666976975491153
 REGULAR_REJOIN_COOLDOWN = 600
 TOURNAMENT_REJOIN_COOLDOWN = 120
 
+# ── AFK / DECISION TIMEOUT ──
+LARGE_POT_THRESHOLD   = 1000
+LARGE_POT_EXTRA_TIME  = 30
+DAILY_AFK_LIMIT        = 5
+CONSECUTIVE_AFK_LIMIT  = 2
+
 # ── GLOBAL CASINO LIMITS ──
 TURN_TIMEOUT_DEFAULT    = 300
 NEXT_HAND_DELAY_DEFAULT = 30
@@ -62,11 +72,26 @@ DEFAULT_SMALL_BLIND = 25
 DEFAULT_BIG_BLIND = 50
 DEFAULT_MIN_BUYIN = 50
 
-EGIRL_SARO_CHANCE = 0.0004
-HIGH_TABLE_SATURDAY_EGIRL_CHANCE = 0.00065
+EGIRL_SARO_CHANCE = 0.0001
+HIGH_TABLE_SATURDAY_EGIRL_CHANCE = 0.0001625
 
 # ── INACTIVITY WIPE TAX ──
 WIPE_TAX_RATE = 0.20  # 20%
+
+# ── UNO ECONOMY (separate wallets/db from poker — see uno/database.py) ──
+UNO_MIN_BET = 50
+UNO_WIPE_TAX_RATE = 0.20       # same tax rate poker uses
+UNO_INACTIVITY_DAYS = 2        # same grace window poker uses
+UNO_MIN_ROUNDS_PER_PERIOD = 2  # UNO rounds run longer than poker hands, so a lower bar than MIN_HANDS_PER_PERIOD
+UNO_MIN_CHIPS_WAGERED = 100    # a single min-bet round should count as activity
+
+# ── UNO SERVER & CHANNELS ── (TODO: fill in real IDs — 0/empty placeholders for now)
+UNO_CASHOUT_CHANNEL_ID = 0            # where /uno request_cashout tickets post, and where staff ✅-react to pay them
+UNO_INACTIVITY_CHANNEL_ID = 0         # daily UNO wipe summary posts here
+UNO_DONATION_CHANNELS = set()         # Dank Memer donation messages in these channels credit UNO chips instead of poker chips
+UNO_ADD_CHIPS_CHANNELS = set()        # restricts /unomgr addchips — empty set = unrestricted (same convention as poker's ADD_CHIPS_CHANNELS)
+UNO_REMOVE_CHIPS_CHANNELS = set()     # restricts /unomgr removechips
+UNO_PAYOUT_MANAGER_ROLE = 0           # role allowed to ✅-react and pay out UNO cashout tickets (poker's PAYOUT_MANAGER_ROLE equivalent)
 
 DEV_USER_IDS = (
     1339935869598961728, # baymax for backups
@@ -74,5 +99,6 @@ DEV_USER_IDS = (
 )
 
 # ── CUSTOM EMOJIS ──
-POKER_CHIP_EMOJI = "<:poker_chip:1490458259855773707>"
+POKER_CHIP_EMOJI = "<:tiltchip:1489665434847285340>"
 TOURNAMENT_CHIP_EMOJI = "<:tourney_chip:1508826107246415924>"
+UNO_CHIP_EMOJI = "<:uno_chip:0>"  # TODO: replace 0 with your uploaded UNO chip emoji's ID

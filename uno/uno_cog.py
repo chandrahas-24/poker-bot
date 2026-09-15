@@ -1745,10 +1745,10 @@ class UnoGame(commands.Cog):
                 log.exception("Failed to load card image %s", fname)
         log.info("Cached %d card image(s) in memory", len(self._card_image_cache))
 
-    uno = app_commands.Group(name="uno", description="UNO game commands")
-    unomgr = app_commands.Group(name="unomgr", description="UNO manager commands (economy)")
-    unoadmin = app_commands.Group(name="unoadmin", description="UNO admin/dev commands")
-    unoset = app_commands.Group(name="unoset", description="Configure UNO settings")
+    uno = app_commands.Group(name="uno", description="UNO game commands", guild_ids=[config.GUILD_ID])
+    unomgr = app_commands.Group(name="unomgr", description="UNO manager commands (economy)", guild_ids=[config.GUILD_ID])
+    unoadmin = app_commands.Group(name="unoadmin", description="UNO admin/dev commands", guild_ids=[config.GUILD_ID])
+    unoset = app_commands.Group(name="unoset", description="Configure UNO settings", guild_ids=[config.GUILD_ID])
 
     # ---------------- persistence ----------------
 

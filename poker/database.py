@@ -15,6 +15,8 @@ _write_lock = asyncio.Lock()
 _settings_cache: dict[int, dict] = {}
 _cache_lock = asyncio.Lock()
 
+# ── AFK/decision-timeout state cache (mirrors afk_tracking table) ─────────────
+_afk_cache: dict[int, dict] = {}
 
 async def _get_db() -> aiosqlite.Connection:
     global _db
@@ -122,6 +124,15 @@ async def init_db():
             except aiosqlite.OperationalError as e:
                 if "duplicate column name" not in str(e).lower():
                     raise
+        try:
+            # 'normal' or 'chaos' — set by /pokerset table when the hidden
+            # "soahc" preset is used, and reset to 'normal' when that table closes.
+            await db.execute(
+                "ALTER TABLE guild_settings ADD COLUMN table_mode TEXT DEFAULT 'normal'"
+            )
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chips_in_play (
                 user_id  INTEGER PRIMARY KEY,
@@ -140,6 +151,15 @@ async def init_db():
                 ts         TEXT NOT NULL
             )
         """)
+        for col, col_type in [
+            ("reason", "TEXT"),
+            ("expires_at", "TEXT"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE poker_bans ADD COLUMN {col} {col_type}")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
         await db.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,6 +262,63 @@ async def init_db():
             )
         """)
 
+        # Card Skins
+        try:
+            await db.execute("ALTER TABLE player_cosmetics ADD COLUMN active_skin TEXT DEFAULT NULL")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+        try:
+            await db.execute("ALTER TABLE player_cosmetics ADD COLUMN unlocked_skins TEXT DEFAULT '[]'")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        try:
+            await db.execute("""
+                        UPDATE player_cosmetics
+                        SET unlocked_skins = (
+                                SELECT json_group_array(value) FROM (
+                                    SELECT value FROM json_each(COALESCE(unlocked_skins, '[]'))
+                                    UNION
+                                    SELECT 'chaos'
+                                )
+                            ),
+                            active_skin = CASE WHEN active_border = 'chaos' THEN 'chaos' ELSE active_skin END,
+                            active_border = CASE WHEN active_border = 'chaos' THEN NULL ELSE active_border END
+                        WHERE EXISTS (
+                            SELECT 1 FROM json_each(COALESCE(unlocked_borders, '[]')) WHERE value = 'chaos'
+                        )
+                    """)
+            await db.execute("""
+                        UPDATE player_cosmetics
+                        SET unlocked_borders = (
+                            SELECT json_group_array(value)
+                            FROM (SELECT value FROM json_each(COALESCE(unlocked_borders, '[]')) WHERE value != 'chaos')
+                        )
+                        WHERE EXISTS (
+                            SELECT 1 FROM json_each(COALESCE(unlocked_borders, '[]')) WHERE value = 'chaos'
+                        )
+                    """)
+        except aiosqlite.OperationalError as e:
+            print(f"⚠  Chaos border→skin migration skipped: {e}")
+
+        # Card Borders — added after the table above already existed for some
+        # installs, so these need their own ALTER TABLE (duplicate-safe, same
+        # pattern as wallets/pending_cashout above) rather than just being in
+        # the CREATE TABLE — that clause only ever runs on a brand-new table.
+        try:
+            await db.execute("ALTER TABLE player_cosmetics ADD COLUMN active_border TEXT DEFAULT NULL")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+        try:
+            await db.execute("ALTER TABLE player_cosmetics ADD COLUMN unlocked_borders TEXT DEFAULT '[]'")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS custom_cosmetics (
                 cosmetic_id TEXT PRIMARY KEY,
@@ -275,9 +352,18 @@ async def init_db():
                 confirm_fold_threshold INTEGER DEFAULT 0,
                 confirm_leave INTEGER DEFAULT 1,
                 confirm_call_raise_mode TEXT DEFAULT 'never',
-                confirm_call_raise_threshold INTEGER DEFAULT 0
+                confirm_call_raise_threshold INTEGER DEFAULT 0,
+                card_size TEXT DEFAULT 'normal'
             )
         """)
+
+        # Migration for existing installs. CREATE TABLE IF NOT EXISTS above
+        # only applies the card_size column on a brand-new table.
+        try:
+            await db.execute("ALTER TABLE player_preferences ADD COLUMN card_size TEXT DEFAULT 'normal'")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS dealer_session_log (
@@ -288,6 +374,16 @@ async def init_db():
                 dealer_name TEXT NOT NULL,
                 event       TEXT NOT NULL,
                 ts          TEXT NOT NULL
+            )
+        """)
+
+        # ── AFK / decision-timeout forgiveness tracking (global, all tables) ──
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS afk_tracking (
+                user_id           INTEGER PRIMARY KEY,
+                daily_count       INTEGER DEFAULT 0,
+                daily_date        TEXT DEFAULT '',
+                consecutive_count INTEGER DEFAULT 0
             )
         """)
 
@@ -320,6 +416,7 @@ async def get_settings(guild_id: int) -> dict:
                 "min_wallet": 50, "max_wallet": 0, "next_hand_delay": 30,
                 "manager_role_id": None, "log_channel_id": None,
                 "turn_timeout": 300, "resend_after_msgs": 10, "muck_time": 15,
+                "table_mode": "normal",
             }
 
     # Update cache
@@ -337,17 +434,18 @@ async def set_settings(guild_id: int, **kwargs):
     current.setdefault("muck_time", 15)
     current.setdefault("max_wallet", 2000)
     current.setdefault("rejoin_fee", 50)
+    current.setdefault("table_mode", "normal")
     db = await _get_db()
     async with _write_lock:
         await db.execute("""
             INSERT INTO guild_settings
                 (guild_id, small_blind, big_blind, min_wallet, max_wallet,
                  next_hand_delay, manager_role_id, log_channel_id,
-                 turn_timeout, resend_after_msgs, muck_time)
+                 turn_timeout, resend_after_msgs, muck_time, table_mode)
             VALUES
                 (:guild_id, :small_blind, :big_blind, :min_wallet, :max_wallet,
                  :next_hand_delay, :manager_role_id, :log_channel_id,
-                 :turn_timeout, :resend_after_msgs, :muck_time)
+                 :turn_timeout, :resend_after_msgs, :muck_time, :table_mode)
             ON CONFLICT(guild_id) DO UPDATE SET
                 small_blind       = :small_blind,
                 big_blind         = :big_blind,
@@ -359,7 +457,8 @@ async def set_settings(guild_id: int, **kwargs):
                 turn_timeout      = :turn_timeout,
                 resend_after_msgs = :resend_after_msgs,
                 muck_time         = :muck_time,
-                rejoin_fee        = :rejoin_fee
+                rejoin_fee        = :rejoin_fee,
+                table_mode        = :table_mode
         """, current)
         await db.commit()
 
@@ -696,7 +795,8 @@ async def write_audit(action: str, user_id: int, user_name: str, detail: str = "
 # ── Bans ──────────────────────────────────────────────────────────────────────
 
 async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int,
-                     table_name: str | None = None):
+                     table_name: str | None = None, reason: str | None = None,
+                     expires_at: str | None = None):
     db = await _get_db()
     async with _write_lock:
         async with db.execute(
@@ -706,10 +806,10 @@ async def ban_player(guild_id: int, user_id: int, username: str, banned_by: int,
             if await c.fetchone():
                 return False
         await db.execute(
-            "INSERT INTO poker_bans (guild_id, user_id, username, table_name, banned_by, ts) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO poker_bans (guild_id, user_id, username, table_name, banned_by, ts, reason, expires_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (guild_id, user_id, username, table_name, banned_by,
-             datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+             datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), reason, expires_at)
         )
         await db.commit()
     return True
@@ -742,17 +842,20 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
 
 
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     db = await _get_db()
     async with db.execute(
-            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL",
-            (guild_id, user_id)
+            "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name IS NULL "
+            "AND (expires_at IS NULL OR expires_at > ?)",
+            (guild_id, user_id, now)
     ) as c:
         if await c.fetchone():
             return True
     if table_name:
         async with db.execute(
-                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=?",
-                (guild_id, user_id, table_name)
+                "SELECT id FROM poker_bans WHERE guild_id=? AND user_id=? AND table_name=? "
+                "AND (expires_at IS NULL OR expires_at > ?)",
+                (guild_id, user_id, table_name, now)
         ) as c:
             if await c.fetchone():
                 return True
@@ -762,12 +865,31 @@ async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) 
 async def get_all_bans(guild_id: int) -> list[dict]:
     db = await _get_db()
     async with db.execute("""
-        SELECT user_id, username, table_name, banned_by, ts
+        SELECT id, user_id, username, table_name, banned_by, ts, reason, expires_at
         FROM poker_bans
         WHERE guild_id = ?
         ORDER BY ts DESC
     """, (guild_id,)) as c:
         return [dict(r) for r in await c.fetchall()]
+
+
+async def get_expired_bans() -> list[dict]:
+    """Bans whose expires_at has passed and are still present in the table."""
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    db = await _get_db()
+    async with db.execute("""
+        SELECT id, guild_id, user_id, username, table_name
+        FROM poker_bans
+        WHERE expires_at IS NOT NULL AND expires_at <= ?
+    """, (now,)) as c:
+        return [dict(r) for r in await c.fetchall()]
+
+
+async def delete_ban_by_id(ban_id: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("DELETE FROM poker_bans WHERE id=?", (ban_id,))
+        await db.commit()
 
 
 async def delete_player_stats(user_id: int) -> bool:
@@ -1140,8 +1262,30 @@ TITLES: dict[str, dict] = {
         "display": "👶 𝑆𝑎𝑟𝑜𝑠ℎ𝑖'𝑠 𝑀𝑜𝑚𝑚𝑦",
         "description": "super secret formula sauce, congrats pro user",
         "rarity": "legendary",
-        "hidden": False,
+        "hidden": True,
     },
+
+    "pwincess": {
+        "display": "⋆˚｡⋆୨୧˚❀ pwincess ❀˚୨୧⋆｡˚⋆",
+        "description": "the perfect fit",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "goth_mommy": {
+        "display": "goth mommy thighs",
+        "description": "🤨 sap's favorite",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "meat": {
+        "display": "cold meat",
+        "description": "talking about the draugr, what else",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
     "blessed": {
         "display": "🌟 Blessed",
         "description": "Favored by the poker gods. Extremely rare.",
@@ -1156,6 +1300,46 @@ TITLES: dict[str, dict] = {
         "hidden": False,
     },
 
+
+    # chaos mod stuff
+
+    "egirl_simp": {
+        "display": "egirl simp",
+        "description": "simp for saroshina",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "kissing_cat": {
+        "display": "😽",
+        "description": "😽",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "rawr": {
+        "display": "rawr :3",
+        "description": "means i love you in dinosaur",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "wilted_flower": {
+        "display": "🥀",
+        "description": "🥀🥀🥀",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "foot": {
+        "display": "🦶",
+        "description": "saroshi's favorite",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+
+
     # ── Nothing to see here ─────────────────────────────────────────────────
     "guard": {
         "display": "BELIEVES IN EGIRL SAROSHINA FOREVER 😍😍😍",
@@ -1166,7 +1350,7 @@ TITLES: dict[str, dict] = {
     },
 
     "bay": {
-        "display": "<:hawl:1538302870581940264>",
+        "display": "<:bay_stare:1472176122564313089>",
         "description": "",
         "rarity": "unique",
         "hidden": True,
@@ -1270,6 +1454,20 @@ WIN_MESSAGES: dict[str, dict] = {
         "hidden": True,
     },
 
+    "undefeated": {
+        "display": "even death cannot defeat me",
+        "description": "another joins the draugar",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "thighs": {
+        "display": "dommy goth mommy thighs will crush you all",
+        "description": "sap and his goth mommy thighs i guess",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
     "touched_by_aces": {
         "display": "✨ The cards chose me",
         "description": "??? (extremely rare drop)",
@@ -1298,6 +1496,32 @@ WIN_MESSAGES: dict[str, dict] = {
         "hidden": False,
     },
 
+
+    # chaos stuff
+
+    "ara_ara": {
+        "display": "ara ara",
+        "description": "-*saroshi*",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "whos_a_good_egirl": {
+        "display": "who's a good egirl?",
+        "description": "i know... saroshi is",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+    "egirl_services": {
+        "display": "dm me for my egirl services...",
+        "description": "do it. hit <@412651268142792704> up.",
+        "rarity": "legendary",
+        "hidden": True,
+    },
+
+
+
     # ── Nothing to see here ──────────────────────────────────────────────
     "guard": {
         "display": "dev hacks enabled 🗿",
@@ -1317,6 +1541,50 @@ WIN_MESSAGES: dict[str, dict] = {
 }
 
 
+# Card borders
+# Each border can define an `underlay` or `overlay` or both
+BORDERS: dict[str, dict] = {
+
+}
+
+# Card Skins
+SKINS: dict[str, dict] = {
+    "chaos": {
+        "display": "🃏 Chaos",
+        "variant": "overlay",
+        "overlay_red": "joker_red.png",
+        "overlay_black": "joker_black.png",
+        "easter_egg_overlay": "joker_batman.png",
+        "easter_egg_chance": 0.01,
+        "preserve_corners": True,
+    },
+    "cute": {
+        "display": "💕 Cute",
+        "description": "pink",
+        "rarity": "rare",
+        "hidden": True,
+        "variant": "overlay",
+        "overlay": "cute.png",
+    }
+}
+
+
+_KIND_TO_COLUMN = {"title": "unlocked_titles", "winmsg": "unlocked_win_msgs",
+                    "border": "unlocked_borders", "skin": "unlocked_skins"}
+_KIND_TO_ACTIVE_COLUMN = {"title": "active_title", "winmsg": "active_win_msg",
+                           "border": "active_border", "skin": "active_skin"}
+
+def catalog_for_kind(kind: str) -> dict:
+    """The in-memory display catalog for a cosmetic kind """
+    if kind == "title":
+        return TITLES
+    elif kind == "border":
+        return BORDERS
+    elif kind == "skin":
+        return SKINS
+    return WIN_MESSAGES
+
+
 async def get_cosmetics(user_id: int) -> dict:
     """
     Returns the player's cosmetics dict (always safe to call, never None).
@@ -1324,8 +1592,8 @@ async def get_cosmetics(user_id: int) -> dict:
     """
     db = await _get_db()
     async with db.execute(
-            "SELECT active_title, active_win_msg, unlocked_titles, unlocked_win_msgs FROM player_cosmetics WHERE user_id=?",
-            (user_id,)
+            "SELECT active_title, active_win_msg, active_border, active_skin, "
+            "unlocked_titles, unlocked_win_msgs, unlocked_borders, unlocked_skins FROM player_cosmetics WHERE user_id=?",(user_id,)
     ) as c:
         row = await c.fetchone()
 
@@ -1333,16 +1601,24 @@ async def get_cosmetics(user_id: int) -> dict:
         cosmetics = {
             "active_title": row[0],
             "active_win_msg": row[1],
-            "unlocked_titles": json.loads(row[2] or "[]"),
-            "unlocked_win_msgs": json.loads(row[3] or '["gg"]'),
+            "active_border": row[2],
+            "active_skin": row[3],
+            "unlocked_titles": json.loads(row[4] or "[]"),
+            "unlocked_win_msgs": json.loads(row[5] or '["gg"]'),
+            "unlocked_borders": json.loads(row[6] or "[]"),
+            "unlocked_skins": json.loads(row[7] or "[]"),
         }
     else:
         # New player defaults
         cosmetics = {
             "active_title": None,
             "active_win_msg": None,
+            "active_border": None,
+            "active_skin": None,
             "unlocked_titles": [],
             "unlocked_win_msgs": ["gg"],
+            "unlocked_borders": [],
+            "unlocked_skins": [],
         }
 
     # Auto-unlock special user cosmetics
@@ -1350,10 +1626,16 @@ async def get_cosmetics(user_id: int) -> dict:
                       if info.get("special_user") == user_id and tid not in cosmetics["unlocked_titles"]]
     special_winmsgs = [mid for mid, info in WIN_MESSAGES.items()
                        if info.get("special_user") == user_id and mid not in cosmetics["unlocked_win_msgs"]]
+    special_borders = [bid for bid, info in BORDERS.items()
+                       if info.get("special_user") == user_id and bid not in cosmetics["unlocked_borders"]]
+    special_skins = [sid for sid, info in SKINS.items()
+                     if info.get("special_user") == user_id and sid not in cosmetics["unlocked_skins"]]
 
-    if special_titles or special_winmsgs:
+    if special_titles or special_winmsgs or special_borders or special_skins:
         cosmetics["unlocked_titles"].extend(special_titles)
         cosmetics["unlocked_win_msgs"].extend(special_winmsgs)
+        cosmetics["unlocked_borders"].extend(special_borders)
+        cosmetics["unlocked_skins"].extend(special_skins)
         # Save the auto-unlocked cosmetics to database
         async with _write_lock:
             await db.execute("""
@@ -1363,10 +1645,12 @@ async def get_cosmetics(user_id: int) -> dict:
             """, (user_id,))
             await db.execute("""
                 UPDATE player_cosmetics 
-                SET unlocked_titles = ?, unlocked_win_msgs = ?
+                SET unlocked_titles = ?, unlocked_win_msgs = ?, unlocked_borders = ?, unlocked_skins = ?
                 WHERE user_id = ?
             """, (json.dumps(cosmetics["unlocked_titles"]),
                   json.dumps(cosmetics["unlocked_win_msgs"]),
+                  json.dumps(cosmetics["unlocked_borders"]),
+                  json.dumps(cosmetics["unlocked_skins"]),
                   user_id))
             await db.commit()
 
@@ -1374,14 +1658,13 @@ async def get_cosmetics(user_id: int) -> dict:
 
 
 async def unlock_cosmetic(user_id: int, kind: str, cosmetic_id: str) -> bool:
-    """Unlock a title ('title') or win message ('winmsg'). Returns True if newly unlocked."""
+    """Unlock a title ('title'), win message ('winmsg'), or card border ('border'). Returns True if newly unlocked."""
     cosmetics = await get_cosmetics(user_id)
-    key = "unlocked_titles" if kind == "title" else "unlocked_win_msgs"
-    if cosmetic_id in cosmetics[key]:
+    col = _KIND_TO_COLUMN[kind]
+    if cosmetic_id in cosmetics[col]:
         return False  # Already owned
-    cosmetics[key].append(cosmetic_id)
+    cosmetics[col].append(cosmetic_id)
     db = await _get_db()
-    col = "unlocked_titles" if kind == "title" else "unlocked_win_msgs"
     async with _write_lock:
         await db.execute("""
             INSERT INTO player_cosmetics (user_id, unlocked_titles, unlocked_win_msgs)
@@ -1424,6 +1707,41 @@ async def set_active_title(user_id: int, title_id: str | None) -> bool:
     return True
 
 
+async def set_active_border(user_id: int, border_id: str | None) -> bool:
+    """Equip a card border. Pass None to remove. Returns False if not unlocked."""
+    if border_id is not None:
+        cosmetics = await get_cosmetics(user_id)
+        if border_id not in cosmetics["unlocked_borders"]:
+            return False
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO player_cosmetics (user_id, unlocked_titles, unlocked_win_msgs)
+            VALUES (?, '[]', '["gg"]')
+            ON CONFLICT(user_id) DO NOTHING
+        """, (user_id,))
+        await db.execute("UPDATE player_cosmetics SET active_border = ? WHERE user_id = ?", (border_id, user_id))
+        await db.commit()
+    return True
+
+async def set_active_skin(user_id: int, skin_id: str | None) -> bool:
+    """Equip a card skin. Pass None to remove. Returns False if not unlocked."""
+    if skin_id is not None:
+        cosmetics = await get_cosmetics(user_id)
+        if skin_id not in cosmetics["unlocked_skins"]:
+            return False
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO player_cosmetics (user_id, unlocked_titles, unlocked_win_msgs)
+            VALUES (?, '[]', '["gg"]')
+            ON CONFLICT(user_id) DO NOTHING
+        """, (user_id,))
+        await db.execute("UPDATE player_cosmetics SET active_skin = ? WHERE user_id = ?", (skin_id, user_id))
+        await db.commit()
+    return True
+
+
 async def set_active_win_msg(user_id: int, msg_id: str | None) -> bool:
     """Equip a win message. Pass None to remove. Returns False if not unlocked."""
     if msg_id is not None:
@@ -1446,7 +1764,7 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
                                  rarity: str = "rare", hidden: bool = False) -> bool:
     """
     Create a custom title or win message dynamically and persist it to the database.
-    kind: 'title' or 'winmsg'
+    kind: 'title', 'winmsg', or 'border'
     cosmetic_id: unique identifier (e.g., 'event_winner_2026')
     display: display text (e.g., '🏆 Event Winner')
     description: optional description
@@ -1455,7 +1773,7 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
 
     Returns True if created, False if ID already exists.
     """
-    catalog = TITLES if kind == "title" else WIN_MESSAGES
+    catalog = catalog_for_kind(kind)
 
     if cosmetic_id in catalog:
         return False  # ID already exists
@@ -1494,7 +1812,7 @@ async def load_custom_cosmetics():
 
     for row in rows:
         cosmetic_id, kind, display, description, rarity, hidden = row
-        catalog = TITLES if kind == "title" else WIN_MESSAGES
+        catalog = catalog_for_kind(kind)
 
         # Only load if not already defined (hardcoded cosmetics take precedence)
         if cosmetic_id not in catalog:
@@ -2004,7 +2322,8 @@ async def get_cosmetics_bulk(user_ids: list[int]) -> dict[int, dict]:
     db = await _get_db()
     placeholders = ",".join("?" * len(user_ids))
     async with db.execute(
-            f"SELECT user_id, active_title, active_win_msg, unlocked_titles, unlocked_win_msgs "
+            f"SELECT user_id, active_title, active_win_msg, active_border, "
+            f"unlocked_titles, unlocked_win_msgs, unlocked_borders "
             f"FROM player_cosmetics WHERE user_id IN ({placeholders})",
             tuple(user_ids)
     ) as c:
@@ -2015,15 +2334,17 @@ async def get_cosmetics_bulk(user_ids: list[int]) -> dict[int, dict]:
         result[row[0]] = {
             "active_title": row[1],
             "active_win_msg": row[2],
-            "unlocked_titles": json.loads(row[3] or "[]"),
-            "unlocked_win_msgs": json.loads(row[4] or '["gg"]'),
+            "active_border": row[3],
+            "unlocked_titles": json.loads(row[4] or "[]"),
+            "unlocked_win_msgs": json.loads(row[5] or '["gg"]'),
+            "unlocked_borders": json.loads(row[6] or "[]"),
         }
     # Fill in defaults for players not yet in player_cosmetics
     for uid in user_ids:
         if uid not in result:
             result[uid] = {
-                "active_title": None, "active_win_msg": None,
-                "unlocked_titles": [], "unlocked_win_msgs": ["gg"],
+                "active_title": None, "active_win_msg": None, "active_border": None,
+                "unlocked_titles": [], "unlocked_win_msgs": ["gg"], "unlocked_borders": [],
             }
     return result
 
@@ -2087,7 +2408,8 @@ DEFAULT_PREFERENCES = {
     "confirm_fold_threshold": 0,
     "confirm_leave": 1,
     "confirm_call_raise_mode": "never",
-    "confirm_call_raise_threshold": 0
+    "confirm_call_raise_threshold": 0,
+    "card_size": "normal"  # "normal" | "compact" for "My Cards" image size only
 }
 
 async def get_player_preference(user_id: int) -> dict:
@@ -2111,8 +2433,9 @@ async def set_player_preference(user_id: int, **kwargs):
                 user_id, auto_rebuy_amount, auto_showdown, default_buyin_amount,
                 confirm_all_in_mode, confirm_all_in_threshold,
                 confirm_fold_mode, confirm_fold_threshold,
-                confirm_leave, confirm_call_raise_mode, confirm_call_raise_threshold
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confirm_leave, confirm_call_raise_mode, confirm_call_raise_threshold,
+                card_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 auto_rebuy_amount = excluded.auto_rebuy_amount,
                 auto_showdown = excluded.auto_showdown,
@@ -2123,7 +2446,8 @@ async def set_player_preference(user_id: int, **kwargs):
                 confirm_fold_threshold = excluded.confirm_fold_threshold,
                 confirm_leave = excluded.confirm_leave,
                 confirm_call_raise_mode = excluded.confirm_call_raise_mode,
-                confirm_call_raise_threshold = excluded.confirm_call_raise_threshold
+                confirm_call_raise_threshold = excluded.confirm_call_raise_threshold,
+                card_size = excluded.card_size
         """, (
             user_id,
             curr["auto_rebuy_amount"],
@@ -2135,7 +2459,8 @@ async def set_player_preference(user_id: int, **kwargs):
             curr["confirm_fold_threshold"],
             curr["confirm_leave"],
             curr["confirm_call_raise_mode"],
-            curr["confirm_call_raise_threshold"]
+            curr["confirm_call_raise_threshold"],
+            curr["card_size"]
         ))
         await db.commit()
 
@@ -2145,6 +2470,61 @@ async def get_autorebuy(user_id: int) -> int:
 
 async def set_autorebuy(user_id: int, amount: int):
     await set_player_preference(user_id, auto_rebuy_amount=amount)
+
+# ── AFK / decision-timeout forgiveness state (global across every table) ──────
+
+def _afk_default(today: str) -> dict:
+    return {"daily_count": 0, "daily_date": today, "consecutive_count": 0}
+
+async def get_afk_state(user_id: int) -> dict:
+    """Returns {'daily_count', 'daily_date', 'consecutive_count'} for a
+    player, rolling the daily counter over (in-memory and in the DB) if the
+    stored date isn't today (UTC). Cache-first: players who have never timed
+    out never touch SQLite."""
+    today = datetime.utcnow().date().isoformat()
+
+    cached = _afk_cache.get(user_id)
+    if cached is not None:
+        if cached["daily_date"] != today:
+            cached["daily_count"] = 0
+            cached["daily_date"] = today
+        return cached
+
+    db = await _get_db()
+    async with db.execute(
+        "SELECT daily_count, daily_date, consecutive_count FROM afk_tracking WHERE user_id = ?",
+        (user_id,)
+    ) as c:
+        row = await c.fetchone()
+
+    state = dict(row) if row else _afk_default(today)
+    if state["daily_date"] != today:
+        state["daily_count"] = 0
+        state["daily_date"] = today
+
+    _afk_cache[user_id] = state
+    return state
+
+async def save_afk_state(user_id: int, daily_count: int, daily_date: str, consecutive_count: int):
+    """Persist a player's AFK state, updating the cache first so subsequent
+    reads in the same process see it immediately."""
+    _afk_cache[user_id] = {
+        "daily_count": daily_count,
+        "daily_date": daily_date,
+        "consecutive_count": consecutive_count,
+    }
+
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO afk_tracking (user_id, daily_count, daily_date, consecutive_count)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                daily_count       = excluded.daily_count,
+                daily_date        = excluded.daily_date,
+                consecutive_count = excluded.consecutive_count
+        """, (user_id, daily_count, daily_date, consecutive_count))
+        await db.commit()
 
 async def log_dealer_event(table_id: str, table_name: str, dealer_id: int, dealer_name: str, event: str):
     async with _write_lock:
@@ -2156,36 +2536,145 @@ async def log_dealer_event(table_id: str, table_name: str, dealer_id: int, deale
         await db.commit()
 
 async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
-    """start_date, end_date: 'YYYY-MM-DD' inclusive."""
-    db = await _get_db()
-    async with db.execute(
-        "SELECT dealer_id, dealer_name, event, ts FROM dealer_session_log WHERE DATE(ts) BETWEEN ? AND ? ORDER BY ts ASC",
-        (start_date, end_date)
-    ) as c:
-        rows = await c.fetchall()
 
     from collections import defaultdict
-    from datetime import datetime as dt
-    open_event = None
-    totals = defaultdict(lambda: {'dealer_name': '', 'seconds': 0})
+    from datetime import datetime as dt, timedelta
 
-    for dealer_id, dealer_name, event, ts in rows:
-        if event in ('start', 'dealer_change'):
-            if open_event:
-                did, dname, start = open_event
-                delta = dt.fromisoformat(ts) - dt.fromisoformat(start)
-                totals[did]['dealer_name'] = dname
-                totals[did]['seconds'] += int(delta.total_seconds())
-            open_event = (dealer_id, dealer_name, ts)
-        elif event in ('close', 'no_players', 'crash'):
-            if open_event:
-                did, dname, start = open_event
-                delta = dt.fromisoformat(ts) - dt.fromisoformat(start)
-                totals[did]['dealer_name'] = dname
-                totals[did]['seconds'] += int(delta.total_seconds())
-                open_event = None
+    db = await _get_db()
+
+    # Treat the requested dates as a half-open UTC interval:
+    #
+    #   [start_date 00:00, day_after_end_date 00:00)
+    #
+    period_start = dt.fromisoformat(start_date)
+    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
+
+    # We need the last event BEFORE the requested period for EVERY table.
+    # This is what lets us reconstruct a session that started yesterday
+    # and continued past UTC midnight.
+    async with db.execute(
+        """
+        SELECT d1.table_id,
+               d1.dealer_id,
+               d1.dealer_name,
+               d1.event,
+               d1.ts
+        FROM dealer_session_log d1
+        WHERE d1.id = (
+            SELECT d2.id
+            FROM dealer_session_log d2
+            WHERE d2.table_id = d1.table_id
+              AND d2.ts < ?
+            ORDER BY d2.ts DESC, d2.id DESC
+            LIMIT 1
+        )
+        """,
+        (period_start.isoformat(),)
+    ) as c:
+        previous_rows = await c.fetchall()
+
+    # Get all events occurring inside the requested UTC period.
+    async with db.execute(
+        """
+        SELECT table_id,
+               dealer_id,
+               dealer_name,
+               event,
+               ts
+        FROM dealer_session_log
+        WHERE ts >= ?
+          AND ts < ?
+        ORDER BY ts ASC, id ASC
+        """,
+        (period_start.isoformat(), period_end.isoformat())
+    ) as c:
+        period_rows = await c.fetchall()
+
+    # Reconstruct events independently for each table.
+    events_by_table = defaultdict(list)
+
+    for row in previous_rows:
+        events_by_table[row["table_id"]].append(row)
+
+    for row in period_rows:
+        events_by_table[row["table_id"]].append(row)
+
+    totals = defaultdict(lambda: {
+        "dealer_name": "",
+        "seconds": 0,
+    })
+
+    # Don't count an active session into the future when querying today.
+    now_utc = dt.utcnow()
+    calculation_end = min(period_end, now_utc)
+
+    for table_id, events in events_by_table.items():
+        open_event = None
+
+        for row in events:
+            dealer_id = row["dealer_id"]
+            dealer_name = row["dealer_name"]
+            event = row["event"]
+            event_time = dt.fromisoformat(row["ts"])
+
+            if event in ("start", "dealer_change"):
+                # Close the previous dealer's session on this table.
+                if open_event:
+                    old_id, old_name, session_start = open_event
+
+                    effective_start = max(session_start, period_start)
+                    effective_end = min(event_time, calculation_end)
+
+                    if effective_end > effective_start:
+                        totals[old_id]["dealer_name"] = old_name
+                        totals[old_id]["seconds"] += int(
+                            (effective_end - effective_start).total_seconds()
+                        )
+
+                # This dealer now becomes the active dealer.
+                open_event = (
+                    dealer_id,
+                    dealer_name,
+                    event_time,
+                )
+
+            elif event in ("close", "no_players", "crash"):
+                if open_event:
+                    old_id, old_name, session_start = open_event
+
+                    effective_start = max(session_start, period_start)
+                    effective_end = min(event_time, calculation_end)
+
+                    if effective_end > effective_start:
+                        totals[old_id]["dealer_name"] = old_name
+                        totals[old_id]["seconds"] += int(
+                            (effective_end - effective_start).total_seconds()
+                        )
+
+                    open_event = None
+
+        # If the dealer is still active at the end of the requested period,
+        # count the open portion up to the current time (never into the future).
+        if open_event:
+            old_id, old_name, session_start = open_event
+
+            effective_start = max(session_start, period_start)
+            effective_end = calculation_end
+
+            if effective_end > effective_start:
+                totals[old_id]["dealer_name"] = old_name
+                totals[old_id]["seconds"] += int(
+                    (effective_end - effective_start).total_seconds()
+                )
 
     return [
-        {'dealer_id': did, 'dealer_name': v['dealer_name'], 'minutes': round(v['seconds'] / 60, 1)}
-        for did, v in sorted(totals.items(), key=lambda x: -x[1]['seconds'])
+        {
+            "dealer_id": dealer_id,
+            "dealer_name": data["dealer_name"],
+            "minutes": round(data["seconds"] / 60, 1),
+        }
+        for dealer_id, data in sorted(
+            totals.items(),
+            key=lambda x: -x[1]["seconds"]
+        )
     ]

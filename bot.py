@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import traceback
 
 from poker.database import init_db, recover_chips_in_play, close_unclosed_dealer_sessions
-from uno.database import init_db as init_uno_db, recover_chips_in_play as recover_uno_chips_in_play
+from uno.database import init_db as init_uno_db
 from poker import database as db
 from uno import database as uno_db
 from poker.tutorial_db import init_db as init_tutorial_db
@@ -297,11 +297,11 @@ async def on_ready():
         for r in recovered:
             print(f"   {r['username']}: +{r['amount']} chips returned to wallet")
 
-    uno_recovered = await recover_uno_chips_in_play()
-    if uno_recovered:
-        print(f"⚠️  Recovered UNO chips for {len(uno_recovered)} player(s) after restart:")
-        for r in uno_recovered:
-            print(f"   {r['username']}: +{r['amount']} UNO chips returned to wallet")
+    uno_locked = await uno_db.get_total_chips_in_play()
+    if uno_locked:
+        print(f"⚠️  {uno_locked} UNO chip(s) still locked in chips_in_play after restart — "
+              f"NOT auto-refunded. Check each channel with an open UNO table: /uno resume "
+              f"first, or /unoadmin recoverchips once you've confirmed a game won't be resumed.")
 
     # tourney_recovered = await tournament_db.recover_chips_in_play()
     # if tourney_recovered:

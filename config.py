@@ -80,18 +80,19 @@ WIPE_TAX_RATE = 0.20  # 20%
 
 # ── UNO ECONOMY (separate wallets/db from poker — see uno/database.py) ──
 UNO_MIN_BET = 50
+UNO_WINNERS_TAX_RATE = 0.05
 UNO_WIPE_TAX_RATE = 0.20       # same tax rate poker uses
 UNO_INACTIVITY_DAYS = 2        # same grace window poker uses
 UNO_MIN_ROUNDS_PER_PERIOD = 2  # UNO rounds run longer than poker hands, so a lower bar than MIN_HANDS_PER_PERIOD
 UNO_MIN_CHIPS_WAGERED = 100    # a single min-bet round should count as activity
 
 # ── UNO SERVER & CHANNELS ── (TODO: fill in real IDs — 0/empty placeholders for now)
-UNO_CASHOUT_CHANNEL_ID = 0            # where /uno request_cashout tickets post, and where staff ✅-react to pay them
-UNO_INACTIVITY_CHANNEL_ID = 0         # daily UNO wipe summary posts here
-UNO_DONATION_CHANNELS = set()         # Dank Memer donation messages in these channels credit UNO chips instead of poker chips
-UNO_ADD_CHIPS_CHANNELS = set()        # restricts /unomgr addchips — empty set = unrestricted (same convention as poker's ADD_CHIPS_CHANNELS)
-UNO_REMOVE_CHIPS_CHANNELS = set()     # restricts /unomgr removechips
-UNO_PAYOUT_MANAGER_ROLE = 0           # role allowed to ✅-react and pay out UNO cashout tickets (poker's PAYOUT_MANAGER_ROLE equivalent)
+UNO_CASHOUT_CHANNEL_ID = 1535033665426297036
+UNO_INACTIVITY_CHANNEL_ID = 1535033665426297036
+UNO_DONATION_CHANNELS = {1535033665426297036}
+UNO_ADD_CHIPS_CHANNELS = {1535033665426297036}
+UNO_REMOVE_CHIPS_CHANNELS = {1535033665426297036}
+UNO_PAYOUT_MANAGER_ROLE = 1486591249434546260
 
 DEV_USER_IDS = (
     1339935869598961728, # baymax for backups
@@ -101,4 +102,5 @@ DEV_USER_IDS = (
 # ── CUSTOM EMOJIS ──
 POKER_CHIP_EMOJI = "<:tiltchip:1489665434847285340>"
 TOURNAMENT_CHIP_EMOJI = "<:tourney_chip:1508826107246415924>"
-UNO_CHIP_EMOJI = "<:uno_chip:0>"  # TODO: replace 0 with your uploaded UNO chip emoji's ID
+UNO_CHIP_EMOJI = "<:uno_chip_tilt:1543048212435435540>"
+PLACEMENT_EMOJI = {0: "<:uno_1:1536286536218443837>", 1: "<:uno_2:1536286641768108065>", 2: "<:uno_3:1536286708331446282>"}

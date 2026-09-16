@@ -593,6 +593,35 @@ class UnoConfirmResetView2(discord.ui.View):
             content=f"✅ UNO database wiped by **{interaction.user.display_name}**.", view=None)
 
 
+class UnoRecoverChipsView(discord.ui.View):
+    def __init__(self, admin_id: int):
+        super().__init__(timeout=60)
+        self.admin_id = admin_id
+
+    @discord.ui.button(label="Refund & Clear", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        recovered = await db.recover_chips_in_play()
+        if not recovered:
+            await interaction.edit_original_response(
+                content="✅ Nothing left to recover — someone beat you to it, or it resolved on its own.",
+                view=None)
+            return
+        lines = "\n".join(f"• **{r['username']}**: +{r['amount']}{config.UNO_CHIP_EMOJI}" for r in recovered[:20])
+        await interaction.edit_original_response(
+            content=f"✅ Refunded and cleared **{len(recovered)}** player(s):\n{lines}", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Not your button.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
 class RawSQLPaginationView(discord.ui.View):
     def __init__(self, columns: list, rows: list, title: str, items_per_page: int = 15, max_pages_limit: int = 20):
         super().__init__(timeout=300)
@@ -776,7 +805,7 @@ class BetModal(discord.ui.Modal, title="UNO — Place Your Bet"):
         self.balance = balance
         self.bet_input = discord.ui.TextInput(
             label="How many chips to bet?",
-            placeholder=f"min {session.min_bet}  (wallet: {balance} {config.UNO_CHIP_EMOJI})",
+            placeholder=f"min {session.min_bet}  (wallet: {balance})",
             min_length=1, max_length=8,
         )
         self.add_item(self.bet_input)
@@ -977,7 +1006,6 @@ class LobbyView(discord.ui.View):
             for pid, excess in self.session.engine.starting_refunds.items():
                 await db.return_chips(pid, excess)
                 await db.update_chips_in_play(pid, self.session.engine.bets[pid])
-                await db.log_currency_event(pid, "Cash In", excess, "Uncontested Buy-In Refund")
                 refund_lines.append(
                     f"<@{pid}> — **{excess}** {config.UNO_CHIP_EMOJI} refunded "
                     f"(no one else covered that much, bet trimmed to **{self.session.engine.bets[pid]}**)"
@@ -1965,12 +1993,55 @@ class UnoGame(commands.Cog):
         channel = self.bot.get_channel(session.channel_id)
         engine = session.engine
         session.cancel_timer()
+
+        if not channel or not engine:
+            self.sessions.pop(session.channel_id, None)
+            await asyncio.to_thread(self._delete_save, session.channel_id)
+            return
+
+        try:
+            net_lines, embed = await self._settle_round(session, channel, engine)
+        except Exception:
+            # Deliberately do NOT pop the session or delete the save file
+            # here — if settlement itself blew up (this is exactly how a
+            # bad config value like a mistyped tax rate surfaced before),
+            # the round's payouts never got recorded. Popping/deleting
+            # first (the old order) meant a crash here silently destroyed
+            # the only copy of that round's state with no way to recover
+            # or even retry — chips_in_play still shows who had what
+            # locked in, but the actual settlement has to be reconstructed
+            # by hand. Leaving everything in place at least preserves
+            # that evidence for /unoadmin recoverchips or a manual fix.
+            log.exception("UNO settlement failed for channel %s — session and save file were NOT cleared, "
+                           "so this needs manual attention", session.channel_id)
+            try:
+                await channel.send(
+                    "⚠️ Something went wrong finishing this round — settlement did not complete. "
+                    "No chips were silently lost: check the bot's console for the error, then use "
+                    "`/unoadmin recoverchips` once you've confirmed there's nothing left to salvage."
+                )
+            except discord.HTTPException:
+                pass
+            return
+
         self.sessions.pop(session.channel_id, None)
         await asyncio.to_thread(self._delete_save, session.channel_id)
 
-        if not channel or not engine:
+        if not engine.finishers:
+            await channel.send(
+                "Game ended — no one finished (not enough players remaining)."
+                + ("\n" + "\n".join(net_lines) if net_lines else "")
+            )
             return
 
+        await channel.send(embed=embed)
+
+    async def _settle_round(self, session: GameSession, channel, engine: ue.GameState):
+        """Does the actual payout/logging work for announce_and_cleanup,
+        split out so the caller can wrap it in one try/except without a
+        huge indented block. Returns (net_lines, embed) — embed may be
+        built even when engine.finishers is empty; the caller decides
+        whether to use it."""
         net_lines = []
         if engine.bets:
             # Every original bettor's buy-in is done being "in play" the
@@ -2015,10 +2086,10 @@ class UnoGame(commands.Cog):
                 credited = gross - tax
 
                 if credited > 0:
-                    await db.add_chips(
-                        self.bot.user.id, "UNO Pot", pid, name,
-                        credited, note="UNO pot win" if net > 0 else "UNO pot refund",
-                    )
+                    # credit_wallet, not add_chips — this is an automatic
+                    # game payout, not a staff action, so it shouldn't
+                    # write a chip_log entry (see credit_wallet's docstring).
+                    await db.credit_wallet(pid, name, credited)
                 await db.clear_chips_in_play(pid)
 
                 net_after_tax = net - tax
@@ -2044,7 +2115,7 @@ class UnoGame(commands.Cog):
                 net_lines.append(f"{_mention(pid)} **{sign}{net_after_tax}** {config.UNO_CHIP_EMOJI}")
 
             winner_pid = engine.finishers[0] if engine.finishers else None
-            await db.log_round(
+            round_id = await db.log_round(
                 engine.round_uuid, session.guild_id, session.channel_id, len(engine.bets), engine.num_decks,
                 sum(engine.bets.values()), total_tax, winner_pid,
                 engine.all_names.get(winner_pid) if winner_pid else None, round_players,
@@ -2052,7 +2123,7 @@ class UnoGame(commands.Cog):
             # Catch anything played since the last periodic flush so the
             # full turn-by-turn log is complete before the session (and
             # its engine, along with any unflushed events still sitting on
-            # it) gets torn down a few lines below.
+            # it) gets torn down by the caller.
             await db.log_turn_events_bulk(engine.pop_turn_events())
 
             settings = await db.get_settings(session.guild_id)
@@ -2060,31 +2131,25 @@ class UnoGame(commands.Cog):
             if log_channel_id:
                 log_channel = self.bot.get_channel(int(log_channel_id))
                 if log_channel:
+                    channel_name = getattr(channel, "name", str(session.channel_id))
+                    short_id = engine.round_uuid[:8]
+                    header = f"Round #{round_id} | Table: #{channel_name} ({short_id}) | Pot: {sum(engine.bets.values())} | Tax: {total_tax}"
                     rows = "\n".join(
-                        f"{p['username'][:14]:<14} bet:{p['bet']:<6} gross:{p['gross']:<6} "
-                        f"tax:{p['tax']:<4} net:{'+' if p['net'] >= 0 else ''}{p['net']}"
+                        f"  {p['username']} ({p['user_id']}): Bet: {p['bet']}  Net: {'+' if p['net'] >= 0 else ''}{p['net']}"
                         for p in round_players
                     )
+                    body = header + "\n" + rows
                     try:
-                        await log_channel.send(
-                            f"**UNO round** — #{getattr(channel, 'name', session.channel_id)} — "
-                            f"{len(round_players)}p, pot {sum(engine.bets.values())}{config.UNO_CHIP_EMOJI}, "
-                            f"tax {total_tax}\n```\n{rows}\n```"
-                        )
+                        await log_channel.send(f"```\n{body}\n```")
                     except discord.HTTPException:
                         pass
 
         if not engine.finishers:
-            await channel.send(
-                "Game ended — no one finished (not enough players remaining)."
-                + ("\n" + "\n".join(net_lines) if net_lines else "")
-            )
-            return
+            return net_lines, None
 
         winner_id = engine.finishers[0]
         embed = discord.Embed(
             title="<:uno_trophy:1536135332863676548> Game Over!",
-            description=f"<:uno_1:1536286536218443837> {_mention(winner_id)} takes the win!",
             color=discord.Color.gold(),
         )
 
@@ -2102,7 +2167,7 @@ class UnoGame(commands.Cog):
             embed.add_field(name="Net", value="\n".join(net_lines), inline=False)
 
         embed.set_footer(text=f"{len(engine.finishers)} finisher(s) • {engine.num_decks} deck(s)")
-        await channel.send(embed=embed)
+        return net_lines, embed
 
     # ---------------- shared action handlers (used by buttons AND slash commands) ----------------
 
@@ -3329,6 +3394,30 @@ class UnoGame(commands.Cog):
             for w in wiped[:20]
         )
         await interaction.followup.send(f"🧹 **Wiped {len(wiped)} inactive UNO player(s):**\n{summary}")
+
+    @unoadmin.command(name="recoverchips",
+                       description="[Admin] Manually refund + clear chips_in_play (only for tables that can't be resumed)")
+    async def recover_chips(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
+            return
+
+        detail = await db.get_chips_in_play_detail()
+        if not detail:
+            await interaction.response.send_message("✅ Nothing locked in chips_in_play right now.", ephemeral=True)
+            return
+
+        lines = "\n".join(f"• **{r['username']}**: {r['amount']}{config.UNO_CHIP_EMOJI}" for r in detail[:20])
+        active_channels = ", ".join(f"<#{cid}>" for cid, s in self.sessions.items() if s.started) or "none"
+        view = UnoRecoverChipsView(interaction.user.id)
+        await interaction.response.send_message(
+            f"⚠️ This refunds and clears **every** locked UNO bet below, all at once — there's no way to "
+            f"target one channel. **Check `/uno resume` works in every channel that should keep its game "
+            f"first** — running this on a table that gets resumed afterward double-credits whoever wins it.\n\n"
+            f"Currently active UNO tables in this server: {active_channels}\n\n"
+            f"**Will refund:**\n{lines}",
+            view=view, ephemeral=True,
+        )
 
     # ── Player-facing stats/leaderboard ─────────────────────────────────────
     # Note: poker's /poker leaderboard renders a PIL/Twemoji graphic

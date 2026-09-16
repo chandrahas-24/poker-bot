@@ -269,6 +269,34 @@ async def get_balance(user_id: int) -> int:
         return row[0] if row else 0
 
 
+async def credit_wallet(user_id: int, username: str, amount: int) -> int:
+    """Adds chips WITHOUT a chip_log entry — for automatic game payouts
+    (pot wins, uncontested-bet refunds), as opposed to add_chips() which
+    is for staff-attributed actions (admin_id/admin_name, /unomgr
+    addchips, the donation logger) and always writes one."""
+    db = await _get_db()
+    now = datetime.utcnow().isoformat()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO wallets (user_id, username, balance, last_activity, recent_rounds, recent_chips_wagered)
+            VALUES (?, ?, MAX(0, ?), ?, 0, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                last_activity = CASE WHEN balance < ? THEN ? ELSE COALESCE(wallets.last_activity, ?) END,
+                recent_rounds = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_rounds, 0) END,
+                recent_chips_wagered = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_chips_wagered, 0) END,
+                balance = MAX(0, balance + ?)
+        """, (user_id, username, amount, now,
+              config.UNO_MIN_BET, now, now,
+              config.UNO_MIN_BET,
+              config.UNO_MIN_BET,
+              amount))
+        await db.commit()
+        async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+            return row[0] if row else 0
+
+
 async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str,
                      amount: int, note: str = "") -> int:
     db = await _get_db()
@@ -638,6 +666,15 @@ async def clear_chips_in_play(user_id: int):
     async with _write_lock:
         await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (user_id,))
         await db.commit()
+
+
+async def get_chips_in_play_detail() -> list[dict]:
+    """Read-only preview of what recover_chips_in_play() would refund and
+    clear — used by /unoadmin recoverchips to show staff exactly who/what
+    before they confirm the (otherwise irreversible) action."""
+    db = await _get_db()
+    async with db.execute("SELECT * FROM chips_in_play") as c:
+        return [dict(r) for r in await c.fetchall()]
 
 
 async def recover_chips_in_play() -> list[dict]:

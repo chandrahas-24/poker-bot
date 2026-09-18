@@ -28,7 +28,7 @@ import dateparser
 
 from .leaderboard_image import generate_leaderboard_image
 from .jackpot_image import generate_jackpot_image
-from .net_chips_graph import get_history as get_net_chips_history, generate_net_chips_graph
+from .net_chips_graph import get_history as get_net_chips_history, generate_net_chips_graph, get_csv_last_updated
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -8157,6 +8157,13 @@ class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
                 discord.MediaGalleryItem("attachment://net_chips_graph.png")
             ),
         )
+
+        last_updated_ts = get_csv_last_updated()
+        if last_updated_ts:
+            container.add_item(
+                discord.ui.TextDisplay(f"-# Data last updated <t:{last_updated_ts}:R>")
+            )
+
         view = discord.ui.LayoutView()
         view.add_item(container)
 

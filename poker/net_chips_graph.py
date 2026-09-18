@@ -49,6 +49,18 @@ GREEN = "#2ECC71"
 RED = "#E74C3C"
 
 
+def get_csv_last_updated() -> int | None:
+    """
+    Returns the CSV's last-modified time as a unix epoch int, so the graph
+    can show how stale the (manually updated) data might be. None if the
+    file doesn't exist or can't be stat'd — never raises.
+    """
+    try:
+        return int(os.path.getmtime(CSV_PATH))
+    except OSError:
+        return None
+
+
 def get_history(user_id: int, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
     """
     Returns [{ts, net_chips}, ...] ordered by ts ascending, for `user_id`

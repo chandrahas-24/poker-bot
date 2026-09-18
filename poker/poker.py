@@ -28,6 +28,7 @@ import dateparser
 
 from .leaderboard_image import generate_leaderboard_image
 from .jackpot_image import generate_jackpot_image
+from .net_chips_graph import get_history as get_net_chips_history, generate_net_chips_graph
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -6382,7 +6383,7 @@ class PokerCog(commands.Cog):
         rank_str = f"#{rank}" if rank else "Unranked"
 
         # Fire up the interactive View!
-        view = StatsView(interaction.user, row, rank_str)
+        view = StatsView(interaction.user, row, rank_str, hidden)
         await interaction.followup.send(embed=view.build_basic_embed(), view=view, ephemeral=hidden)
 
     # ── Manager settings commands ─────────────────────────────────────────
@@ -8062,12 +8063,113 @@ class PokerCog(commands.Cog):
         await self.myactivity.callback(self, interaction)
 
 
+class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
+    start_input = discord.ui.TextInput(
+        label="Start (optional)",
+        placeholder="e.g. 2024-01-01, 'last week', 'yesterday' — blank = earliest",
+        required=False,
+        max_length=50,
+    )
+    end_input = discord.ui.TextInput(
+        label="End (optional)",
+        placeholder="e.g. today, '3 days ago' — blank = now",
+        required=False,
+        max_length=50,
+    )
+
+    def __init__(self, target_user: discord.User | discord.Member, display_name: str, hidden: bool):
+        super().__init__()
+        self.target_user = target_user
+        self.display_name = display_name
+        self.hidden = hidden
+
+    @staticmethod
+    def _parse(text: str):
+        return dateparser.parse(
+            text.strip(),
+            settings={
+                "TIMEZONE": "UTC",
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "PREFER_DATES_FROM": "past",
+            },
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=self.hidden)
+
+        start_dt = end_dt = None
+
+        if self.start_input.value.strip():
+            start_dt = self._parse(self.start_input.value)
+            if start_dt is None:
+                await interaction.followup.send(
+                    f"❌ Couldn't understand start date: `{self.start_input.value}`", ephemeral=True
+                )
+                return
+
+        if self.end_input.value.strip():
+            end_dt = self._parse(self.end_input.value)
+            if end_dt is None:
+                await interaction.followup.send(
+                    f"❌ Couldn't understand end date: `{self.end_input.value}`", ephemeral=True
+                )
+                return
+
+        if start_dt and end_dt and start_dt > end_dt:
+            await interaction.followup.send("❌ Start date is after end date.", ephemeral=True)
+            return
+
+        start_ts = int(start_dt.timestamp()) if start_dt else None
+        end_ts = int(end_dt.timestamp()) if end_dt else int(datetime.now(_tz.utc).timestamp())
+
+        history = await asyncio.to_thread(
+            get_net_chips_history, self.target_user.id, start_ts, end_ts
+        )
+
+        if len(history) < 2:
+            if len(history) == 1:
+                v = history[0]["net_chips"]
+                await interaction.followup.send(
+                    f"Only one data point in that range — net chips was "
+                    f"**{'+' if v >= 0 else ''}{v:,}** then. Not enough to graph a trend.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send("No data in that range yet.", ephemeral=True)
+            return
+
+        # CPU-bound rendering — keep it off the event loop.
+        try:
+            buf = await asyncio.to_thread(generate_net_chips_graph, self.display_name, history)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send(
+                "❌ Something went wrong rendering the graph. This didn't affect any game data — try again, "
+                "and if it keeps happening let an admin know.",
+                ephemeral=True,
+            )
+            return
+
+        file = discord.File(buf, filename="net_chips_graph.png")
+
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem("attachment://net_chips_graph.png")
+            ),
+        )
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+
+        await interaction.followup.send(file=file, view=view, ephemeral=self.hidden)
+
+
 class StatsView(discord.ui.View):
-    def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
+    def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str, hidden: bool = False):
         super().__init__(timeout=120)
         self.user = user
         self.row = row
         self.rank_str = rank_str
+        self.hidden = hidden
 
     def build_basic_embed(self) -> discord.Embed:
         net = self.row['net_chips']
@@ -8131,6 +8233,14 @@ class StatsView(discord.ui.View):
         self.btn_basic.disabled = False
         self.btn_highlights.disabled = True
         await interaction.response.edit_message(embed=self.build_highlights_embed(), view=self)
+
+    @discord.ui.button(label="Graph", style=discord.ButtonStyle.green)
+    async def btn_graph(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        await interaction.response.send_modal(
+            NetChipsGraphModal(self.user, self.row["username"], self.hidden)
+        )
 
 
 async def should_confirm_premove_all_in(t: TableState, user_id: int, move: dict) -> bool:

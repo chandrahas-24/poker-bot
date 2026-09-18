@@ -14,6 +14,7 @@ DB_PATH = BASE_DIR / "data" / "poker" / "poker.db"
 TOURNAMENT_DB_PATH = BASE_DIR / "data" / "tournament" / "tournament.db"
 TUTORIAL_DB_PATH = BASE_DIR / "data" / "tutorial" / "tutorial.db"
 EVENTLOG_DB_PATH = BASE_DIR / "data" / "eventlog" / "eventlog_database.db"
+NET_CHIPS_HISTORY_CSV_PATH = BASE_DIR / "historical_net_chips.csv"
 TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
 TOURNAMENT_STARTING_CHIPS = 5000
 

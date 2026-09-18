@@ -72,6 +72,21 @@ def parse_chips(value: str) -> int | None:
     except (ValueError, TypeError):
         return None
 
+
+def _as_id_set(value) -> set:
+    """Normalizes a config value that might be a single channel/role id or
+    a set/list/tuple of them into a plain set — CASHOUT_CHANNEL_ID and
+    similar became sets to support multiple channels, but most call sites
+    still treated them as a single id (get_channel(a_set) throws, and
+    `!=`/`==` against a set never matches an int). Same helper as bot.py's,
+    duplicated locally since poker.py is imported BY bot.py as a cog, not
+    the other way around."""
+    if not value:
+        return set()
+    if isinstance(value, (set, frozenset, list, tuple)):
+        return set(value)
+    return {value}
+
 DATE_FORMAT = "%Y-%m-%d"
 
 def parse_date(value: str) -> date:
@@ -6842,16 +6857,17 @@ class PokerCog(commands.Cog):
         await db.log_currency_event(interaction.user.id, "Cash Out", -chips, desc)
 
         if config.CASHOUT_CHANNEL_ID:
-            try:
-                ch = interaction.guild.get_channel(config.CASHOUT_CHANNEL_ID)
-                if ch:
-                    ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1490458259855773707>"
-                    if note: ticket_msg += f"\n**Notes:** {note}"
-                    await ch.send(ticket_msg)
-            except Exception as e:
-                print(f"🚨 [ERROR] {e}")
-                import traceback
-                traceback.print_exc()
+            for channel_id in _as_id_set(config.CASHOUT_CHANNEL_ID):
+                try:
+                    ch = interaction.guild.get_channel(channel_id)
+                    if ch:
+                        ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1490458259855773707>"
+                        if note: ticket_msg += f"\n**Notes:** {note}"
+                        await ch.send(ticket_msg)
+                except Exception as e:
+                    print(f"🚨 [ERROR] {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # FIXED: Send the final receipt ephemerally
         await interaction.followup.send(
@@ -6868,8 +6884,10 @@ class PokerCog(commands.Cog):
             return
 
         if config.CASHOUT_CHANNEL_ID:
-            if interaction.channel_id != config.CASHOUT_CHANNEL_ID:
-                await interaction.followup.send(f"❌ This command can only be used in <#{config.CASHOUT_CHANNEL_ID}>.",
+            allowed_channels = _as_id_set(config.CASHOUT_CHANNEL_ID)
+            if interaction.channel_id not in allowed_channels:
+                mentions = " or ".join(f"<#{cid}>" for cid in allowed_channels)
+                await interaction.followup.send(f"❌ This command can only be used in {mentions}.",
                                                 ephemeral=True)
                 return
 

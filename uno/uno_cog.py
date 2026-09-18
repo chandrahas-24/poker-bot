@@ -2557,7 +2557,7 @@ class UnoGame(commands.Cog):
 
     # ---------------- commands ----------------
 
-    @uno.command(name="start", description="Start a new UNO lobby in this channel")
+    @uno.command(name="open", description="Open a new UNO lobby in this channel")
     async def start(self, interaction: discord.Interaction):
         # Guards the check-then-insert below — without this, two /uno start
         # calls landing in the same channel within the same event-loop tick
@@ -3584,13 +3584,11 @@ class UnoGame(commands.Cog):
                     if note:
                         ticket_msg += f"\n**Notes:** {note}"
                     ticket = await ch.send(ticket_msg)
-                    await ticket.add_reaction("✅")
             except Exception:
                 log.exception("Failed to post UNO cashout ticket")
 
         await interaction.followup.send(
-            f"✅ Locked **{chips}** {config.UNO_CHIP_EMOJI} for cashout. Staff have been notified — "
-            f"react ✅ on the ticket to mark it paid.", ephemeral=True)
+            f"✅ Locked **{chips}** {config.UNO_CHIP_EMOJI} for cashout. Staff have been notified""", ephemeral=True)
 
     @uno.command(name="currencylog", description="View recent UNO chip transactions")
     @app_commands.describe(user="Player to check (managers only, leave blank for yourself)",

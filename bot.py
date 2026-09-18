@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import traceback
 
 from poker.database import init_db, recover_chips_in_play, close_unclosed_dealer_sessions
+from poker.poker import _as_id_set
 from uno.database import init_db as init_uno_db
 from poker import database as db
 from uno import database as uno_db
@@ -18,6 +19,8 @@ import config
 import re
 
 load_dotenv()
+
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -143,8 +146,7 @@ async def daily_inactive_wipe():
 
         # ── Step 4: Channel summary ──────────────────────────────────────────
         if wiped:
-            channel_id = config.INACTIVITY_CHANNEL_ID
-            if channel_id:
+            for channel_id in _as_id_set(config.INACTIVITY_CHANNEL_ID):
                 try:
                     channel = await bot.fetch_channel(channel_id)
                     tax_total = sum(w["tax_amount"] for w in wiped)
@@ -166,9 +168,9 @@ async def daily_inactive_wipe():
                     traceback.print_exc()
 
             # ── Step 5: Staff Cashout Tickets ────────────────────────────────
-            if hasattr(config, "CASHOUT_CHANNEL_ID") and config.CASHOUT_CHANNEL_ID:
+            for cashout_channel_id in _as_id_set(getattr(config, "CASHOUT_CHANNEL_ID", None)):
                 try:
-                    cashout_channel = await bot.fetch_channel(config.CASHOUT_CHANNEL_ID)
+                    cashout_channel = await bot.fetch_channel(cashout_channel_id)
                     for w in wiped:
                         if w.get('cashout_amount', 0) > 0:
                             ticket_msg = (
@@ -478,32 +480,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == bot.user.id:
         return
 
-    # 2. Restrict to a Cashout channel (poker or UNO)
-    is_uno = payload.channel_id == getattr(config, "UNO_CASHOUT_CHANNEL_ID", 0) and config.UNO_CASHOUT_CHANNEL_ID
-    if payload.channel_id != getattr(config, "CASHOUT_CHANNEL_ID", 0) and not is_uno:
+    # 2. Restrict to a cashout channel — poker's and UNO's may be the same
+    # channel, different channels, or (for poker) a set of several; either
+    # way this is just "is it worth looking at all", not which economy.
+    poker_channels = _as_id_set(getattr(config, "CASHOUT_CHANNEL_ID", None))
+    uno_channels = _as_id_set(getattr(config, "UNO_CASHOUT_CHANNEL_ID", None))
+    if payload.channel_id not in poker_channels and payload.channel_id not in uno_channels:
         return
-    target_db = uno_db if is_uno else db
 
     # 3. Trigger on standard ✅ OR any custom emoji with "check" or "tick" in the name
     emoji_name = str(payload.emoji.name).lower()
     if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name != "✅":
         return
-
-    # 4. Security Check: Must be Admin, Dev, or Payout Manager
-    settings = await db.get_settings(payload.guild_id)
-    payout_manager_role_id = config.PAYOUT_MANAGER_ROLE
-
-    is_admin = payload.member.guild_permissions.administrator
-    is_dev = payload.user_id in config.DEV_USER_IDS
-    is_payout_manager = False
-
-    if payout_manager_role_id:
-        role = payload.member.guild.get_role(int(payout_manager_role_id))
-        if role and role in payload.member.roles:
-            is_payout_manager = True
-
-    if not (is_admin or is_dev or is_payout_manager):
-        return  # Unauthorized person reacted, ignore silently
 
     # ── Concurrency Check ─────────────────────────────────────────────────────
     if payload.message_id in _processing_cashouts:
@@ -511,7 +499,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     _processing_cashouts.add(payload.message_id)
 
     try:
-        # 5. Fetch the actual message from Discord
+        # 4. Fetch the actual message from Discord
         channel = bot.get_channel(payload.channel_id)
         if not channel:
             return
@@ -520,11 +508,40 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         except discord.NotFound:
             return
 
-        # 6. Ensure we don't double-pay a ticket that's already processed
+        # 5. Ensure we don't double-pay a ticket that's already processed
         if "**PAID**" in message.content:
             return
 
-        # 7. Extract the User ID and Amount from the ticket format (same
+        # 6. Which economy this ticket belongs to has to come from the
+        # message itself, not the channel, now that both can post to the
+        # same one — /uno request_cashout always embeds
+        # config.UNO_CHIP_EMOJI verbatim in its ticket text; anything
+        # posted to a cashout channel without it is a poker ticket. This
+        # works whether the two channels are configured the same or
+        # different — channel identity was never a reliable enough signal
+        # once they can overlap.
+        is_uno = config.UNO_CHIP_EMOJI in message.content
+        target_db = uno_db if is_uno else db
+
+        # 7. Security Check: Admin/Dev always allowed; otherwise gated by
+        # that economy's own payout-manager role specifically — a poker
+        # payout manager reacting to a UNO ticket (or vice versa) doesn't
+        # count, same as if the channels were still separate.
+        payout_manager_role_id = config.UNO_PAYOUT_MANAGER_ROLE if is_uno else config.PAYOUT_MANAGER_ROLE
+
+        is_admin = payload.member.guild_permissions.administrator
+        is_dev = payload.user_id in config.DEV_USER_IDS
+        is_payout_manager = False
+
+        if payout_manager_role_id:
+            role = payload.member.guild.get_role(int(payout_manager_role_id))
+            if role and role in payload.member.roles:
+                is_payout_manager = True
+
+        if not (is_admin or is_dev or is_payout_manager):
+            return  # Unauthorized person reacted, ignore silently
+
+        # 8. Extract the User ID and Amount from the ticket format (same
         # shape for poker and UNO — /uno request_cashout posts identically)
         user_match = re.search(r"\*\*Username:\*\* <@!?(\d+)>", message.content)
         amount_match = re.search(r"\*\*Amount:\*\* ([\d,]+)", message.content)
@@ -535,7 +552,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         target_user_id = int(user_match.group(1))
         amount = int(amount_match.group(1).replace(",", ""))
 
-        # 8. Attempt to process the payment in the database
+        # 9. Attempt to process the payment in the database
         ok = await target_db.pay_cashout(target_user_id, amount)
         if not ok:
             await channel.send(
@@ -545,7 +562,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             )
             return
 
-        # 9. Update the ticket visually so staff know it's done
+        # 10. Update the ticket visually so staff know it's done
         new_content = message.content + f"\n\n-# **PAID** by <@{payload.user_id}>"
         await message.edit(content=new_content)
     finally:

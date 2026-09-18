@@ -14,6 +14,7 @@ DB_PATH = BASE_DIR / "data" / "poker" / "poker.db"
 TOURNAMENT_DB_PATH = BASE_DIR / "data" / "tournament" / "tournament.db"
 TUTORIAL_DB_PATH = BASE_DIR / "data" / "tutorial" / "tutorial.db"
 EVENTLOG_DB_PATH = BASE_DIR / "data" / "eventlog" / "eventlog_database.db"
+NET_CHIPS_HISTORY_CSV_PATH = BASE_DIR / "historical_net_chips.csv"
 UNO_DB_PATH = BASE_DIR / "data" / "uno" / "uno.db"
 TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
 TOURNAMENT_STARTING_CHIPS = 5000
@@ -31,7 +32,6 @@ LOCKDOWN_CHANNELS = [799685122701000754]
 RESTRICTED_CHANNELS = {
     1508645866712465479: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table"],  #allowed exceptions
     1513018821982814270: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table"],
-    1485495899722354809: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table", "poker wallet", "pokeradmin revenue", "pokeradmin salt", "pokeradmin adjustrevenue", "poker titles", "poker equipborder", "poker equiptitle", "poker equipwinmsg", "pokerset preferences"],
 }
 
 # ── ECONOMY & TAX ──
@@ -52,7 +52,7 @@ TOURNAMENT_REJOIN_COOLDOWN = 120
 
 # ── AFK / DECISION TIMEOUT ──
 LARGE_POT_THRESHOLD   = 1000
-LARGE_POT_EXTRA_TIME  = 30
+LARGE_POT_EXTRA_TIME  = 15
 DAILY_AFK_LIMIT        = 5
 CONSECUTIVE_AFK_LIMIT  = 2
 
@@ -72,9 +72,6 @@ DEFAULT_SMALL_BLIND = 25
 DEFAULT_BIG_BLIND = 50
 DEFAULT_MIN_BUYIN = 50
 
-EGIRL_SARO_CHANCE = 0.0001
-HIGH_TABLE_SATURDAY_EGIRL_CHANCE = 0.0001625
-
 # ── INACTIVITY WIPE TAX ──
 WIPE_TAX_RATE = 0.20  # 20%
 
@@ -87,7 +84,7 @@ UNO_MIN_ROUNDS_PER_PERIOD = 2  # UNO rounds run longer than poker hands, so a lo
 UNO_MIN_CHIPS_WAGERED = 100    # a single min-bet round should count as activity
 
 # ── UNO SERVER & CHANNELS ── (TODO: fill in real IDs — 0/empty placeholders for now)
-UNO_CASHOUT_CHANNEL_ID = 1535033665426297036
+UNO_CASHOUT_CHANNEL_ID = 1485495899722354809
 UNO_INACTIVITY_CHANNEL_ID = 1535033665426297036
 UNO_DONATION_CHANNELS = {1535033665426297036}
 UNO_ADD_CHIPS_CHANNELS = {1535033665426297036}

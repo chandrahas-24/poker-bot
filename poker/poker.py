@@ -8087,10 +8087,11 @@ class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
     def _parse(text: str):
         return dateparser.parse(
             text.strip(),
-            settings={
+            settings={  # type: ignore
                 "TIMEZONE": "UTC",
                 "RETURN_AS_TIMEZONE_AWARE": True,
                 "PREFER_DATES_FROM": "past",
+                "RELATIVE_BASE": datetime.now(_tz.utc).replace(tzinfo=None),
             },
         )
 

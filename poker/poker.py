@@ -81,6 +81,9 @@ def parse_date(value: str) -> date:
         settings={
             "PREFER_DATES_FROM": "past",
             "DATE_ORDER": "YMD",
+            "TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "RELATIVE_BASE": datetime.now(_tz.utc).replace(tzinfo=None),
         },
     )
 
@@ -110,7 +113,7 @@ async def date_autocomplete(
 
     # Last 14 days through today
     for i in range(14, -1, -1):
-        d = date.today() - timedelta(days=i)
+        d = datetime.now(_tz.utc).date() - timedelta(days=i)
         s = d.strftime(DATE_FORMAT)
 
         if current in s:
@@ -7984,7 +7987,7 @@ class PokerCog(commands.Cog):
             if end:
                 end = parse_date(end).strftime(DATE_FORMAT)
             else:
-                end = date.today().strftime(DATE_FORMAT)
+                end = datetime.now(_tz.utc).date().strftime(DATE_FORMAT)
 
         except ValueError:
             await interaction.followup.send(
@@ -8107,6 +8110,7 @@ class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
                     f"❌ Couldn't understand start date: `{self.start_input.value}`", ephemeral=True
                 )
                 return
+            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
         if self.end_input.value.strip():
             end_dt = self._parse(self.end_input.value)
@@ -8115,6 +8119,7 @@ class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
                     f"❌ Couldn't understand end date: `{self.end_input.value}`", ephemeral=True
                 )
                 return
+            end_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - timedelta(seconds=1)
 
         if start_dt and end_dt and start_dt > end_dt:
             await interaction.followup.send("❌ Start date is after end date.", ephemeral=True)

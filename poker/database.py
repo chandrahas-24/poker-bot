@@ -390,6 +390,7 @@ async def init_db():
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
+        await _ensure_top_net(locked=True)
 
 
 # ── Guild settings ────────────────────────────────────────────────────────────
@@ -1807,6 +1808,119 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
             # Remove from in-memory catalog if database save failed
             del catalog[cosmetic_id]
             return False
+
+
+# ── #1 Net title (top_net) ────────────────────────────────────────────────────
+# One title id whose *owner* follows the net-chips leaderboard and whose
+# *display text* the current owner can rewrite. State lives in top_net_state.
+TOP_NET_ID = "top_net"
+TOP_NET_MAX_LEN = 40
+_top_net_ready = False
+_top_net_holder: int | None = None  # in-process cache so sync UI builders can gate on it
+
+async def _ensure_top_net(locked: bool = False):
+    global _top_net_ready
+    if _top_net_ready:
+        return
+    db = await _get_db()
+    ddl = """
+        CREATE TABLE IF NOT EXISTS top_net_state (
+            id             INTEGER PRIMARY KEY CHECK (id = 1),
+            holder_id      INTEGER,
+            custom_display TEXT
+        )
+    """
+    if locked:
+        await db.execute(ddl)
+        await db.commit()
+    else:
+        async with _write_lock:
+            await db.execute(ddl)
+            await db.commit()
+    async with db.execute("SELECT custom_display FROM top_net_state WHERE id=1") as c:
+        row = await c.fetchone()
+    if row and row[0] and TOP_NET_ID in TITLES:
+        TITLES[TOP_NET_ID]["display"] = row[0]
+    _top_net_ready = True
+
+
+def sanitize_top_net_display(raw: str) -> str | None:
+    """Collapse whitespace, reject mentions/markdown-breakers/overlong text. None = invalid."""
+    s = " ".join((raw or "").split())
+    if not s or len(s) > TOP_NET_MAX_LEN:
+        return None
+    if any(ch in s for ch in ("@", "`")):
+        return None
+    return s
+
+
+async def get_top_net_holder() -> int | None:
+    """Authoritative read (also refreshes the sync cache)."""
+    global _top_net_holder
+    await _ensure_top_net()
+    db = await _get_db()
+    async with db.execute("SELECT holder_id FROM top_net_state WHERE id=1") as c:
+        row = await c.fetchone()
+    _top_net_holder = row[0] if row else None
+    return _top_net_holder
+
+
+def top_net_holder_cached() -> int | None:
+    return _top_net_holder
+
+
+async def get_player_net(user_id: int) -> int | None:
+    """Net chips for a player, or None if they have no stats row (e.g. removed from the leaderboard)."""
+    db = await _get_db()
+    async with db.execute("SELECT chips_won - chips_lost FROM stats WHERE user_id=?", (user_id,)) as c:
+        row = await c.fetchone()
+    return row[0] if row else None
+
+
+async def transfer_top_net(new_holder_id: int) -> int | None:
+    """Give top_net to new_holder_id and strip it (owned + equipped) from everyone else. Returns previous holder id."""
+    await _ensure_top_net()
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT holder_id FROM top_net_state WHERE id=1") as c:
+            row = await c.fetchone()
+        prev = row[0] if row else None
+        await db.execute("""
+            UPDATE player_cosmetics
+            SET unlocked_titles = COALESCE((SELECT json_group_array(value) FROM json_each(unlocked_titles)
+                                            WHERE value != ?), '[]'),
+                active_title    = CASE WHEN active_title = ? THEN NULL ELSE active_title END
+            WHERE user_id != ?
+              AND (active_title = ?
+                   OR EXISTS (SELECT 1 FROM json_each(unlocked_titles) WHERE value = ?))
+        """, (TOP_NET_ID, TOP_NET_ID, new_holder_id, TOP_NET_ID, TOP_NET_ID))
+        await db.execute("""
+            INSERT INTO top_net_state (id, holder_id) VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET holder_id = excluded.holder_id
+        """, (new_holder_id,))
+        await db.commit()
+    global _top_net_holder
+    _top_net_holder = new_holder_id
+    await unlock_cosmetic(new_holder_id, "title", TOP_NET_ID)  # takes _write_lock itself — must be outside
+    return prev
+
+
+async def set_top_net_display(user_id: int, raw: str) -> str | None:
+    """Rename the title. Only the current holder may. Returns the saved text, or None if rejected."""
+    await _ensure_top_net()
+    text = sanitize_top_net_display(raw)
+    if text is None or TOP_NET_ID not in TITLES:
+        return None
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT holder_id FROM top_net_state WHERE id=1") as c:
+            row = await c.fetchone()
+        if not row or row[0] != user_id:
+            return None
+        await db.execute("UPDATE top_net_state SET custom_display=? WHERE id=1", (text,))
+        await db.commit()
+    TITLES[TOP_NET_ID]["display"] = text
+    return text
 
 
 async def load_custom_cosmetics():

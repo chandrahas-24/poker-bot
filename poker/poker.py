@@ -2279,6 +2279,33 @@ async def _handle_shiny_cards(channel, t: TableState):
     t.game.shiny_holders.clear()
 
 
+
+_top_net_lock = asyncio.Lock()
+
+
+async def _check_top_net() -> str | None:
+    """Called at end of hand. If someone new is #1 on net chips, move the top_net title to them.
+    Returns an announcement string, or None. Ties never dethrone the incumbent."""
+    async with _top_net_lock:
+        rows = await db.get_leaderboard(1)
+        if not rows:
+            return None
+        top = rows[0]
+        holder = await db.get_top_net_holder()
+        if holder == top["user_id"]:
+            return None
+        if holder is not None:
+            cur = await db.get_player_net(holder)
+            if cur is not None and cur >= top["net_chips"]:
+                return None
+        prev = await db.transfer_top_net(top["user_id"])
+        display = db.TITLES.get(db.TOP_NET_ID, {}).get("display", db.TOP_NET_ID)
+        msg = f"👑 <@{top['user_id']}> is now **#1 on the net leaderboard** and claims the **{display}** title"
+        if prev and prev != top["user_id"]:
+            msg += f", taking it from <@{prev}>"
+        return msg + "!\nUse `/poker titles` → **Rename #1 Title** to make it your own."
+
+
 async def _process_result(guild, channel, t: TableState):
     result = t.game._hand_result
     if not result:
@@ -2413,6 +2440,15 @@ async def _process_result(guild, channel, t: TableState):
                 icon = {"title": "🎖", "winmsg": "💬", "border": "🖼", "skin": "🎨"}.get(kind, "🎁")
                 lines.append(f"  {icon} **{display}** *{rarity}*")
             achievement_announces.append("\n".join(lines))
+
+        # ── #1 net title handover ─────────────────────────────────────────────
+        try:
+            top_msg = await _check_top_net()
+            if top_msg:
+                achievement_announces.append(top_msg)
+        except Exception as e:
+            print(f"[poker] top_net check error: {e}")
+            traceback.print_exc()
 
         # ── Jackpot split payout ──────────────────────────────────────────────
         folded_ids = getattr(result, "folded_ids", set())
@@ -5253,7 +5289,15 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 if info["display"].startswith("<")
                 else f"`{info['display']}`"
             )
-            if tid in owned_titles:
+            if tid == db.TOP_NET_ID:
+                holder = db.top_net_holder_cached()
+                if holder == user_id:
+                    equipped = "  ◀ **equipped**" if tid == active_t else ""
+                    t_lines.append(f"👑 {display_str} — #1 on lb {equipped}")
+                else:
+                    who = f"<@{holder}>" if holder else "nobody yet"
+                    t_lines.append(f"🔒 {display_str} — *Be #1 on the lb. Held by {who}*")
+            elif tid in owned_titles:
                 equipped = "  ◀ **equipped**" if tid == active_t else ""
                 desc = f" — *{info['description']}*" if info.get('description') else ""
                 t_lines.append(f"✅ {display_str}{desc}{equipped}")
@@ -5325,6 +5369,24 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
         embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
     view = CosmeticsView(user_id, owned_titles, owned_msgs, owned_skins, active_t, active_m, active_sk, page)
     return embed, view
+
+class TopNetTitleModal(discord.ui.Modal, title="Rename #1 Title"):
+    text = discord.ui.TextInput(label="Title text", min_length=1, max_length=db.TOP_NET_MAX_LEN,
+                                placeholder="water bottle")
+
+    def __init__(self):
+        super().__init__()
+        self.text.default = db.TITLES.get(db.TOP_NET_ID, {}).get("display", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        saved = await db.set_top_net_display(interaction.user.id, self.text.value)
+        if saved is None:
+            await interaction.response.send_message(
+                f"❌ Couldn't save. You must be #1, the text can't contain @ or backticks, "
+                f"and it must be ≤ {db.TOP_NET_MAX_LEN} chars.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"✅ #1 title is now **{saved}**.", ephemeral=True)
+
 
 class CosmeticsView(discord.ui.View):
     """Attach Select menus and a page toggle button to /poker titles."""
@@ -5409,6 +5471,19 @@ class CosmeticsView(discord.ui.View):
             switch_btn.callback = self._make_switch_callback(target_page)
             self.add_item(switch_btn)
 
+        if self.page == "titles" and db.top_net_holder_cached() == user_id:
+            rename_btn = discord.ui.Button(label="Rename #1 Title", style=discord.ButtonStyle.success,
+                                           row=2, emoji="✏️")
+            rename_btn.callback = self._on_rename_top_net
+            self.add_item(rename_btn)
+
+    async def _on_rename_top_net(self, interaction: discord.Interaction):
+        if not await self._guard(interaction): return
+        if await db.get_top_net_holder() != self.user_id:
+            await interaction.response.send_message("❌ You're no longer #1 — the title has moved on.", ephemeral=True)
+            return
+        await interaction.response.send_modal(TopNetTitleModal())
+
     def _make_switch_callback(self, target_page: str):
         async def _callback(interaction: discord.Interaction):
             await self._on_switch(interaction, target_page)
@@ -5423,6 +5498,7 @@ class CosmeticsView(discord.ui.View):
     async def _on_switch(self, interaction: discord.Interaction, target_page: str):
         if not await self._guard(interaction): return
         cosmetics = await db.get_cosmetics(self.user_id)
+        await db.get_top_net_holder()
         embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=target_page)
         new_view.message = self.message
         await interaction.response.edit_message(embed=embed, view=new_view)
@@ -5433,6 +5509,7 @@ class CosmeticsView(discord.ui.View):
         tid = None if chosen == "none" else chosen
         await db.set_active_title(self.user_id, tid)
         cosmetics = await db.get_cosmetics(self.user_id)
+        await db.get_top_net_holder()
         embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
         new_view.message = self.message
         label = db.TITLES[tid]["display"] if tid else "removed"
@@ -5446,6 +5523,7 @@ class CosmeticsView(discord.ui.View):
         mid = None if chosen == "none" else chosen
         await db.set_active_win_msg(self.user_id, mid)
         cosmetics = await db.get_cosmetics(self.user_id)
+        await db.get_top_net_holder()
         embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
         new_view.message = self.message
         label = db.WIN_MESSAGES[mid]["display"] if mid else "removed"
@@ -7445,6 +7523,7 @@ class PokerCog(commands.Cog):
     async def titles_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         cosmetics = await db.get_cosmetics(interaction.user.id)
+        await db.get_top_net_holder()
         embed, view = _build_cosmetics_embed_and_view(interaction.user.id, cosmetics)
         view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 

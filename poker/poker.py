@@ -6094,7 +6094,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)",
                            reason="Reason for the ban", duration="Ban length, e.g. 7d, 12h, 2w (leave blank for permanent)")
-    async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None,
+    async def ban(self, interaction: discord.Interaction, user: discord.User, table_name: str = None,
                  reason: str = None, duration: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
@@ -6212,7 +6212,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
-    async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
+    async def unban(self, interaction: discord.Interaction, user: discord.User, table_name: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
@@ -6301,7 +6301,7 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="wallet", description="Check your chip wallet balance")
     @app_commands.describe(user="Player to check (leave blank for yourself)")
-    async def wallet(self, interaction: discord.Interaction, user: discord.Member = None):
+    async def wallet(self, interaction: discord.Interaction, user: discord.User = None):
         await interaction.response.defer(ephemeral=False)
         target = user or interaction.user
         bal, pending = await db.get_wallet(target.id)
@@ -6458,7 +6458,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")
-    async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
+    async def remove_stats(self, interaction: discord.Interaction, user: discord.User):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True);
@@ -6489,7 +6489,7 @@ class PokerCog(commands.Cog):
     # ── Manager settings commands ─────────────────────────────────────────
     @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
-    async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+    async def mgr_addchips(self, interaction: discord.Interaction, user: discord.User, amount: int, note: str = ""):
         await interaction.response.defer(ephemeral=False)
 
         if not await is_manager(interaction):
@@ -6517,7 +6517,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
-    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int,
+    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.User, amount: int,
                               note: str = ""):
         await interaction.response.defer(ephemeral=False)
 
@@ -6962,7 +6962,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="pay_cashout", description="[Manager] Deduct paid chips from pending and send receipt")
     @app_commands.describe(user="Player who was paid", amount="Amount of chips paid")
-    async def pay_cashout(self, interaction: discord.Interaction, user: discord.Member, amount: int):
+    async def pay_cashout(self, interaction: discord.Interaction, user: discord.User, amount: int):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
@@ -7625,7 +7625,7 @@ class PokerCog(commands.Cog):
         app_commands.Choice(name="Card Skin", value="skin"),
     ])
     @app_commands.autocomplete(cosmetic_id=_autocomplete_grant_cosmetic)
-    async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.Member, kind: str, cosmetic_id: str):
+    async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.User, kind: str, cosmetic_id: str):
         if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
@@ -7826,7 +7826,7 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="currencylog", description="View recent chip transactions")
     @app_commands.describe(minimum="Only show transactions with this many chips or more", user="Player to check (Admins/Devs only, leave blank for yourself)")
-    async def currencylog(self, interaction: discord.Interaction, user: discord.Member = None, minimum: int = None):
+    async def currencylog(self, interaction: discord.Interaction, user: discord.User = None, minimum: int = None):
         target = user or interaction.user
 
         # 🚨 Permission Check
@@ -7923,7 +7923,7 @@ class PokerCog(commands.Cog):
         app_commands.Choice(name="Royal Flush Wins", value="royal_flush_wins"),
         app_commands.Choice(name="Times Wiped (Inactivity)", value="times_wiped"),
     ])
-    async def setstat(self, interaction: discord.Interaction, user: discord.Member, stat: app_commands.Choice[str],
+    async def setstat(self, interaction: discord.Interaction, user: discord.User, stat: app_commands.Choice[str],
                       value: int):
         # 1. Security Check
         if interaction.user.id not in config.DEV_USER_IDS:

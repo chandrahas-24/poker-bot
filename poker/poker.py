@@ -1459,11 +1459,30 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
     await refresh(channel, t)
     return "✅ You left the table."
 
+def build_disclaimer_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="⚠️ Before you play",
+        description=(
+            "This table uses **DMC chips only** remember it's just pixels nothing here has real-world value.\n\n"
+            "If gambling (real or simulated) is a problem for you, help is available, 24/7:\n"
+            "National Problem Gambling Helpline: 1-800-522-4700\n"
+            "**[gamblingtherapy.org](https://www.gamblingtherapy.org)**: free, international, multilingual"
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="Run /responsible-gambling anytime to see this again")
+    return embed
+
+
 async def join_table_execute(interaction: discord.Interaction, t: TableState, chips: int, bal: int, rejoin_fee: int, min_w: int, max_w: int, is_deferred: bool = False):
     if not is_deferred:
         await interaction.response.defer(ephemeral=True)
 
     await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
+
+    if not await db.has_seen_disclaimer(interaction.user.id):
+        await interaction.followup.send(embed=build_disclaimer_embed(), ephemeral=True)
+        await db.mark_disclaimer_seen(interaction.user.id)
 
     if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
         await interaction.followup.send("❌ You are banned from this table.", ephemeral=True)
@@ -8123,6 +8142,12 @@ class PokerCog(commands.Cog):
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def user_jackpot(self, interaction: discord.Interaction):
         await self.jackpot_cmd.callback(self, interaction)
+
+    @app_commands.command(name="responsible-gambling", description="Gambling disclaimer and helpline")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def responsible_gaming(self, interaction: discord.Interaction):
+        await interaction.response.send_message(embed=build_disclaimer_embed(), ephemeral=True)
 
     @app_commands.command(name="drawcards", description="Draw cards from a 52 card deck.")
     @app_commands.allowed_installs(guilds=True, users=True)

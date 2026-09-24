@@ -387,6 +387,14 @@ async def init_db():
             )
         """)
 
+        # ── Responsible-gaming disclaimer: fire-once tracking per user ────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS disclaimer_seen (
+                user_id INTEGER PRIMARY KEY,
+                seen_at TEXT NOT NULL
+            )
+        """)
+
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
@@ -840,6 +848,24 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
             )
         await db.commit()
         return count
+
+
+async def has_seen_disclaimer(user_id: int) -> bool:
+    db = await _get_db()
+    async with db.execute(
+            "SELECT 1 FROM disclaimer_seen WHERE user_id=?", (user_id,)
+    ) as c:
+        return await c.fetchone() is not None
+
+
+async def mark_disclaimer_seen(user_id: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute(
+            "INSERT OR IGNORE INTO disclaimer_seen (user_id, seen_at) VALUES (?, ?)",
+            (user_id, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+        )
+        await db.commit()
 
 
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:

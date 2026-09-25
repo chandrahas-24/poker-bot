@@ -213,6 +213,7 @@ async def on_ready():
     #         print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
 
     await bot.load_extension("poker.poker")
+    await bot.load_extension("poker.tax_experiment")
     await bot.load_extension("poker.tutorial_cog")
     await bot.load_extension("eventlog.eventlog")
     await bot.load_extension("poker.pokerai")
@@ -540,7 +541,7 @@ async def reload(ctx, cog_name: str = None):
 
     if cog_name is None:
         helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
-        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "highlight"]
+        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "highlight", "poker.tax_experiment"]
     else:
         # Comma-separated list of targets — aliases, dotted helper modules, or cogs, any mix.
         for token in [t.strip() for t in cog_name.split(",") if t.strip()]:

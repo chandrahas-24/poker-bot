@@ -1686,6 +1686,10 @@ class PokerGame:
 
         res.folded_ids = {p.user_id for p in self.players if p.folded}
         res.vpip_ids = {p.user_id for p in self.players if getattr(p, 'vpip', False)}  # 🛠️ Exported
+        # Tax experiment (shadow only): "no flop no drop" — every player still
+        # in the hand folded before any community card was dealt. This is the
+        # ONLY place this can be True; showdown results never set it.
+        res.resolved_preflop_fold = (self.street == Street.PREFLOP)
         return res
 
     def _refund_uncalled_bet(self):

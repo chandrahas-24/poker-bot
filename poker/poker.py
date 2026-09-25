@@ -2570,6 +2570,22 @@ async def _process_result(guild, channel, t: TableState):
         print(f"[poker] log_tax error: {e}")
         traceback.print_exc()
 
+    # Tax experiment: shadow log only, never touches chips/pot/tax above
+    try:
+        from . import tax_experiment
+        await tax_experiment.log_hand(
+            guild_id=guild.id,
+            table_id=t.id,
+            table_name=t.name,
+            hand_num=t.game.hand_num,
+            player_count=len(result.showdown_players or []),
+            resolved_preflop_fold=getattr(result, "resolved_preflop_fold", False),
+            actual_tax=getattr(result, "tax", 0),
+        )
+    except Exception as e:
+        print(f"[poker] tax_experiment log error: {e}")
+        traceback.print_exc()
+
     try:
         log_body = await post_hand_log(channel, t, result)
 

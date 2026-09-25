@@ -395,6 +395,24 @@ async def init_db():
             )
         """)
 
+        # ── Tax experiment: shadow log, never touches real chips/tax ──────────
+        # One row per resolved hand. actual_tax is what was really deducted;
+        # the "no flop no drop" hypothetical is derived at query time as
+        # 0 WHERE resolved_preflop_fold ELSE actual_tax.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tax_experiment_log (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                     TEXT NOT NULL,
+                guild_id               INTEGER NOT NULL,
+                table_id               TEXT NOT NULL,
+                table_name             TEXT NOT NULL,
+                hand_num               INTEGER,
+                player_count           INTEGER NOT NULL,
+                resolved_preflop_fold  INTEGER NOT NULL,
+                actual_tax             INTEGER NOT NULL
+            )
+        """)
+
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database

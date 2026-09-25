@@ -670,6 +670,7 @@ async def global_channel_restriction(interaction: discord.Interaction) -> bool:
         "drawcards",
         "myactivity",
         "changelog",
+        "responsible-gambling"
     }
 
     allowed_guild = config.GUILD_ID

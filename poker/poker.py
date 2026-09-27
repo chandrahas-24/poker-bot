@@ -1451,6 +1451,9 @@ async def _run_rit_vote(channel, t: TableState):
     recap, then hands off to continue_runout() exactly like an ordinary
     run-out resumes after any other pause."""
     game = t.game
+
+    cancel_timer(t)
+
     names: list[tuple[int, str]] = []
     for uid in game.rit_eligible_uids:
         p = game.get_player(uid)

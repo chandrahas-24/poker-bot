@@ -1499,6 +1499,14 @@ async def _run_rit_vote(channel, t: TableState):
         recap.append(f"** Running it {count} times!**" if count > 1 else "")
         await channel.send("\n".join(recap))
 
+        # Wipe the tracking state to force a new message
+    t.hand_msg = None
+    t.msg_count = 0
+
+    # Send the fresh table at the bottom.
+    # The subsequent card reveal logic will now edit this new message.
+    await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, new_hand=True, pause_turn=True)
+
     pre_len = len(game.community)  # community length BEFORE any post-vote dealing — see
                                     # _reveal_rit_boards_sequential's docstring for why this matters
 

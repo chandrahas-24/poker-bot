@@ -1382,6 +1382,7 @@ class RunItMultiVoteView(discord.ui.LayoutView):
         self.pot_display = pot_display
         self.done = asyncio.Event()
         self.message: discord.Message | None = None
+        self.finalized = False  # True once the shared message has had its one and only edit — see _make_callback
         self._build()
 
     def _tally_lines(self) -> list[str]:
@@ -1427,14 +1428,32 @@ class RunItMultiVoteView(discord.ui.LayoutView):
             if uid in self.game.rit_votes:
                 await interaction.response.send_message("❌ You already voted.", ephemeral=True)
                 return
-            all_voted = self.game.cast_run_it_vote(uid, choice)
-            self._build()
-            try:
-                await interaction.response.edit_message(view=self)
-            except discord.HTTPException:
-                pass
-            if all_voted:
+            finished = self.game.cast_run_it_vote(uid, choice)
+            if finished:
+                # Either this was a decline (always ends the vote instantly,
+                # per cast_run_it_vote's own semantics) or the last
+                # outstanding vote — either way nobody else can still be
+                # mid-click on this vote, so it's safe to do the one and
+                # only edit to the SHARED message now.
+                self._build()
+                self.disable_all()
+                try:
+                    await interaction.response.edit_message(view=self)
+                except discord.HTTPException:
+                    pass
+                self.finalized = True
                 self.done.set()
+            else:
+                # Still waiting on others — acknowledge PRIVATELY instead of
+                # touching the shared message. Editing the shared message on
+                # every non-deciding vote (the old behavior) is exactly what
+                # was causing other players' clicks on that same message to
+                # fail with "interaction failed" when their click landed
+                # while someone else's edit was in flight. Only the click
+                # that actually ends the vote gets to edit the real message.
+                label = "2x" if choice == 2 else "3x"
+                await interaction.response.send_message(
+                    f"✅ Vote recorded: run it {label}. Waiting on the others…", ephemeral=True)
         return _cb
 
     def disable_all(self):
@@ -1484,12 +1503,16 @@ async def _run_rit_vote(channel, t: TableState):
 
         count = game.resolve_run_it_vote()
 
-        view.disable_all()
-        try:
-            if view.message:
-                await view.message.edit(view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        if not view.finalized:
+            # Only reached on a genuine timeout — no click ever finished the
+            # vote (see _make_callback), so this is the one and only edit
+            # for that case.
+            view.disable_all()
+            try:
+                if view.message:
+                    await view.message.edit(view=view)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
         recap = []
         for uid, name in names:

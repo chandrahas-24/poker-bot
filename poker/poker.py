@@ -154,6 +154,13 @@ class TableState:
         self.active_random_event: dict | None = None  # Random events: message-based ones (phrase chant, number guess) read this from on_message
         self.sixseven_bait_active: bool = False # 67 title after hand before next hand
 
+        # Run It Multiple: transient per-board reveal cursor, used only
+        # while _reveal_rit_boards_sequential() is actively revealing
+        # (board 1 fully, then board 2, then board 3…). None the rest of
+        # the time, in which case update_board() renders every board's
+        # full live state as normal. See that function's docstring.
+        self.rit_reveal_upto: list[int] | None = None
+
     @property
     def is_tournament(self) -> bool:
         return getattr(self, "_is_tournament", False)
@@ -965,7 +972,11 @@ async def post_hand_log(channel, t: TableState, result):
         uname = _name_map.get(uid, "Unknown")
         return f"{uname} ({uid})"
 
-    if hasattr(result, 'community2') and result.community2:
+    if hasattr(result, 'rit_boards') and result.rit_boards:
+        lines.append(f"Board 1: {hand_str(result.community)}")
+        for i, b in enumerate(result.rit_boards, start=2):
+            lines.append(f"Board {i}: {hand_str(b)}")
+    elif hasattr(result, 'community2') and result.community2:
         lines.append(f"Board 1: {hand_str(result.community)}")
         lines.append(f"Board 2: {hand_str(result.community2)}")
     elif hasattr(result, 'community') and result.community:
@@ -975,7 +986,9 @@ async def post_hand_log(channel, t: TableState, result):
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results))]
     ranks = result.winner_ranks or {}
     ranks2 = result.winner_ranks2 or {}
+    rit_ranks = getattr(result, "rit_winner_ranks", None) or []
     double_board_active = bool(getattr(result, "community2", None))
+    rit_active = bool(getattr(result, "rit_boards", None))
 
     # 🚨 Grab the folded snapshot from the engine
     folded_ids = getattr(result, "folded_ids", set())
@@ -994,7 +1007,17 @@ async def post_hand_log(channel, t: TableState, result):
         else:
             cards = "no cards"
 
-        if double_board_active:
+        if rit_active:
+            board_parts = []
+            r1 = ranks.get(uid)
+            if r1:
+                board_parts.append(f"B1: {r1}")
+            for i, rr in enumerate(rit_ranks, start=2):
+                r = rr.get(uid)
+                if r:
+                    board_parts.append(f"B{i}: {r}")
+            rank_part = f" [{', '.join(board_parts)}]" if board_parts else ""
+        elif double_board_active:
             # Each board gets its own rank shown separately
             board_parts = []
             r1 = ranks.get(uid)
@@ -1217,6 +1240,25 @@ async def update_board(t: TableState):
 
     cute_mode = "cute_mode" in t.chaos_modifiers
 
+    if game.rit_count > 1 and game.rit_boards:
+        # Run It Multiple: same reveal pacing/positions as a normal single
+        # board (this never combines with "reverse" or Double Board — see
+        # engine.py's rit_state docstring for why those stay mutually
+        # exclusive), just stacked N-high instead of stitched side-by-side.
+        boards = [list(game.community)] + [list(b) for b in game.rit_boards]
+        if t.rit_reveal_upto is not None:
+            # Mid-sequential-reveal: truncate each board to however many of
+            # its cards should be visible RIGHT NOW (see
+            # _reveal_rit_boards_sequential) — make_multi_board_strip pads
+            # the rest with card backs automatically, same as a normal
+            # single board's `backs` count does.
+            boards = [b[:n] for b, n in zip(boards, t.rit_reveal_upto)]
+        blinds = [game.blinded_community_idx] + [set() for _ in game.rit_boards]
+        t.board_file = await asyncio.to_thread(
+            card_images.make_multi_board_strip, boards, blinds, cute_mode,
+        )
+        return
+
     if "double_board" in t.chaos_modifiers:
         if "reverse" in t.chaos_modifiers:
             # river, turn, then flop
@@ -1312,6 +1354,239 @@ RUNOUT_REVEAL_DELAY = 2.5  # seconds paused between each community card reveal d
                             # an all-in run-out (natural, or the "All In!" modifier) —
                             # see _handle_post_action and engine.py's runout_pause_pending
 
+# ── Run It Multiple (player-consented; NOT a chaos modifier) ──────────────────
+# See engine.py's rit_state docstring for the full state machine this is the
+# UI half of. Entirely self-contained: one Components V2 view, one driver
+# coroutine, one hook line in _handle_post_action below. Nothing else in the
+# file reaches into it, and it reaches into nothing else beyond t.game's
+# public rit_* surface and the ordinary continue_runout()/slog() calls the
+# existing runout-reveal loop already uses — safe to rip out by deleting this
+# block, the one hook line, and the run_it_multi_mode preference wiring.
+
+RIT_VOTE_TIMEOUT = 15.0  # seconds before a non-vote counts as a decline
+
+
+class RunItMultiVoteView(discord.ui.LayoutView):
+    """Posted in-channel (not ephemeral) so every eligible all-in player can
+    click from the same message. Only user_ids in `eligible` may vote; every
+    click re-renders the live tally via edit_message. Resolution itself
+    (min-of-votes / any-decline-cancels) lives in engine.py's
+    resolve_run_it_vote() — this view only collects raw votes and displays
+    them."""
+
+    def __init__(self, game: "PokerGame", eligible: list[tuple[int, str]], pot_display: str):
+        super().__init__(timeout=RIT_VOTE_TIMEOUT + 5)
+        self.game = game
+        self.eligible = eligible  # [(user_id, display_name), ...], fixed order
+        self.eligible_ids = {uid for uid, _ in eligible}
+        self.pot_display = pot_display
+        self.done = asyncio.Event()
+        self.message: discord.Message | None = None
+        self._build()
+
+    def _tally_lines(self) -> list[str]:
+        lines = []
+        for uid, name in self.eligible:
+            if uid not in self.game.rit_votes:
+                lines.append(f"⏳ **{name}** — waiting…")
+            else:
+                vote = self.game.rit_votes[uid]
+                lines.append(f"❌ **{name}** — declined" if vote is None else f"✅ **{name}** — run it **{vote}x**")
+        return lines
+
+    def _build(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=discord.Colour(0x2ECC71))
+        mentions = " ".join(f"<@{uid}>" for uid, _ in self.eligible)
+        container.add_item(discord.ui.TextDisplay(
+            f"# Run It Multiple?\n"
+            f"Everyone's all-in. {mentions} how many times do you want to run the board? "
+            f"Any single decline runs it once as normal, and the final count is the LOWEST anyone asks for."
+        ))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay("\n".join(self._tally_lines())))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        for label, choice in (("2 times", 2), ("3 times", 3), ("Decline", None)):
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.danger if choice is None else discord.ButtonStyle.success,
+            )
+            btn.callback = self._make_callback(choice)
+            row.add_item(btn)
+        container.add_item(row)
+        self.add_item(container)
+
+    def _make_callback(self, choice: int | None):
+        async def _cb(interaction: discord.Interaction):
+            uid = interaction.user.id
+            if uid not in self.eligible_ids:
+                await interaction.response.send_message(
+                    "❌ Not your call — only players still live in this hand vote on this.", ephemeral=True)
+                return
+            if uid in self.game.rit_votes:
+                await interaction.response.send_message("❌ You already voted.", ephemeral=True)
+                return
+            all_voted = self.game.cast_run_it_vote(uid, choice)
+            self._build()
+            try:
+                await interaction.response.edit_message(view=self)
+            except discord.HTTPException:
+                pass
+            if all_voted:
+                self.done.set()
+        return _cb
+
+    def disable_all(self):
+        for item in self.walk_children():
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+
+async def _run_rit_vote(channel, t: TableState):
+    """Driver for one Run It Multiple vote. Called once from
+    _handle_post_action right when engine.py's rit_state gate fires
+    (t.game.rit_vote_pending). Handles the auto-decline-preference skip,
+    posts/live-updates the vote card, applies the 15s timeout, posts the
+    recap, then hands off to continue_runout() exactly like an ordinary
+    run-out resumes after any other pause."""
+    game = t.game
+    names: list[tuple[int, str]] = []
+    for uid in game.rit_eligible_uids:
+        p = game.get_player(uid)
+        names.append((uid, p.display_name if p else f"Player {uid}"))
+
+    # Any eligible player with the auto-decline preference set skips the
+    # vote entirely for everyone — a single decline cancels the whole thing
+    # regardless of who else might have agreed, so there's nothing to ask.
+    auto_decline_names = []
+    for uid, name in names:
+        pref = await db.get_player_preference(uid)
+        if pref.get("run_it_multi_mode") == "auto_decline":
+            auto_decline_names.append(name)
+
+    if auto_decline_names:
+        who = ", ".join(f"**{n}**" for n in auto_decline_names)
+        await channel.send(f"{who} auto-declines Run It Multiple.")
+        game.resolve_run_it_vote()
+    else:
+        pot_display = f"{game.pot}{game.chip_emoji}"
+        view = RunItMultiVoteView(game, names, pot_display)
+        view.message = await channel.send(view=view)
+
+        try:
+            await asyncio.wait_for(view.done.wait(), timeout=RIT_VOTE_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+
+        count = game.resolve_run_it_vote()
+
+        view.disable_all()
+        try:
+            if view.message:
+                await view.message.edit(view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+        recap = []
+        for uid, name in names:
+            if uid not in game.rit_votes:
+                recap.append(f"**{name}** didn't get a vote in (a decline already ended it or time ran out).")
+            elif game.rit_votes[uid] is None:
+                recap.append(f"❌ **{name}** declined.")
+            else:
+                recap.append(f"✅ **{name}** voted **{game.rit_votes[uid]}x**.")
+        recap.append(f"** Running it {count} times!**" if count > 1 else "")
+        await channel.send("\n".join(recap))
+
+    pre_len = len(game.community)  # community length BEFORE any post-vote dealing — see
+                                    # _reveal_rit_boards_sequential's docstring for why this matters
+
+    if game.rit_count > 1 and game.rit_boards:
+        # Multi-board: drain every remaining street ourselves right now,
+        # quietly (no visual pacing here) — because we're about to do our
+        # OWN reveal pacing next: board 1 fully, then board 2, then board
+        # 3, instead of _handle_post_action's standard lockstep-across-
+        # all-boards loop. By the time we return, runout_pause_pending is
+        # already False, so that standard loop is a no-op and falls
+        # straight through to the (unchanged, rit-agnostic) showdown call.
+        #
+        # continue_runout() itself is what deals the NEXT street — it only
+        # clears runout_pause_pending on the way in, so the very first call
+        # must happen unconditionally (the vote gate in engine.py returns
+        # before that flag is ever set to True, so `while
+        # game.runout_pause_pending:` alone would never even enter its
+        # body on the first street after a vote).
+        def _drain_tail(tail):
+            if tail:
+                if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
+                    slog_clear(t)
+                for part in tail.split("\n"):
+                    if part.strip():
+                        slog(t, part)
+        _drain_tail(game.continue_runout())
+        while game.runout_pause_pending:
+            _drain_tail(game.continue_runout())
+        await _reveal_rit_boards_sequential(channel, t, pre_len)
+    else:
+        # Declined (or nothing to vote on) — an ordinary single-board hand
+        # from here on, so leave the usual pacing to _handle_post_action's
+        # own runout_pause_pending loop; just deal the immediate next
+        # street here, exactly like this code path always did before any
+        # vote existed.
+        tail = game.continue_runout()
+        if tail:
+            if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
+                slog_clear(t)
+            for part in tail.split("\n"):
+                if part.strip():
+                    slog(t, part)
+
+
+RIT_REVEAL_DELAY = 1.2  # Run It Multiple's own reveal pacing — smaller than RUNOUT_REVEAL_DELAY
+                         # since there are more total reveals overall (every board's remaining
+                         # streets, once per board) than a normal single-board run-out has.
+
+
+async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int):
+    """
+    Called once, right after a Run It Multiple vote resolves to more than
+    one board — by which point _run_rit_vote has already fully dealt every
+    board internally. Reveals board 1's remaining streets completely, THEN
+    board 2's, THEN board 3's — sequential and complete per board — rather
+    than Double Board's lockstep street-by-street-across-all-boards pacing.
+
+    `pre_len` is how many community cards existed BEFORE the vote — e.g. 3
+    if the all-in happened going into the turn, so only the river needs
+    revealing per board, not the flop everyone already watched during real
+    betting. Every board shares that same pre_len prefix (they're literal
+    copies of each other up to the point they diverge), so all of them
+    already show those shared cards for the whole reveal.
+
+    Drives update_board() via t.rit_reveal_upto (a per-board "cards visible
+    right now" cursor) rather than touching game state — nothing here
+    affects the actual dealt cards, only what's rendered at each step.
+    """
+    game = t.game
+    all_boards = [game.community] + game.rit_boards
+    n_boards = len(all_boards)
+
+    steps = [n for n in (3, 4, 5) if n > pre_len]  # street boundaries still to reveal
+    if not steps:
+        return  # nothing left to reveal (all-in happened on/after the river — caller shouldn't hit this)
+
+    t.rit_reveal_upto = [pre_len] * n_boards
+    try:
+        for board_idx in range(n_boards):
+            for n in steps:
+                t.rit_reveal_upto[board_idx] = n
+                await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+                await asyncio.sleep(RIT_REVEAL_DELAY)
+            # board_idx is now fully shown (5 cards) and stays that way on
+            # screen while later boards continue revealing next to it.
+    finally:
+        t.rit_reveal_upto = None  # back to normal — update_board() renders full live state again
+
 
 async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
     for trigger_point in t.game.pending_random_event_triggers:
@@ -1319,6 +1594,10 @@ async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
         if event_id:
             asyncio.create_task(_run_random_event(channel, t, event_id, trigger_point))
     t.game.pending_random_event_triggers = []
+
+    # Run It Multiple: fires once, before any card of the run-out is dealt.
+    if t.game.rit_vote_pending:
+        await _run_rit_vote(channel, t)
 
     # all in reveals
     while t.game.runout_pause_pending:
@@ -1632,6 +1911,9 @@ class PreferencesView(discord.ui.View):
         self.btn_card_size = discord.ui.Button(custom_id="pref_card_size")
         self.btn_card_size.callback = self.toggle_card_size
 
+        self.btn_run_it_multi = discord.ui.Button(custom_id="pref_run_it_multi")
+        self.btn_run_it_multi.callback = self.toggle_run_it_multi
+
         # Add items so they are registered in ViewStore for dispatching
         self.add_item(self.btn_auto_rebuy)
         self.add_item(self.btn_auto_showdown)
@@ -1641,6 +1923,7 @@ class PreferencesView(discord.ui.View):
         self.add_item(self.btn_confirm_leave)
         self.add_item(self.btn_confirm_call_raise)
         self.add_item(self.btn_card_size)
+        self.add_item(self.btn_run_it_multi)
 
     def has_components_v2(self) -> bool:
         return True
@@ -1724,6 +2007,11 @@ class PreferencesView(discord.ui.View):
         cs_val = self.pref.get("card_size", "normal")
         self.btn_card_size.label = "Compact" if cs_val == "compact" else "Normal"
         self.btn_card_size.style = discord.ButtonStyle.blurple if cs_val == "compact" else discord.ButtonStyle.grey
+
+        # Run It Multiple — auto-decline
+        rim_val = self.pref.get("run_it_multi_mode", "ask")
+        self.btn_run_it_multi.label = "Auto-Decline" if rim_val == "auto_decline" else "Ask Me"
+        self.btn_run_it_multi.style = discord.ButtonStyle.red if rim_val == "auto_decline" else discord.ButtonStyle.green
 
     def to_components(self) -> list[dict]:
         self.update_button_states()
@@ -1842,6 +2130,17 @@ class PreferencesView(discord.ui.View):
                         }
                     ],
                     "accessory": button_to_dict(self.btn_card_size)
+                },
+                # Section 9: Run It Multiple
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Run It Multiple**\n Auto-Decline skips the vote for you every time (a decline always cancels it for everyone, same as clicking Decline yourself)."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_run_it_multi)
                 }
             ]
         }
@@ -1929,6 +2228,15 @@ class PreferencesView(discord.ui.View):
         await db.set_player_preference(self.user_id, card_size=new_val)
         await self.refresh_preferences(interaction)
 
+    async def toggle_run_it_multi(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        val = self.pref.get("run_it_multi_mode", "ask")
+        new_val = "ask" if val == "auto_decline" else "auto_decline"
+        await db.set_player_preference(self.user_id, run_it_multi_mode=new_val)
+        await self.refresh_preferences(interaction)
+
     async def on_confirm_call_raise_click(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
@@ -1946,6 +2254,7 @@ class PreferencesView(discord.ui.View):
 
     async def refresh_preferences(self, interaction: discord.Interaction):
         self.pref = await db.get_player_preference(self.user_id)
+        self.update_button_states()
         if interaction.response.is_done():
             await interaction.followup.edit_message(message_id="@original", view=self)
         else:
@@ -2035,21 +2344,36 @@ def _slog_result(t: TableState, result):
     game        = t.game
     ranks       = result.winner_ranks or {}
     ranks2      = result.winner_ranks2 or {}
+    rit_ranks   = getattr(result, "rit_winner_ranks", None) or []
     pot_results = result.pot_results
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results or []))]
     double_board_active = bool(result.community2)
+    rit_boards = getattr(result, "rit_boards", None) or []
+    rit_active = bool(rit_boards)
     emoji       = get_chip_emoji(t)
     hidden_pot  = "hidden_pot" in getattr(t, "chaos_modifiers", [])
 
+    def _board_ranks(board_num: int) -> dict:
+        if rit_active:
+            if board_num <= 1:
+                return ranks
+            idx = board_num - 2
+            return rit_ranks[idx] if idx < len(rit_ranks) else {}
+        return ranks2 if board_num == 2 else ranks
+
     # Use result.community — game.community is already cleared by _end_hand at this point.
-    if double_board_active:
+    if rit_active:
+        slog(t, f"🃏 Board 1: {hand_str(result.community)}")
+        for i, b in enumerate(rit_boards, start=2):
+            slog(t, f"🃏 Board {i}: {hand_str(b)}")
+    elif double_board_active:
         slog(t, f"🃏 Board 1: {hand_str(result.community)}")
         slog(t, f"🃏 Board 2: {hand_str(result.community2)}")
     elif result.community:
         slog(t, f"🃏 Board: {hand_str(result.community)}")
 
     distinct_pots = len({pot_idx for pot_idx, _ in pot_result_meta})
-    if not pot_results or (distinct_pots <= 1 and not double_board_active):
+    if not pot_results or (distinct_pots <= 1 and not double_board_active and not rit_active):
         if len(result.winners) == 1:
             w = result.winners[0]
             gained = result.chip_deltas.get(w.user_id, 0)
@@ -2080,7 +2404,7 @@ def _slog_result(t: TableState, result):
             if board_num:
                 label += f" (Board {board_num})"
             amt_str = "🙈 hidden" if hidden_pot else f"{amt}{emoji}"
-            board_ranks = ranks2 if board_num == 2 else ranks
+            board_ranks = _board_ranks(board_num)
             if len(winners) == 1:
                 w      = winners[0]
                 rank   = board_ranks.get(w.user_id)
@@ -2099,10 +2423,21 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     game = t.game
     ranks = result.winner_ranks or {}
     ranks2 = result.winner_ranks2 or {}
+    rit_ranks = getattr(result, "rit_winner_ranks", None) or []
     pot_results = result.pot_results  # [(amount, [PokerPlayer, ...]), ...]
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results or []))]
     double_board_active = bool(result.community2)
+    rit_boards = getattr(result, "rit_boards", None) or []
+    rit_active = bool(rit_boards)
     emoji = get_chip_emoji(t)
+
+    def _board_ranks(board_num: int) -> dict:
+        if rit_active:
+            if board_num <= 1:
+                return ranks
+            idx = board_num - 2
+            return rit_ranks[idx] if idx < len(rit_ranks) else {}
+        return ranks2 if board_num == 2 else ranks
 
     _cos_cache = cosmetics_cache or {}
 
@@ -2135,7 +2470,11 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
         return "\n".join(quotes)
 
     def _add_board_fields():
-        if double_board_active:
+        if rit_active:
+            embed.add_field(name="🃏 Board 1", value=f"{hand_str(result.community)}\n\u200b", inline=True)
+            for i, b in enumerate(rit_boards, start=2):
+                embed.add_field(name=f"🃏 Board {i}", value=f"{hand_str(b)}\n\u200b", inline=True)
+        elif double_board_active:
             embed.add_field(name="🃏 Board 1", value=f"{hand_str(result.community)}\n\u200b", inline=True)
             embed.add_field(name="🃏 Board 2", value=f"{hand_str(result.community2)}\n\u200b", inline=True)
         elif result.community:
@@ -2146,7 +2485,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     desc_lines = []
 
     distinct_pots = len({pot_idx for pot_idx, _ in pot_result_meta})
-    if not pot_results or (distinct_pots <= 1 and not double_board_active):
+    if not pot_results or (distinct_pots <= 1 and not double_board_active and not rit_active):
         # ── Single Pot (or Fold Win) ──
         if len(result.winners) == 1:
             w = result.winners[0]
@@ -2198,7 +2537,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
             if board_num:
                 label += f" — Board {board_num}"
             icon = "🥇" if pot_idx == 0 else "🥈"
-            board_ranks = ranks2 if board_num == 2 else ranks
+            board_ranks = _board_ranks(board_num)
 
             desc_lines.append(f"{icon} **{label}** {emoji} **{amt}**")
 
@@ -2718,19 +3057,30 @@ async def _process_result(guild, channel, t: TableState):
 # ── Showdown reveal (muck / show) ─────────────────────────────────────────────
 
 def _hand_rank_display(hole_cards: list, community: list, community2: list | None,
-                        double_board_active: bool) -> str:
+                        double_board_active: bool, rit_boards: list | None = None) -> str:
     """
-    shows hand's rank on each board for double board
+    shows hand's rank on each board — for Double Board (exactly community2)
+    or Run It Multiple (rit_boards, any length). Never both at once (see
+    engine.py's rit_state docstring), so callers only ever populate one.
     """
+    rit_boards = rit_boards or []
+    rit_active = bool(rit_boards)
+    multi = double_board_active or rit_active
     parts = []
     if len(hole_cards) + len(community) >= 5:
         score = hand_eval.evaluate_any(evaluator, hole_cards, community)
         rank = evaluator.class_to_string(evaluator.get_rank_class(score))
-        parts.append(f"Board 1: {rank}" if double_board_active else rank)
+        parts.append(f"Board 1: {rank}" if multi else rank)
     if double_board_active and community2 and len(hole_cards) + len(community2) >= 5:
         score2 = hand_eval.evaluate_any(evaluator, hole_cards, community2)
         rank2 = evaluator.class_to_string(evaluator.get_rank_class(score2))
         parts.append(f"Board 2: {rank2}")
+    if rit_active:
+        for i, b in enumerate(rit_boards, start=2):
+            if len(hole_cards) + len(b) >= 5:
+                score_b = hand_eval.evaluate_any(evaluator, hole_cards, b)
+                rank_b = evaluator.class_to_string(evaluator.get_rank_class(score_b))
+                parts.append(f"Board {i}: {rank_b}")
     return f" — *{', '.join(parts)}*" if parts else ""
 
 
@@ -2766,7 +3116,8 @@ class ShowdownRevealView(discord.ui.View):
         # chaos modifier the board can have just 1-2 cards on a real street.
         rank_str = _hand_rank_display(sp.hole_cards, self.result.community,
                                        getattr(self.result, "community2", None),
-                                       bool(getattr(self.result, "community2", None)))
+                                       bool(getattr(self.result, "community2", None)),
+                                       getattr(self.result, "rit_boards", None))
 
         shiny = " ✨" if sp.shiny_ids else ""
         caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{shiny}{rank_str}"
@@ -2842,21 +3193,33 @@ async def _reveal_phase(channel, t: TableState, result):
     # ── 2. Contested Showdown ─────────────────────────────
     winner_ids = {w.user_id for w in result.winners}
     double_board_active = bool(result.community2)
+    rit_boards = getattr(result, "rit_boards", None) or []
+    rit_active = bool(rit_boards)
     pot_results = result.pot_results or []
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results))]
     ranks = result.winner_ranks or {}
     ranks2 = result.winner_ranks2 or {}
+    rit_ranks = getattr(result, "rit_winner_ranks", None) or []
+
+    def _board_ranks(board_num: int) -> dict:
+        if rit_active:
+            if board_num <= 1:
+                return ranks
+            idx = board_num - 2
+            return rit_ranks[idx] if idx < len(rit_ranks) else {}
+        return ranks2 if board_num == 2 else ranks
 
     # Per winner, the board(s) they ACTUALLY won and the rank they won it
     # with — never a fresh re-evaluation against board 1 alone. Under
-    # Double Board the same hole cards can rank completely differently on
-    # each board (or even tie/lose on one while winning the other), so
-    # this only ever attributes a rank to a winner for a board a pot
-    # result says they won — exactly the same source of truth the Hand
-    # Results embed already uses, so the two can never disagree again.
+    # Double Board or Run It Multiple the same hole cards can rank
+    # completely differently on each board (or even tie/lose on one while
+    # winning another), so this only ever attributes a rank to a winner
+    # for a board a pot result says they won — exactly the same source of
+    # truth the Hand Results embed already uses, so the two can never
+    # disagree again.
     winner_board_ranks: dict[int, list[tuple[int, str]]] = {}
     for (_, pot_winners), (_, board_num) in zip(pot_results, pot_result_meta):
-        board_ranks = ranks2 if board_num == 2 else ranks
+        board_ranks = _board_ranks(board_num)
         for pw in pot_winners:
             rank = board_ranks.get(pw.user_id)
             if not rank:
@@ -2869,8 +3232,15 @@ async def _reveal_phase(channel, t: TableState, result):
     def _winner_rank_str(uid: int, hole_cards: list, community: list) -> str:
         won = winner_board_ranks.get(uid, [])
         if won:
-            if len(won) == 1 or not double_board_active:
+            if not (double_board_active or rit_active):
                 return f" — *{won[0][1]}*"
+            # Multi-board: ALWAYS label which board(s), even when a player
+            # only won exactly one of them — with 2+ boards in play "Pair"
+            # alone is ambiguous about which board that was, whereas the
+            # len(won)==1 shortcut this used to take silently dropped the
+            # label for every winner who happened to win just one board
+            # (i.e. most winners, most hands) while only multi-board
+            # winners ever got a "Board N:" prefix.
             parts = ", ".join(f"Board {bn}: {r}" for bn, r in sorted(won))
             return f" — *{parts}*"
         # Fallback for the rare case a winner isn't in either ranks dict
@@ -2912,7 +3282,8 @@ async def _reveal_phase(channel, t: TableState, result):
         if auto_action == "muck":
             continue
         elif auto_action == "show":
-            rank_str = _hand_rank_display(p.hole_cards, result.community, result.community2, double_board_active)
+            rank_str = _hand_rank_display(p.hole_cards, result.community, result.community2,
+                                           double_board_active, rit_boards)
             caption = f"👁️ **{p.display_name}** shows: {hand_str(p.hole_cards)}{rank_str}"
             if USE_IMAGES:
                 cosmetics = await db.get_cosmetics(p.user_id)
@@ -4801,7 +5172,29 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
     visible_board1 = [c for i, c in enumerate(t.game.community)
                        if i not in t.game.blinded_community_idx]
     double_board_active = "double_board" in t.game.chaos_modifiers
-    if double_board_active:
+    rit_active = t.game.rit_count > 1 and bool(t.game.rit_boards)
+    if rit_active:
+        # Run It Multiple: same idea as Double Board just below — rank
+        # against each board separately, since the same hole cards can be
+        # miles apart in strength across boards. rit_boards has no
+        # "blinded" concept of its own (blindness only ever applies to
+        # the primary board — see rit_state's docstring in engine.py), so
+        # every extra board is shown in full.
+        board_lines = []
+        if len(visible_hole) + len(visible_board1) >= 5:
+            score = hand_eval.evaluate_any(evaluator, visible_hole, visible_board1)
+            rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+            pct = round((1 - score / 7462) * 100, 1)
+            board_lines.append(f"**Board 1:** {rank} (top {100 - pct:.0f}%)")
+        for i, board in enumerate(t.game.rit_boards, start=2):
+            if len(visible_hole) + len(board) >= 5:
+                score = hand_eval.evaluate_any(evaluator, visible_hole, board)
+                rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+                pct = round((1 - score / 7462) * 100, 1)
+                board_lines.append(f"**Board {i}:** {rank} (top {100 - pct:.0f}%)")
+        if board_lines:
+            strength = "\n" + "\n".join(board_lines)
+    elif double_board_active:
         # Double board show the ranking against each board separately
         visible_board2 = [c for i, c in enumerate(t.game.community2)
                            if i not in t.game.blinded_community2_idx]

@@ -128,6 +128,16 @@ class HandResult:
                                          # kept SEPARATE from winner_ranks rather than folded into one "best hand"
                                          # dict, since a player can win board 1 with one hand class and board 2
                                          # with a completely different one in the same showdown.
+    # Run It Multiple (player-consented, all-in only — NOT a chaos modifier,
+    # fully independent of Double Board / community2 above). rit_count is 1
+    # for every ordinary hand. When >1, rit_boards holds the EXTRA boards
+    # beyond the primary self.community (so len(rit_boards) == rit_count-1),
+    # and rit_winner_ranks is a same-length parallel list of per-board
+    # {user_id: "Flush"} dicts, mirroring winner_ranks2's role but for N-1
+    # boards instead of exactly one.
+    rit_count: int = 1
+    rit_boards: list = None
+    rit_winner_ranks: list = None
 
 class PokerGame:
     SMALL_BLIND = config.DEFAULT_SMALL_BLIND
@@ -177,6 +187,28 @@ class PokerGame:
                                                               # least one more street still to come — poker.py sleeps
                                                               # a beat, shows the board as it stands, then calls
                                                               # continue_runout() to deal the next one. See both.
+
+        # ── Run It Multiple (player-consented; NOT a chaos modifier) ──────
+        # Independent of Double Board's community2 mechanism above — never
+        # reads or writes chaos_modifiers/community2, and is itself skipped
+        # outright when "double_board" is in chaos_modifiers this hand (see
+        # _next_street()'s gate) so the two multi-board systems never stack.
+        #
+        # "none"         — normal hand, no vote has happened / is needed.
+        # "pending_vote" — _next_street() paused right before dealing the
+        #                  first undealt street of an all-in run-out;
+        #                  poker.py must show the vote UI and, once every
+        #                  eligible voter has answered (or the 15s timeout
+        #                  elapses), call resolve_run_it_vote() then
+        #                  continue_runout() to actually resume dealing.
+        # "resolved"     — vote is done (declined, or a board count is set)
+        #                  for the rest of this hand; the gate below is a
+        #                  no-op until the next start_hand() resets it.
+        self.rit_state: str = "none"
+        self.rit_eligible_uids: list[int] = []   # user_ids who get a vote this hand (frozen at trigger time)
+        self.rit_votes: dict[int, int | None] = {}  # user_id -> 2, 3, or None (declined)
+        self.rit_count: int = 1                  # final number of boards; 1 == normal single-board hand
+        self.rit_boards: list[list[int]] = []    # EXTRA boards beyond self.community (len == rit_count-1)
         self.is_chaos_hand: bool = False                 # set by poker.py: True if this table is in chaos mode this hand
         # Random events: trigger-point names reached (and independently
         # rolled a "yes") during this hand's play, not yet consumed by
@@ -320,6 +352,11 @@ class PokerGame:
         self.deck.shuffle()
         self.community = []
         self.community2 = []
+        self.rit_state = "none"
+        self.rit_eligible_uids = []
+        self.rit_votes = {}
+        self.rit_count = 1
+        self.rit_boards = []
         self.community_auction_done = False
         self.uno_reverse_reminder_pending = False
         self.awaiting_runout_showdown = False
@@ -748,6 +785,14 @@ class PokerGame:
         """Zero active players — board runs itself."""
         return len(self.active_players) == 0
 
+    @property
+    def rit_vote_pending(self) -> bool:
+        """Run It Multiple: True when poker.py needs to post the vote embed
+        (or, if it already has and is polling after each click, keep showing
+        it) before any further dealing can happen. See rit_state's docstring
+        in __init__ for the state machine this belongs to."""
+        return self.rit_state == "pending_vote"
+
     def current_player(self) -> Optional[PokerPlayer]:
         if self.street in (Street.WAITING, Street.SHOWDOWN):
             return None
@@ -1106,6 +1151,43 @@ class PokerGame:
         # — see chaos.py's "Timing model" notes.
         entering_runout = len(self.active_players) <= 1
 
+        # ── Run It Multiple: gate the run-out here, before ANY card for the
+        # next street is dealt — exactly the point real rooms ask "how many
+        # times?". Only fires ONCE per hand (guarded by rit_state == "none",
+        # same one-shot idea as _runout_first_reveal_queued just below),
+        # never on a Double Board chaos hand (community2 already owns "more
+        # than one board" for that hand — see rit_state's docstring), and
+        # never once all 5 community cards are already out — if the final
+        # all-in happens ON the river (or is just a river call), there is
+        # nothing left to run multiple times; showdown proceeds normally.
+        #
+        # Eligible voters = players_in_hand (every non-folded player), NOT
+        # just p.all_in. entering_runout already guarantees nobody left has
+        # a real decision to make — but that includes the common case where
+        # a short stack shoves and the only other player left just CALLS
+        # without themselves going all-in (they still have chips for future
+        # hands, so p.all_in is False for them, yet they have no more
+        # action this hand either). That covering caller is a real
+        # stakeholder in this pot and gets a vote same as the short stack —
+        # filtering to p.all_in here would silently drop exactly that
+        # heads-up-call-a-shove case, the single most common real-world
+        # run-it-twice scenario, so don't narrow past players_in_hand.
+        if (entering_runout and self.rit_state == "none" and len(self.community) < 5
+                and "double_board" not in self.chaos_modifiers):
+            eligible = self.players_in_hand
+            if len(eligible) >= 2:
+                self.rit_state = "pending_vote"
+                self.rit_eligible_uids = [p.user_id for p in eligible]
+                self.rit_votes = {}
+                # Nothing dealt yet this call — poker.py's post-action loop
+                # checks rit_vote_pending and posts the vote UI instead of
+                # its usual runout_pause_pending/awaiting_runout_showdown
+                # handling. Once resolve_run_it_vote() has run, it calls
+                # continue_runout() to re-enter this exact function; rit_state
+                # will then be "resolved" and this whole block is a no-op.
+                return ""
+            self.rit_state = "resolved"  # only 1 player left in the hand — nothing to vote on, ever
+
         # Fetch rigged community list
         rigged_comm = getattr(self, "_rigged_community", [])
         # "Reverse" is a chaos-table-only modifier and tutorials never run chaos
@@ -1225,6 +1307,17 @@ class PokerGame:
             n_new = len(self.community) - prev_community_len
             if n_new > 0:
                 self.community2 += self.deck.draw(n_new)
+
+        # ── Run It Multiple — same lockstep idea as Double Board just above,
+        # but for however many EXTRA boards the vote resolved to (rit_boards
+        # is empty unless rit_count > 1). Only ever populated once resolved
+        # this hand; guaranteed mutually exclusive with double_board_active
+        # by the gate in this function above, so no double-dealing risk.
+        if self.rit_count > 1 and self.rit_boards:
+            n_new_rit = len(self.community) - prev_community_len
+            if n_new_rit > 0:
+                for i in range(len(self.rit_boards)):
+                    self.rit_boards[i] += self.deck.draw(n_new_rit)
 
         # ── Chaos: Blindness — each newly revealed community card independently
         # has a chance to come out smudged. Rolled BEFORE the announcement
@@ -1361,6 +1454,51 @@ class PokerGame:
         self.runout_pause_pending = False
         return self._next_street()
 
+    # Run It Multiple
+
+    def cast_run_it_vote(self, user_id: int, choice: int | None) -> bool:
+        """
+        Records one eligible player's vote. `choice` is 2, 3 (run count) or
+        None (decline). Ignored (returns False) if it's not this user's
+        vote to cast — already voted, not eligible, or no vote pending.
+        Returns True once the vote is FINISHED and poker.py should call
+        resolve_run_it_vote() next — either every eligible voter has now
+        voted, OR this vote was a decline, which ends things immediately
+        regardless of who else hasn't answered yet (a single decline
+        cancels the whole thing either way, so there's nothing left to
+        wait for). Returns False only when still waiting on other,
+        not-yet-declining voters, in which case poker.py just re-renders
+        the live tally.
+        """
+        if self.rit_state != "pending_vote" or user_id not in self.rit_eligible_uids:
+            return False
+        if user_id in self.rit_votes:
+            return False
+        self.rit_votes[user_id] = choice
+        if choice is None:
+            return True
+        return all(uid in self.rit_votes for uid in self.rit_eligible_uids)
+
+    def resolve_run_it_vote(self) -> int:
+        """
+        Finalizes the vote — call once cast_run_it_vote() returns True, or
+        once poker.py's own 15s timeout elapses (any player who never voted
+        counts as a decline, same as a real click on Decline). Any single
+        decline (explicit or via timeout) cancels the whole thing: final
+        count is 1, board runs out normally. Otherwise final count is the
+        LOWEST count any eligible player asked for. Sets self.rit_boards
+        (snapshotted from the current, already-dealt self.community) and
+        flips rit_state to "resolved" so _next_street()'s gate won't refire.
+        Returns the final count for poker.py's recap message.
+        """
+        votes = [self.rit_votes.get(uid) for uid in self.rit_eligible_uids]
+        count = 1 if any(v is None for v in votes) else min(votes)
+        self.rit_state = "resolved"
+        self.rit_count = count
+        if count > 1:
+            self.rit_boards = [list(self.community) for _ in range(count - 1)]
+        return count
+
     # Side pots
 
     def _compute_side_pots(self) -> list[SidePot]:
@@ -1418,6 +1556,18 @@ class PokerGame:
             scores2 = {p.user_id: hand_eval.evaluate_any(evaluator, p.hole_cards, self.community2)
                        for p in alive}
 
+        # ── Run It Multiple — mutually exclusive with double_board_active
+        # (guaranteed by _next_street()'s gate, never both True together).
+        # board_scores[0] is always `scores` (the primary board, already
+        # computed above); board_scores[1:] is one dict per extra board.
+        rit_active = self.rit_count > 1 and bool(self.rit_boards)
+        board_scores = None
+        if rit_active:
+            board_scores = [scores] + [
+                {p.user_id: hand_eval.evaluate_any(evaluator, p.hole_cards, b) for p in alive}
+                for b in self.rit_boards
+            ]
+
         pots = self._compute_side_pots()
         chip_deltas = {p.user_id: -p.total_bet for p in self.players}
         pot_results = []
@@ -1468,7 +1618,23 @@ class PokerGame:
             chip_deltas[w.user_id] += award
 
         for pot_idx, sp in enumerate(pots):
-            if double_board_active and sp.eligible:
+            if rit_active and sp.eligible:
+                n_boards = len(board_scores)
+                base = sp.amount // n_boards
+                remainder = sp.amount - base * n_boards  # round-robin to board 1, then 2, then 3…
+                for board_num, sc in enumerate(board_scores, start=1):
+                    board_amount = base + (1 if board_num <= remainder else 0)
+                    if board_amount <= 0:
+                        continue
+                    best = self._pot_winning_score(sc, sp.eligible)
+                    winners = [p for p in sp.eligible if sc[p.user_id] == best]
+                    each = board_amount // len(winners)
+                    rem2 = board_amount - each * len(winners)
+                    for i, w in enumerate(winners):
+                        _award(w, each + (rem2 if i == 0 else 0))
+                    pot_results.append((board_amount, winners))
+                    pot_result_meta.append((pot_idx, board_num))
+            elif double_board_active and sp.eligible:
                 half1 = sp.amount // 2
                 half2 = sp.amount - half1
                 for board_num, (half_amount, sc) in enumerate(((half1, scores), (half2, scores2)), start=1):
@@ -1534,12 +1700,38 @@ class PokerGame:
                         chip_deltas[p.user_id] -= profit_tax
                         total_tax += profit_tax
 
-        lines = ["🃏 **Showdown!**",
-                 f"Board 1: {hand_str(self.community)}" if double_board_active else f"Board: {hand_str(self.community)}"]
-        if double_board_active:
-            lines.append(f"Board 2: {hand_str(self.community2)}")
+        if rit_active:
+            n_boards = len(board_scores)
+            run_word = "twice" if n_boards == 2 else f"{n_boards} times"
+            lines = [f"🃏 **Showdown!** (Run it {run_word})",
+                     f"Board 1: {hand_str(self.community)}"]
+            for i, b in enumerate(self.rit_boards, start=2):
+                lines.append(f"Board {i}: {hand_str(b)}")
+        else:
+            lines = ["🃏 **Showdown!**",
+                     f"Board 1: {hand_str(self.community)}" if double_board_active else f"Board: {hand_str(self.community)}"]
+            if double_board_active:
+                lines.append(f"Board 2: {hand_str(self.community2)}")
 
-        if double_board_active:
+        if rit_active:
+            n_boards = len(board_scores)
+            for pot_idx in range(len(pots)):
+                label_prefix = "Main pot" if pot_idx == 0 else f"Side pot {pot_idx}"
+                for board_num in range(1, n_boards + 1):
+                    ridx = pot_idx * n_boards + (board_num - 1)
+                    if ridx >= len(pot_results):
+                        continue
+                    amt, winners = pot_results[ridx]
+                    if amt <= 0 or not winners:
+                        continue
+                    each = amt // len(winners)
+                    board_label = f"{label_prefix} — Board {board_num}"
+                    if len(winners) == 1:
+                        lines.append(f"🏆 **{board_label}** ({amt}{self.chip_emoji}): **{winners[0].display_name}**")
+                    else:
+                        names = ", ".join(w.display_name for w in winners)
+                        lines.append(f"🤝 **{board_label}** ({amt}{self.chip_emoji}): **{names}** ({each}{self.chip_emoji} each)")
+        elif double_board_active:
             # pot_results holds (board1_half, board2_half) pairs per side pot
             for pot_idx in range(len(pots)):
                 label_prefix = "Main pot" if pot_idx == 0 else f"Side pot {pot_idx}"
@@ -1585,6 +1777,7 @@ class PokerGame:
 
         winner_ranks = {}
         winner_ranks2 = {}
+        rit_winner_ranks = [{} for _ in range(len(self.rit_boards))] if rit_active else None
         for w in all_winners:
             # Board 1 (or the single board): rank strictly reflects THIS
             # board's own score for this player — never mixed with board 2.
@@ -1598,6 +1791,12 @@ class PokerGame:
                 # reported as "Flush" on BOTH boards. Each board's rank now
                 # only ever describes that board.
                 winner_ranks2[w.user_id] = evaluator.class_to_string(evaluator.get_rank_class(scores2[w.user_id]))
+            if rit_active:
+                # Same independent-per-board idea as winner_ranks2, just for
+                # however many extra boards this hand actually ran (2 or 3).
+                for bi, sc in enumerate(board_scores[1:]):
+                    if w.user_id in sc:
+                        rit_winner_ranks[bi][w.user_id] = evaluator.class_to_string(evaluator.get_rank_class(sc[w.user_id]))
 
         self.side_pots    = pots
         self._hand_result = HandResult(
@@ -1620,6 +1819,9 @@ class PokerGame:
             bounty_targets=dict(self.bounty_targets),
             bounty_results=self._bounty_results,
             community2=list(self.community2) if double_board_active else None,
+            rit_count=self.rit_count if rit_active else 1,
+            rit_boards=[list(b) for b in self.rit_boards] if rit_active else None,
+            rit_winner_ranks=rit_winner_ranks,
         )
 
         self._hand_result.folded_ids = {p.user_id for p in self.players if p.folded}

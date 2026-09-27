@@ -353,7 +353,8 @@ async def init_db():
                 confirm_leave INTEGER DEFAULT 1,
                 confirm_call_raise_mode TEXT DEFAULT 'never',
                 confirm_call_raise_threshold INTEGER DEFAULT 0,
-                card_size TEXT DEFAULT 'normal'
+                card_size TEXT DEFAULT 'normal',
+                run_it_multi_mode TEXT DEFAULT 'ask'
             )
         """)
 
@@ -361,6 +362,19 @@ async def init_db():
         # only applies the card_size column on a brand-new table.
         try:
             await db.execute("ALTER TABLE player_preferences ADD COLUMN card_size TEXT DEFAULT 'normal'")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        # Migration for existing installs — Run It Multiple auto-decline
+        # preference. 'ask' (default) votes normally every time; 'auto_decline'
+        # skips this player straight to a normal single-board run-out with no
+        # vote prompt (see poker.py's _run_rit_vote). Deliberately no
+        # 'auto_accept' — a vote for 2x/3x still needs an actual count chosen
+        # per hand, same as real rooms don't let you pre-commit to a run count
+        # before seeing that hand's pot/opponents.
+        try:
+            await db.execute("ALTER TABLE player_preferences ADD COLUMN run_it_multi_mode TEXT DEFAULT 'ask'")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
@@ -2574,7 +2588,8 @@ DEFAULT_PREFERENCES = {
     "confirm_leave": 1,
     "confirm_call_raise_mode": "never",
     "confirm_call_raise_threshold": 0,
-    "card_size": "normal"  # "normal" | "compact" for "My Cards" image size only
+    "card_size": "normal",  # "normal" | "compact" for "My Cards" image size only
+    "run_it_multi_mode": "ask"  # "ask" | "auto_decline" for Run It Multiple votes
 }
 
 async def get_player_preference(user_id: int) -> dict:
@@ -2599,8 +2614,8 @@ async def set_player_preference(user_id: int, **kwargs):
                 confirm_all_in_mode, confirm_all_in_threshold,
                 confirm_fold_mode, confirm_fold_threshold,
                 confirm_leave, confirm_call_raise_mode, confirm_call_raise_threshold,
-                card_size
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                card_size, run_it_multi_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 auto_rebuy_amount = excluded.auto_rebuy_amount,
                 auto_showdown = excluded.auto_showdown,
@@ -2612,7 +2627,8 @@ async def set_player_preference(user_id: int, **kwargs):
                 confirm_leave = excluded.confirm_leave,
                 confirm_call_raise_mode = excluded.confirm_call_raise_mode,
                 confirm_call_raise_threshold = excluded.confirm_call_raise_threshold,
-                card_size = excluded.card_size
+                card_size = excluded.card_size,
+                run_it_multi_mode = excluded.run_it_multi_mode
         """, (
             user_id,
             curr["auto_rebuy_amount"],
@@ -2625,7 +2641,8 @@ async def set_player_preference(user_id: int, **kwargs):
             curr["confirm_leave"],
             curr["confirm_call_raise_mode"],
             curr["confirm_call_raise_threshold"],
-            curr["card_size"]
+            curr["card_size"],
+            curr["run_it_multi_mode"]
         ))
         await db.commit()
 

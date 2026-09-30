@@ -161,6 +161,8 @@ class TableState:
         # full live state as normal. See that function's docstring.
         self.rit_reveal_upto: list[int] | None = None
 
+        self.rit_vote_in_progress: bool = False
+
     @property
     def is_tournament(self) -> bool:
         return getattr(self, "_is_tournament", False)
@@ -1468,7 +1470,28 @@ async def _run_rit_vote(channel, t: TableState):
     (t.game.rit_vote_pending). Handles the auto-decline-preference skip,
     posts/live-updates the vote card, applies the 15s timeout, posts the
     recap, then hands off to continue_runout() exactly like an ordinary
-    run-out resumes after any other pause."""
+    run-out resumes after any other pause.
+
+    Re-entrancy guarded (t.rit_vote_in_progress): this is the longest-
+    running pipeline in the file by far — up to ~15s for the vote plus
+    however long the sequential reveal takes afterward — which is enough
+    time for a second, independently-delayed call into _handle_post_action
+    for this SAME table to also observe rit_vote_pending==True while the
+    first call is still mid-flight, and start a second, fully parallel copy
+    of this entire pipeline against the same hand: a second vote card, a
+    second showdown, a duplicate/corrupted hand-log entry. If that guard is
+    already set, this is exactly that situation — bail immediately rather
+    than run twice."""
+    if t.rit_vote_in_progress:
+        return
+    t.rit_vote_in_progress = True
+    try:
+        await _run_rit_vote_impl(channel, t)
+    finally:
+        t.rit_vote_in_progress = False
+
+
+async def _run_rit_vote_impl(channel, t: TableState):
     game = t.game
 
     cancel_timer(t)
@@ -1623,6 +1646,9 @@ async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int):
 
 
 async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
+    if t.rit_vote_in_progress:
+        return
+
     for trigger_point in t.game.pending_random_event_triggers:
         event_id = chaos.pick_event_id()
         if event_id:

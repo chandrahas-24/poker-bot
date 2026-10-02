@@ -5299,7 +5299,17 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
         caption = f"Your hole cards — {target.chips} {get_chip_emoji(t)} at table{strength}\n**Cards:** {cards_text}{shiny}{uno_note}{bounty_note}"
 
     if USE_IMAGES:
-        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            # Interaction already expired by the time this callback got to
+            # run — most commonly a "My Cards" click landing in the
+            # AuctionCardsOnlyView, which gets rebuilt fresh on every
+            # refresh() during a paused/reveal state (e.g. every ~1.2s
+            # through a Run It Multiple sequential board reveal). Nothing
+            # can be done with a dead interaction token; fail silently
+            # rather than letting this propagate as an unhandled 404.
+            return
         try:
             # Card Borders cosmetic
             target_cosmetics = await db.get_cosmetics(target.user_id)
@@ -5325,7 +5335,10 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
             await interaction.followup.send(caption, view=uno_view, ephemeral=True)  # text-only fallback
         return
 
-    await interaction.response.send_message(caption, view=uno_view, ephemeral=True)
+    try:
+        await interaction.response.send_message(caption, view=uno_view, ephemeral=True)
+    except (discord.NotFound, discord.HTTPException):
+        pass  # same expired-interaction race as the USE_IMAGES branch above
 
 
 class AuctionCardsOnlyView(discord.ui.View):

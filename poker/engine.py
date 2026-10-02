@@ -1192,11 +1192,6 @@ class PokerGame:
                 return ""
             self.rit_state = "resolved"  # only 1 player left in the hand — nothing to vote on, ever
 
-        # Never allow a second street advance while the RIT vote is pending.
-        # The vote must resolve before any community cards are dealt.
-        if self.rit_state == "pending_vote":
-            return ""
-
         # Fetch rigged community list
         rigged_comm = getattr(self, "_rigged_community", [])
         # "Reverse" is a chaos-table-only modifier and tutorials never run chaos

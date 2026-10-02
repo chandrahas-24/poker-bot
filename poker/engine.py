@@ -1134,6 +1134,10 @@ class PokerGame:
             self.pending_random_event_triggers.append(point)
 
     def _next_street(self) -> str:
+        # Never advance or deal cards while an RIT vote is unresolved.
+        if self.rit_state == "pending_vote":
+            return ""
+
         for p in self.players:
             p.reset_for_street()
         self.current_bet = 0

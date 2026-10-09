@@ -1106,6 +1106,20 @@ async def pay_jackpot(user_id: int, username: str, amount: int, reason: str) -> 
     return actual
 
 
+async def get_jackpot_payouts() -> list[tuple]:
+    """
+    Every JACKPOT_PAYOUT audit row, newest first, as (id, ts, user_id, user_name, detail).
+    Read-only. pay_jackpot() is the only writer of these rows.
+    """
+    db = await _get_db()
+    async with db.execute(
+        "SELECT id, ts, user_id, user_name, detail FROM audit_log "
+        "WHERE action = 'JACKPOT_PAYOUT' ORDER BY id DESC"
+    ) as c:
+        rows = await c.fetchall()
+    return [tuple(r) for r in rows]
+
+
 async def get_revenue_stats() -> dict:
     db = await _get_db()
     now = datetime.utcnow()

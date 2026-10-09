@@ -7823,18 +7823,9 @@ class PokerCog(commands.Cog):
 
         file = discord.File(image_data, filename="jackpot.png")
 
-        # Components V2 layout
-        view = discord.ui.LayoutView()
-
-        container = discord.ui.Container(
-            discord.ui.MediaGallery().add_item(
-                media="attachment://jackpot.png"
-            ),
-        )
-
-        view.add_item(container)
-
-        await interaction.followup.send(
+        # Components V2 layout (image + Stats button)
+        view = JackpotView()
+        view.message = await interaction.followup.send(
             view=view,
             file=file,
         )
@@ -9273,6 +9264,112 @@ class RawSQLPaginationView(discord.ui.View):
         self.current_page = self.max_pages - 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+
+# ── Jackpot stats ─────────────────────────────────────────────────────────────
+
+def _fmt_jp(amt: int) -> str:
+    # Same display convention as the in-channel jackpot announcement.
+    return f"⏣ {amt:,},000,000"
+
+
+def _jp_section(entries: list[dict], width: int, show_tier: bool) -> str:
+    if not entries:
+        return "No hits yet."
+    lines = []
+    for e in entries:
+        tier = f" · {e['tier']}" if show_tier else ""
+        when = f" · <t:{e['ts']}:R>" if e["ts"] else ""
+        lines.append(f"{_fmt_jp(e['amt']).rjust(width)}  <@{e['uid']}>{tier}{when}")
+    return "\n".join(lines)
+
+
+def jackpot_stats_items(stats: dict) -> list:
+    sections = (
+        ("Four of a Kind", stats["quads"], False),
+        ("Straight Flush", stats["sf"], False),
+        ("Royal Flush", stats["rf"], False),
+        ("Shiny Hits", stats["shiny"], True),
+        ("Biggest Wins", stats["top"], True),
+    )
+    all_entries = [e for _, es, _ in sections for e in es]
+    width = max((len(_fmt_jp(e["amt"])) for e in all_entries), default=1)
+
+    items = [discord.ui.TextDisplay(
+        f"## Jackpot History\n"
+        f"-# Last 30 days: {_fmt_jp(stats['window_total'])} won across "
+        f"{stats['window_count']} payout{'s' if stats['window_count'] != 1 else ''}\n"
+        f"-# All time: {_fmt_jp(stats['all_total'])} across "
+        f"{stats['all_count']} payout{'s' if stats['all_count'] != 1 else ''}"
+    )]
+    for title, entries, show_tier in sections:
+        items.append(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        items.append(discord.ui.TextDisplay(
+            f"### {title}\n{_jp_section(entries, width, show_tier)}"
+        ))
+    items.append(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    items.append(discord.ui.TextDisplay(
+        "-# At least ⏣ 30,000,000,000 in earlier payouts was not recorded properly, "
+        "so the real total paid out is higher."
+    ))
+    return items
+
+
+class JackpotView(discord.ui.LayoutView):
+    """/jackpot message: image + a Stats button that expands/collapses the stats in place."""
+
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.message: discord.Message | None = None
+        self.stats: dict | None = None  # None = collapsed
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        expanded = self.stats is not None
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://jackpot.png")),
+        )
+        if expanded:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            for item in jackpot_stats_items(self.stats):
+                container.add_item(item)
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        self.stats_btn = discord.ui.Button(
+            label="Hide" if expanded else "History",
+            style=discord.ButtonStyle.blurple if expanded else discord.ButtonStyle.secondary,
+        )
+        self.stats_btn.callback = self._on_stats
+        row = discord.ui.ActionRow()
+        row.add_item(self.stats_btn)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def _on_stats(self, interaction: discord.Interaction):
+        try:
+            if self.stats is None:
+                rows = await db.get_jackpot_payouts()
+                self.stats = jackpot.build_jackpot_stats(rows)
+            else:
+                self.stats = None
+            self._build()
+            await interaction.response.edit_message(view=self)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        except Exception:
+            traceback.print_exc()
+            try:
+                await interaction.response.send_message("Couldn't load jackpot stats.", ephemeral=True)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+    async def on_timeout(self):
+        self.stats_btn.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.Forbidden):
+                pass
 
 
 class ChangelogView(discord.ui.LayoutView):

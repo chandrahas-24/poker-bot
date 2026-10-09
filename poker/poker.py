@@ -9280,7 +9280,7 @@ def _jp_section(entries: list[dict], width: int, show_tier: bool) -> str:
     for e in entries:
         tier = f" · {e['tier']}" if show_tier else ""
         when = f" · <t:{e['ts']}:R>" if e["ts"] else ""
-        lines.append(f"{_fmt_jp(e['amt']).rjust(width)}  <@{e['uid']}>{tier}{when}")
+        lines.append(f"`{_fmt_jp(e['amt']).rjust(width)}`  <@{e['uid']}>{tier}{when}")
     return "\n".join(lines)
 
 

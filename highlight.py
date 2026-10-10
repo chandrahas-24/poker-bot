@@ -18,8 +18,15 @@ DEFAULT_CONFIG = {
     "active_context_seconds": 60,
     "allowed_users": [],
     "role_ids": [836210264873369630],
-    "max_context_words": 1
+    "max_context_words": 1,
+    "alert_delay_seconds": 90
 }
+
+# Messages shown around the trigger message in the DM.
+CONTEXT_BEFORE = 3   # messages before the trigger
+CONTEXT_AFTER = 4    # messages after the trigger (filled in after the delay)
+VERIFY_BEFORE = 5    # messages before the trigger sent to the AI verifier
+HISTORY_SIZE = 15    # per-channel rolling history (only needs the "before" context)
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -80,7 +87,7 @@ class HighlightCog(commands.Cog):
         self.cooldowns = {}
         self.regex_cache = {}
         self.last_active = {}  # Tracks {(user_id, channel_id): timestamp} for highlight users ONLY
-        self.channel_history = {}
+        self.channel_history = {}  # {channel_id: deque[(message_id, formatted_line)]}
         self.session = None    # Persistent aiohttp session
 
     async def cog_load(self):
@@ -314,6 +321,7 @@ class HighlightCog(commands.Cog):
     @app_commands.choices(setting=[
         app_commands.Choice(name="Cooldown Seconds", value="cooldown"),
         app_commands.Choice(name="Active Context Seconds", value="active_context"),
+        app_commands.Choice(name="Alert Delay Seconds", value="alert_delay"),
         app_commands.Choice(name="Max Context Words", value="max_context_words"),
         app_commands.Choice(name="Allow User", value="allow"),
         app_commands.Choice(name="Disallow User", value="disallow"),
@@ -338,7 +346,7 @@ class HighlightCog(commands.Cog):
                 return
             HIGHLIGHT_CONFIG["cooldown_seconds"] = value
             globals()["COOLDOWN_SECONDS"] = value
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(f"✅ Cooldown set to `{value}s`.", ephemeral=True)
 
         elif setting == "active_context":
@@ -347,15 +355,23 @@ class HighlightCog(commands.Cog):
                 return
             HIGHLIGHT_CONFIG["active_context_seconds"] = value
             globals()["ACTIVE_CONTEXT_SECONDS"] = value
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(f"✅ Active context set to `{value}s`.", ephemeral=True)
+
+        elif setting == "alert_delay":
+            if value is None or value < 0:
+                await interaction.response.send_message("❌ Provide a non-negative numeric value.", ephemeral=True)
+                return
+            HIGHLIGHT_CONFIG["alert_delay_seconds"] = value
+            save_config(HIGHLIGHT_CONFIG)
+            await interaction.response.send_message(f"✅ Alert delay set to `{value}s`.", ephemeral=True)
 
         elif setting == "max_context_words":
             if value is None or value < 1:
                 await interaction.response.send_message("❌ Max context words must be at least 1.", ephemeral=True)
                 return
             HIGHLIGHT_CONFIG["max_context_words"] = value
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(f"✅ Max context words set to `{value}`.", ephemeral=True)
 
         elif setting == "allow":
@@ -366,7 +382,7 @@ class HighlightCog(commands.Cog):
             allowed_users = {int(uid) for uid in HIGHLIGHT_CONFIG.get("allowed_users", [])}
             allowed_users.add(user.id)
             HIGHLIGHT_CONFIG["allowed_users"] = sorted(allowed_users)
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(f"✅ {user.mention} is now allowlisted.", ephemeral=True)
 
         elif setting == "disallow":
@@ -377,7 +393,7 @@ class HighlightCog(commands.Cog):
             allowed_users = {int(uid) for uid in HIGHLIGHT_CONFIG.get("allowed_users", [])}
             allowed_users.discard(user.id)
             HIGHLIGHT_CONFIG["allowed_users"] = sorted(allowed_users)
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(f"✅ {user.mention} was removed from the allowlist.", ephemeral=True)
 
         elif setting == "add_role":
@@ -389,7 +405,7 @@ class HighlightCog(commands.Cog):
             HIGHLIGHT_CONFIG["role_ids"] = sorted(role_ids)
             if role.id not in HIGHLIGHT_ROLE_IDS:
                 HIGHLIGHT_ROLE_IDS.append(role.id)
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(
                 f"✅ Members with {role.mention} can now use highlights.",
                 ephemeral=True
@@ -404,7 +420,7 @@ class HighlightCog(commands.Cog):
             HIGHLIGHT_CONFIG["role_ids"] = sorted(role_ids)
             while role.id in HIGHLIGHT_ROLE_IDS:
                 HIGHLIGHT_ROLE_IDS.remove(role.id)
-            save_config()
+            save_config(HIGHLIGHT_CONFIG)
             await interaction.response.send_message(
                 f"✅ {role.mention} was removed from the highlight role allowlist.",
                 ephemeral=True
@@ -556,11 +572,13 @@ class HighlightCog(commands.Cog):
             return
 
         if message.channel.id not in self.channel_history:
-            self.channel_history[message.channel.id] = deque(maxlen=6)
+            self.channel_history[message.channel.id] = deque(maxlen=HISTORY_SIZE)
 
         time_str = message.created_at.strftime('%H:%M:%S')
         clean_content = discord.utils.escape_markdown(message.content)
-        self.channel_history[message.channel.id].append(f"**[{time_str}] {message.author.name}:** {clean_content}")
+        self.channel_history[message.channel.id].append(
+            (message.id, f"**[{time_str}] {message.author.name}:** {clean_content}")
+        )
 
         current_time = time.time()
         author_id_str = str(message.author.id)
@@ -778,13 +796,47 @@ class HighlightCog(commands.Cog):
                 print(f"[Groq] API error: {type(e).__name__}: {e} -> allowing highlight")
                 return True
 
+    def _slice_context(self, channel_id: int, msg_id: int, before: int, after: int):
+        """Returns formatted lines around msg_id, or None if it rolled out of history."""
+        history = list(self.channel_history.get(channel_id, []))
+        idx = next((i for i, (mid, _) in enumerate(history) if mid == msg_id), None)
+        if idx is None:
+            return None
+        return [line for _, line in history[max(0, idx - before): idx + 1 + after]]
+
+    async def _fetch_after(self, message: discord.Message, count: int):
+        """Fetches up to `count` non-bot messages after `message` straight from Discord."""
+        lines = []
+        try:
+            async for m in message.channel.history(after=message, limit=count * 5, oldest_first=True):
+                if m.author.bot:
+                    continue
+                time_str = m.created_at.strftime('%H:%M:%S')
+                clean = discord.utils.escape_markdown(m.content)
+                lines.append(f"**[{time_str}] {m.author.name}:** {clean}")
+                if len(lines) >= count:
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return lines
+
+    @staticmethod
+    def _highlight_lines(lines, pattern) -> str:
+        out = []
+        for line in lines:
+            parts = line.split(":** ", 1)
+            if len(parts) == 2 and pattern:
+                out.append(parts[0] + ":** " + pattern.sub(r'`\g<0>`', parts[1]))
+            else:
+                out.append(line)
+        return "\n".join(out)
+
     async def send_alert(self, user_id_str: str, word: str, message: discord.Message):
         try:
             user = await self.bot.fetch_user(int(user_id_str))
             if not user:
                 return
 
-            context_lines = list(self.channel_history.get(message.channel.id, []))
             user_prefs = self.highlights.get(user_id_str, {})
             context_words = user_prefs.get("context_words", set())
 
@@ -797,34 +849,27 @@ class HighlightCog(commands.Cog):
             else:
                 pattern = re.compile(r'(?i)' + re.escape(word))
 
-            highlighted_lines = []
-            for line in context_lines:
-                parts = line.split(":** ", 1)
-                if len(parts) == 2:
-                    prefix = parts[0] + ":** "
-                    content = parts[1]
-                    if pattern:
-                        content = pattern.sub(r'`\g<0>`', content)
-                    highlighted_lines.append(prefix + content)
-                else:
-                    highlighted_lines.append(line)
-
-            formatted_context = "\n".join(highlighted_lines)
-
             is_context_word = any(
                 word.lower() == context_word.lower()
                 or word.lower() == f"*{context_word.lower()}*"
                 for context_word in context_words
             )
 
+            # Context up to and including the trigger message (nothing after it).
+            pre_lines = self._slice_context(message.channel.id, message.id, VERIFY_BEFORE, 0) or []
+
             if is_context_word:
-                is_valid_target = await self.verify_context_with_gemini(word, formatted_context)
+                is_valid_target = await self.verify_context_with_gemini(
+                    word, self._highlight_lines(pre_lines, pattern)
+                )
                 if not is_valid_target:
                     return
 
+            # Initial DM: instant, trigger message is the last line.
+            initial_lines = pre_lines[-(CONTEXT_BEFORE + 1):]
             embed = discord.Embed(
                 title=f"Highlight word \"{word}\"",
-                description=formatted_context,
+                description=self._highlight_lines(initial_lines, pattern),
                 color=discord.Color.gold(),
                 timestamp=message.created_at
             )
@@ -833,7 +878,24 @@ class HighlightCog(commands.Cog):
             embed.set_footer(text="Triggered")
 
             ping_content = f"{user.mention} | In **{message.guild.name}** › {message.channel.mention}"
-            await user.send(content=ping_content, embed=embed)
+            dm_message = await user.send(content=ping_content, embed=embed)
+
+            # After the delay, edit the DM to include the following messages.
+            delay = HIGHLIGHT_CONFIG.get("alert_delay_seconds", 0)
+            if delay <= 0:
+                return
+
+            await asyncio.sleep(delay)
+
+            after_lines = await self._fetch_after(message, CONTEXT_AFTER)
+            if not after_lines:
+                return  # nothing followed
+
+            embed.description = self._highlight_lines(initial_lines + after_lines, pattern)
+            try:
+                await dm_message.edit(embed=embed)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
         except discord.Forbidden:
             pass

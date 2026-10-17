@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 import dateparser
 
 DATE_FORMAT = "%Y-%m-%d"
+IST = timezone(timedelta(hours=5, minutes=30))  # event_logs.timestamp is stored in IST, not UTC
 
 def parse_date(value: str) -> date:
     dt = dateparser.parse(
@@ -19,6 +20,9 @@ def parse_date(value: str) -> date:
         settings={
             "PREFER_DATES_FROM": "past",   # "Aug 1" -> most recent Aug 1
             "DATE_ORDER": "YMD",           # Prefer YYYY-MM-DD
+            "TIMEZONE": "Asia/Kolkata",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "RELATIVE_BASE": datetime.now(IST).replace(tzinfo=None),
         },
     )
 
@@ -48,7 +52,7 @@ async def date_autocomplete(
 
     # Last 14 days -> today
     for i in range(14, -1, -1):
-        d = date.today() - timedelta(days=i)
+        d = datetime.now(IST).date() - timedelta(days=i)
         s = d.strftime(DATE_FORMAT)
 
         if current in s:
@@ -220,7 +224,7 @@ class EventLogsCog(commands.Cog):
             if end_date:
                 end_date = parse_date(end_date).strftime(DATE_FORMAT)
             else:
-                end_date = date.today().strftime(DATE_FORMAT)
+                end_date = datetime.now(IST).date().strftime(DATE_FORMAT)
         except ValueError:
             await interaction.response.send_message(
                 "❌ Invalid date.",
@@ -335,7 +339,7 @@ class EventLogsCog(commands.Cog):
                 message = await channel.fetch_message(payload.message_id)
                 message_timestamp = (
                     message.created_at
-                    .astimezone(timezone(timedelta(hours=5, minutes=30)))
+                    .astimezone(IST)
                     .strftime("%Y-%m-%d %H:%M:%S")
                 )
             except discord.NotFound:

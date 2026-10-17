@@ -28,6 +28,7 @@ import dateparser
 
 from .leaderboard_image import generate_leaderboard_image
 from .jackpot_image import generate_jackpot_image
+from .net_chips_graph import get_history as get_net_chips_history, generate_net_chips_graph, get_csv_last_updated
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -41,7 +42,7 @@ DAILY_AFK_LIMIT        = config.DAILY_AFK_LIMIT
 CONSECUTIVE_AFK_LIMIT  = config.CONSECUTIVE_AFK_LIMIT
 TABLE_RESEND_MSGS       = config.TABLE_RESEND_MSGS
 
-# Chaos only
+# 2/7 offsuit bluff bonus + "67" title
 BLUFF_27_BONUS = 30  # chips taken from each other player's table stack
 
 def _is_27_offsuit(hole_cards: list[int]) -> bool:
@@ -95,6 +96,9 @@ def parse_date(value: str) -> date:
         settings={
             "PREFER_DATES_FROM": "past",
             "DATE_ORDER": "YMD",
+            "TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "RELATIVE_BASE": datetime.now(_tz.utc).replace(tzinfo=None),
         },
     )
 
@@ -124,7 +128,7 @@ async def date_autocomplete(
 
     # Last 14 days through today
     for i in range(14, -1, -1):
-        d = date.today() - timedelta(days=i)
+        d = datetime.now(_tz.utc).date() - timedelta(days=i)
         s = d.strftime(DATE_FORMAT)
 
         if current in s:
@@ -164,6 +168,15 @@ class TableState:
         self.pending_gamble_bets: dict = {}      # Gamble the Gamble during the pre-deal window
         self.active_random_event: dict | None = None  # Random events: message-based ones (phrase chant, number guess) read this from on_message
         self.sixseven_bait_active: bool = False # 67 title after hand before next hand
+
+        # Run It Multiple: transient per-board reveal cursor, used only
+        # while _reveal_rit_boards_sequential() is actively revealing
+        # (board 1 fully, then board 2, then board 3…). None the rest of
+        # the time, in which case update_board() renders every board's
+        # full live state as normal. See that function's docstring.
+        self.rit_reveal_upto: list[int] | None = None
+
+        self.rit_vote_in_progress: bool = False
 
     @property
     def is_tournament(self) -> bool:
@@ -976,7 +989,11 @@ async def post_hand_log(channel, t: TableState, result):
         uname = _name_map.get(uid, "Unknown")
         return f"{uname} ({uid})"
 
-    if hasattr(result, 'community2') and result.community2:
+    if hasattr(result, 'rit_boards') and result.rit_boards:
+        lines.append(f"Board 1: {hand_str(result.community)}")
+        for i, b in enumerate(result.rit_boards, start=2):
+            lines.append(f"Board {i}: {hand_str(b)}")
+    elif hasattr(result, 'community2') and result.community2:
         lines.append(f"Board 1: {hand_str(result.community)}")
         lines.append(f"Board 2: {hand_str(result.community2)}")
     elif hasattr(result, 'community') and result.community:
@@ -986,7 +1003,9 @@ async def post_hand_log(channel, t: TableState, result):
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results))]
     ranks = result.winner_ranks or {}
     ranks2 = result.winner_ranks2 or {}
+    rit_ranks = getattr(result, "rit_winner_ranks", None) or []
     double_board_active = bool(getattr(result, "community2", None))
+    rit_active = bool(getattr(result, "rit_boards", None))
 
     # 🚨 Grab the folded snapshot from the engine
     folded_ids = getattr(result, "folded_ids", set())
@@ -1005,7 +1024,17 @@ async def post_hand_log(channel, t: TableState, result):
         else:
             cards = "no cards"
 
-        if double_board_active:
+        if rit_active:
+            board_parts = []
+            r1 = ranks.get(uid)
+            if r1:
+                board_parts.append(f"B1: {r1}")
+            for i, rr in enumerate(rit_ranks, start=2):
+                r = rr.get(uid)
+                if r:
+                    board_parts.append(f"B{i}: {r}")
+            rank_part = f" [{', '.join(board_parts)}]" if board_parts else ""
+        elif double_board_active:
             # Each board gets its own rank shown separately
             board_parts = []
             r1 = ranks.get(uid)
@@ -1228,6 +1257,25 @@ async def update_board(t: TableState):
 
     cute_mode = "cute_mode" in t.chaos_modifiers
 
+    if game.rit_count > 1 and game.rit_boards:
+        # Run It Multiple: same reveal pacing/positions as a normal single
+        # board (this never combines with "reverse" or Double Board — see
+        # engine.py's rit_state docstring for why those stay mutually
+        # exclusive), just stacked N-high instead of stitched side-by-side.
+        boards = [list(game.community)] + [list(b) for b in game.rit_boards]
+        if t.rit_reveal_upto is not None:
+            # Mid-sequential-reveal: truncate each board to however many of
+            # its cards should be visible RIGHT NOW (see
+            # _reveal_rit_boards_sequential) — make_multi_board_strip pads
+            # the rest with card backs automatically, same as a normal
+            # single board's `backs` count does.
+            boards = [b[:n] for b, n in zip(boards, t.rit_reveal_upto)]
+        blinds = [game.blinded_community_idx] + [set() for _ in game.rit_boards]
+        t.board_file = await asyncio.to_thread(
+            card_images.make_multi_board_strip, boards, blinds, cute_mode,
+        )
+        return
+
     if "double_board" in t.chaos_modifiers:
         if "reverse" in t.chaos_modifiers:
             # river, turn, then flop
@@ -1323,13 +1371,308 @@ RUNOUT_REVEAL_DELAY = 2.5  # seconds paused between each community card reveal d
                             # an all-in run-out (natural, or the "All In!" modifier) —
                             # see _handle_post_action and engine.py's runout_pause_pending
 
+# ── Run It Multiple (player-consented; NOT a chaos modifier) ──────────────────
+# See engine.py's rit_state docstring for the full state machine this is the
+# UI half of. Entirely self-contained: one Components V2 view, one driver
+# coroutine, one hook line in _handle_post_action below. Nothing else in the
+# file reaches into it, and it reaches into nothing else beyond t.game's
+# public rit_* surface and the ordinary continue_runout()/slog() calls the
+# existing runout-reveal loop already uses — safe to rip out by deleting this
+# block, the one hook line, and the run_it_multi_mode preference wiring.
+
+RIT_VOTE_TIMEOUT = 15.0  # seconds before a non-vote counts as a decline
+
+
+class RunItMultiVoteView(discord.ui.LayoutView):
+    """Posted in-channel (not ephemeral) so every eligible all-in player can
+    click from the same message. Only user_ids in `eligible` may vote; every
+    click re-renders the live tally via edit_message. Resolution itself
+    (min-of-votes / any-decline-cancels) lives in engine.py's
+    resolve_run_it_vote() — this view only collects raw votes and displays
+    them."""
+
+    def __init__(self, game: "PokerGame", eligible: list[tuple[int, str]], pot_display: str):
+        super().__init__(timeout=RIT_VOTE_TIMEOUT + 5)
+        self.game = game
+        self.eligible = eligible  # [(user_id, display_name), ...], fixed order
+        self.eligible_ids = {uid for uid, _ in eligible}
+        self.pot_display = pot_display
+        self.done = asyncio.Event()
+        self.message: discord.Message | None = None
+        self.finalized = False  # True once the shared message has had its one and only edit — see _make_callback
+        self._build()
+
+    def _tally_lines(self) -> list[str]:
+        lines = []
+        for uid, name in self.eligible:
+            if uid not in self.game.rit_votes:
+                lines.append(f"⏳ **{name}** — waiting…")
+            else:
+                vote = self.game.rit_votes[uid]
+                lines.append(f"❌ **{name}** — declined" if vote is None else f"✅ **{name}** — run it **{vote}x**")
+        return lines
+
+    def _build(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=discord.Colour(0x2ECC71))
+        mentions = " ".join(f"<@{uid}>" for uid, _ in self.eligible)
+        container.add_item(discord.ui.TextDisplay(
+            f"# Run It Multiple?\n"
+            f"Everyone's all-in. {mentions} how many times do you want to run the board? "
+            f"Any single decline runs it once as normal, and the final count is the LOWEST anyone asks for."
+        ))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay("\n".join(self._tally_lines())))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        for label, choice in (("2 times", 2), ("3 times", 3), ("Decline", None)):
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.danger if choice is None else discord.ButtonStyle.success,
+            )
+            btn.callback = self._make_callback(choice)
+            row.add_item(btn)
+        container.add_item(row)
+        self.add_item(container)
+
+    def _make_callback(self, choice: int | None):
+        async def _cb(interaction: discord.Interaction):
+            uid = interaction.user.id
+            if uid not in self.eligible_ids:
+                await interaction.response.send_message(
+                    "❌ Not your call — only players still live in this hand vote on this.", ephemeral=True)
+                return
+            if uid in self.game.rit_votes:
+                await interaction.response.send_message("❌ You already voted.", ephemeral=True)
+                return
+            finished = self.game.cast_run_it_vote(uid, choice)
+            if finished:
+                # Either this was a decline (always ends the vote instantly,
+                # per cast_run_it_vote's own semantics) or the last
+                # outstanding vote — either way nobody else can still be
+                # mid-click on this vote, so it's safe to do the one and
+                # only edit to the SHARED message now.
+                self._build()
+                self.disable_all()
+                try:
+                    await interaction.response.edit_message(view=self)
+                except discord.HTTPException:
+                    pass
+                self.finalized = True
+                self.done.set()
+            else:
+                # Still waiting on others — acknowledge PRIVATELY instead of
+                # touching the shared message. Editing the shared message on
+                # every non-deciding vote (the old behavior) is exactly what
+                # was causing other players' clicks on that same message to
+                # fail with "interaction failed" when their click landed
+                # while someone else's edit was in flight. Only the click
+                # that actually ends the vote gets to edit the real message.
+                label = "2x" if choice == 2 else "3x"
+                await interaction.response.send_message(
+                    f"✅ Vote recorded: run it {label}. Waiting on the others…", ephemeral=True)
+        return _cb
+
+    def disable_all(self):
+        for item in self.walk_children():
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+
+async def _run_rit_vote(channel, t: TableState):
+    """Driver for one Run It Multiple vote. Called once from
+    _handle_post_action right when engine.py's rit_state gate fires
+    (t.game.rit_vote_pending). Handles the auto-decline-preference skip,
+    posts/live-updates the vote card, applies the 15s timeout, posts the
+    recap, then hands off to continue_runout() exactly like an ordinary
+    run-out resumes after any other pause.
+
+    Re-entrancy guarded (t.rit_vote_in_progress): this is the longest-
+    running pipeline in the file by far — up to ~15s for the vote plus
+    however long the sequential reveal takes afterward — which is enough
+    time for a second, independently-delayed call into _handle_post_action
+    for this SAME table to also observe rit_vote_pending==True while the
+    first call is still mid-flight, and start a second, fully parallel copy
+    of this entire pipeline against the same hand: a second vote card, a
+    second showdown, a duplicate/corrupted hand-log entry. If that guard is
+    already set, this is exactly that situation — bail immediately rather
+    than run twice."""
+    if t.rit_vote_in_progress:
+        return
+    t.rit_vote_in_progress = True
+    try:
+        await _run_rit_vote_impl(channel, t)
+    finally:
+        t.rit_vote_in_progress = False
+
+
+async def _run_rit_vote_impl(channel, t: TableState):
+    game = t.game
+
+    cancel_timer(t)
+
+    names: list[tuple[int, str]] = []
+    for uid in game.rit_eligible_uids:
+        p = game.get_player(uid)
+        names.append((uid, p.display_name if p else f"Player {uid}"))
+
+    # Any eligible player with the auto-decline preference set skips the
+    # vote entirely for everyone — a single decline cancels the whole thing
+    # regardless of who else might have agreed, so there's nothing to ask.
+    auto_decline_names = []
+    for uid, name in names:
+        pref = await db.get_player_preference(uid)
+        if pref.get("run_it_multi_mode") == "auto_decline":
+            auto_decline_names.append(name)
+
+    if auto_decline_names:
+        who = ", ".join(f"**{n}**" for n in auto_decline_names)
+        await channel.send(f"{who} auto-declines Run It Multiple.")
+        game.resolve_run_it_vote()
+    else:
+        pot_display = f"{game.pot}{game.chip_emoji}"
+        view = RunItMultiVoteView(game, names, pot_display)
+        view.message = await channel.send(view=view)
+
+        try:
+            await asyncio.wait_for(view.done.wait(), timeout=RIT_VOTE_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+
+        count = game.resolve_run_it_vote()
+
+        if not view.finalized:
+            # Only reached on a genuine timeout — no click ever finished the
+            # vote (see _make_callback), so this is the one and only edit
+            # for that case.
+            view.disable_all()
+            try:
+                if view.message:
+                    await view.message.edit(view=view)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        recap = []
+        for uid, name in names:
+            if uid not in game.rit_votes:
+                recap.append(f"**{name}** didn't get a vote in (a decline already ended it or time ran out).")
+            elif game.rit_votes[uid] is None:
+                recap.append(f"❌ **{name}** declined.")
+            else:
+                recap.append(f"✅ **{name}** voted **{game.rit_votes[uid]}x**.")
+        recap.append(f"** Running it {count} times!**" if count > 1 else "")
+        await channel.send("\n".join(recap))
+
+        # Wipe the tracking state to force a new message
+    t.hand_msg = None
+    t.msg_count = 0
+
+    # Send the fresh table at the bottom.
+    # The subsequent card reveal logic will now edit this new message.
+    await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, new_hand=True, pause_turn=True)
+
+    pre_len = len(game.community)  # community length BEFORE any post-vote dealing — see
+                                    # _reveal_rit_boards_sequential's docstring for why this matters
+
+    if game.rit_count > 1 and game.rit_boards:
+        # Multi-board: drain every remaining street ourselves right now,
+        # quietly (no visual pacing here) — because we're about to do our
+        # OWN reveal pacing next: board 1 fully, then board 2, then board
+        # 3, instead of _handle_post_action's standard lockstep-across-
+        # all-boards loop. By the time we return, runout_pause_pending is
+        # already False, so that standard loop is a no-op and falls
+        # straight through to the (unchanged, rit-agnostic) showdown call.
+        #
+        # continue_runout() itself is what deals the NEXT street — it only
+        # clears runout_pause_pending on the way in, so the very first call
+        # must happen unconditionally (the vote gate in engine.py returns
+        # before that flag is ever set to True, so `while
+        # game.runout_pause_pending:` alone would never even enter its
+        # body on the first street after a vote).
+        def _drain_tail(tail):
+            if tail:
+                if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
+                    slog_clear(t)
+                for part in tail.split("\n"):
+                    if part.strip():
+                        slog(t, part)
+        _drain_tail(game.continue_runout())
+        while game.runout_pause_pending:
+            _drain_tail(game.continue_runout())
+        await _reveal_rit_boards_sequential(channel, t, pre_len)
+    else:
+        # Declined (or nothing to vote on) — an ordinary single-board hand
+        # from here on, so leave the usual pacing to _handle_post_action's
+        # own runout_pause_pending loop; just deal the immediate next
+        # street here, exactly like this code path always did before any
+        # vote existed.
+        tail = game.continue_runout()
+        if tail:
+            if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
+                slog_clear(t)
+            for part in tail.split("\n"):
+                if part.strip():
+                    slog(t, part)
+
+
+RIT_REVEAL_DELAY = 1.2  # Run It Multiple's own reveal pacing — smaller than RUNOUT_REVEAL_DELAY
+                         # since there are more total reveals overall (every board's remaining
+                         # streets, once per board) than a normal single-board run-out has.
+
+
+async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int):
+    """
+    Called once, right after a Run It Multiple vote resolves to more than
+    one board — by which point _run_rit_vote has already fully dealt every
+    board internally. Reveals board 1's remaining streets completely, THEN
+    board 2's, THEN board 3's — sequential and complete per board — rather
+    than Double Board's lockstep street-by-street-across-all-boards pacing.
+
+    `pre_len` is how many community cards existed BEFORE the vote — e.g. 3
+    if the all-in happened going into the turn, so only the river needs
+    revealing per board, not the flop everyone already watched during real
+    betting. Every board shares that same pre_len prefix (they're literal
+    copies of each other up to the point they diverge), so all of them
+    already show those shared cards for the whole reveal.
+
+    Drives update_board() via t.rit_reveal_upto (a per-board "cards visible
+    right now" cursor) rather than touching game state — nothing here
+    affects the actual dealt cards, only what's rendered at each step.
+    """
+    game = t.game
+    all_boards = [game.community] + game.rit_boards
+    n_boards = len(all_boards)
+
+    steps = [n for n in (3, 4, 5) if n > pre_len]  # street boundaries still to reveal
+    if not steps:
+        return  # nothing left to reveal (all-in happened on/after the river — caller shouldn't hit this)
+
+    t.rit_reveal_upto = [pre_len] * n_boards
+    try:
+        for board_idx in range(n_boards):
+            for n in steps:
+                t.rit_reveal_upto[board_idx] = n
+                await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+                await asyncio.sleep(RIT_REVEAL_DELAY)
+            # board_idx is now fully shown (5 cards) and stays that way on
+            # screen while later boards continue revealing next to it.
+    finally:
+        t.rit_reveal_upto = None  # back to normal — update_board() renders full live state again
+
 
 async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
+    if t.rit_vote_in_progress:
+        return
+
     for trigger_point in t.game.pending_random_event_triggers:
         event_id = chaos.pick_event_id()
         if event_id:
             asyncio.create_task(_run_random_event(channel, t, event_id, trigger_point))
     t.game.pending_random_event_triggers = []
+
+    # Run It Multiple: fires once, before any card of the run-out is dealt.
+    if t.game.rit_vote_pending:
+        await _run_rit_vote(channel, t)
 
     # all in reveals
     while t.game.runout_pause_pending:
@@ -1470,11 +1813,30 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
     await refresh(channel, t)
     return "✅ You left the table."
 
+def build_disclaimer_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="⚠️ Before you play",
+        description=(
+            "This table uses **DMC chips only** remember it's just pixels nothing here has real-world value.\n\n"
+            "If gambling (real or simulated) is a problem for you, help is available, 24/7:\n"
+            "National Problem Gambling Helpline: 1-800-522-4700\n"
+            "**[gamblingtherapy.org](https://www.gamblingtherapy.org)**: free, international, multilingual"
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="Run /responsible-gambling anytime to see this again")
+    return embed
+
+
 async def join_table_execute(interaction: discord.Interaction, t: TableState, chips: int, bal: int, rejoin_fee: int, min_w: int, max_w: int, is_deferred: bool = False):
     if not is_deferred:
         await interaction.response.defer(ephemeral=True)
 
     await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
+
+    if not await db.has_seen_disclaimer(interaction.user.id):
+        await interaction.followup.send(embed=build_disclaimer_embed(), ephemeral=True)
+        await db.mark_disclaimer_seen(interaction.user.id)
 
     if await db.is_banned(interaction.guild_id, interaction.user.id, t.name):
         await interaction.followup.send("❌ You are banned from this table.", ephemeral=True)
@@ -1624,6 +1986,9 @@ class PreferencesView(discord.ui.View):
         self.btn_card_size = discord.ui.Button(custom_id="pref_card_size")
         self.btn_card_size.callback = self.toggle_card_size
 
+        self.btn_run_it_multi = discord.ui.Button(custom_id="pref_run_it_multi")
+        self.btn_run_it_multi.callback = self.toggle_run_it_multi
+
         # Add items so they are registered in ViewStore for dispatching
         self.add_item(self.btn_auto_rebuy)
         self.add_item(self.btn_auto_showdown)
@@ -1633,6 +1998,7 @@ class PreferencesView(discord.ui.View):
         self.add_item(self.btn_confirm_leave)
         self.add_item(self.btn_confirm_call_raise)
         self.add_item(self.btn_card_size)
+        self.add_item(self.btn_run_it_multi)
 
     def has_components_v2(self) -> bool:
         return True
@@ -1716,6 +2082,11 @@ class PreferencesView(discord.ui.View):
         cs_val = self.pref.get("card_size", "normal")
         self.btn_card_size.label = "Compact" if cs_val == "compact" else "Normal"
         self.btn_card_size.style = discord.ButtonStyle.blurple if cs_val == "compact" else discord.ButtonStyle.grey
+
+        # Run It Multiple — auto-decline
+        rim_val = self.pref.get("run_it_multi_mode", "ask")
+        self.btn_run_it_multi.label = "Auto-Decline" if rim_val == "auto_decline" else "Ask Me"
+        self.btn_run_it_multi.style = discord.ButtonStyle.red if rim_val == "auto_decline" else discord.ButtonStyle.green
 
     def to_components(self) -> list[dict]:
         self.update_button_states()
@@ -1834,6 +2205,17 @@ class PreferencesView(discord.ui.View):
                         }
                     ],
                     "accessory": button_to_dict(self.btn_card_size)
+                },
+                # Section 9: Run It Multiple
+                {
+                    "type": 9,
+                    "components": [
+                        {
+                            "type": 10,
+                            "content": "**Run It Multiple**\n Auto-Decline skips the vote for you every time (a decline always cancels it for everyone, same as clicking Decline yourself)."
+                        }
+                    ],
+                    "accessory": button_to_dict(self.btn_run_it_multi)
                 }
             ]
         }
@@ -1921,6 +2303,15 @@ class PreferencesView(discord.ui.View):
         await db.set_player_preference(self.user_id, card_size=new_val)
         await self.refresh_preferences(interaction)
 
+    async def toggle_run_it_multi(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
+            return
+        val = self.pref.get("run_it_multi_mode", "ask")
+        new_val = "ask" if val == "auto_decline" else "auto_decline"
+        await db.set_player_preference(self.user_id, run_it_multi_mode=new_val)
+        await self.refresh_preferences(interaction)
+
     async def on_confirm_call_raise_click(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ This is not your settings menu.", ephemeral=True)
@@ -1938,6 +2329,7 @@ class PreferencesView(discord.ui.View):
 
     async def refresh_preferences(self, interaction: discord.Interaction):
         self.pref = await db.get_player_preference(self.user_id)
+        self.update_button_states()
         if interaction.response.is_done():
             await interaction.followup.edit_message(message_id="@original", view=self)
         else:
@@ -2027,21 +2419,36 @@ def _slog_result(t: TableState, result):
     game        = t.game
     ranks       = result.winner_ranks or {}
     ranks2      = result.winner_ranks2 or {}
+    rit_ranks   = getattr(result, "rit_winner_ranks", None) or []
     pot_results = result.pot_results
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results or []))]
     double_board_active = bool(result.community2)
+    rit_boards = getattr(result, "rit_boards", None) or []
+    rit_active = bool(rit_boards)
     emoji       = get_chip_emoji(t)
     hidden_pot  = "hidden_pot" in getattr(t, "chaos_modifiers", [])
 
+    def _board_ranks(board_num: int) -> dict:
+        if rit_active:
+            if board_num <= 1:
+                return ranks
+            idx = board_num - 2
+            return rit_ranks[idx] if idx < len(rit_ranks) else {}
+        return ranks2 if board_num == 2 else ranks
+
     # Use result.community — game.community is already cleared by _end_hand at this point.
-    if double_board_active:
+    if rit_active:
+        slog(t, f"🃏 Board 1: {hand_str(result.community)}")
+        for i, b in enumerate(rit_boards, start=2):
+            slog(t, f"🃏 Board {i}: {hand_str(b)}")
+    elif double_board_active:
         slog(t, f"🃏 Board 1: {hand_str(result.community)}")
         slog(t, f"🃏 Board 2: {hand_str(result.community2)}")
     elif result.community:
         slog(t, f"🃏 Board: {hand_str(result.community)}")
 
     distinct_pots = len({pot_idx for pot_idx, _ in pot_result_meta})
-    if not pot_results or (distinct_pots <= 1 and not double_board_active):
+    if not pot_results or (distinct_pots <= 1 and not double_board_active and not rit_active):
         if len(result.winners) == 1:
             w = result.winners[0]
             gained = result.chip_deltas.get(w.user_id, 0)
@@ -2072,7 +2479,7 @@ def _slog_result(t: TableState, result):
             if board_num:
                 label += f" (Board {board_num})"
             amt_str = "🙈 hidden" if hidden_pot else f"{amt}{emoji}"
-            board_ranks = ranks2 if board_num == 2 else ranks
+            board_ranks = _board_ranks(board_num)
             if len(winners) == 1:
                 w      = winners[0]
                 rank   = board_ranks.get(w.user_id)
@@ -2091,10 +2498,21 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     game = t.game
     ranks = result.winner_ranks or {}
     ranks2 = result.winner_ranks2 or {}
+    rit_ranks = getattr(result, "rit_winner_ranks", None) or []
     pot_results = result.pot_results  # [(amount, [PokerPlayer, ...]), ...]
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results or []))]
     double_board_active = bool(result.community2)
+    rit_boards = getattr(result, "rit_boards", None) or []
+    rit_active = bool(rit_boards)
     emoji = get_chip_emoji(t)
+
+    def _board_ranks(board_num: int) -> dict:
+        if rit_active:
+            if board_num <= 1:
+                return ranks
+            idx = board_num - 2
+            return rit_ranks[idx] if idx < len(rit_ranks) else {}
+        return ranks2 if board_num == 2 else ranks
 
     _cos_cache = cosmetics_cache or {}
 
@@ -2127,7 +2545,11 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
         return "\n".join(quotes)
 
     def _add_board_fields():
-        if double_board_active:
+        if rit_active:
+            embed.add_field(name="🃏 Board 1", value=f"{hand_str(result.community)}\n\u200b", inline=True)
+            for i, b in enumerate(rit_boards, start=2):
+                embed.add_field(name=f"🃏 Board {i}", value=f"{hand_str(b)}\n\u200b", inline=True)
+        elif double_board_active:
             embed.add_field(name="🃏 Board 1", value=f"{hand_str(result.community)}\n\u200b", inline=True)
             embed.add_field(name="🃏 Board 2", value=f"{hand_str(result.community2)}\n\u200b", inline=True)
         elif result.community:
@@ -2138,7 +2560,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
     desc_lines = []
 
     distinct_pots = len({pot_idx for pot_idx, _ in pot_result_meta})
-    if not pot_results or (distinct_pots <= 1 and not double_board_active):
+    if not pot_results or (distinct_pots <= 1 and not double_board_active and not rit_active):
         # ── Single Pot (or Fold Win) ──
         if len(result.winners) == 1:
             w = result.winners[0]
@@ -2190,7 +2612,7 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
             if board_num:
                 label += f" — Board {board_num}"
             icon = "🥇" if pot_idx == 0 else "🥈"
-            board_ranks = ranks2 if board_num == 2 else ranks
+            board_ranks = _board_ranks(board_num)
 
             desc_lines.append(f"{icon} **{label}** {emoji} **{amt}**")
 
@@ -2288,6 +2710,33 @@ async def _handle_shiny_cards(channel, t: TableState):
             except (discord.HTTPException, discord.Forbidden) as e:
                 print(f"[Error] Failed to announce {shiny.display_name} drop for {uid}: {e}")
     t.game.shiny_holders.clear()
+
+
+
+_top_net_lock = asyncio.Lock()
+
+
+async def _check_top_net() -> str | None:
+    """Called at end of hand. If someone new is #1 on net chips, move the top_net title to them.
+    Returns an announcement string, or None. Ties never dethrone the incumbent."""
+    async with _top_net_lock:
+        rows = await db.get_leaderboard(1)
+        if not rows:
+            return None
+        top = rows[0]
+        holder = await db.get_top_net_holder()
+        if holder == top["user_id"]:
+            return None
+        if holder is not None:
+            cur = await db.get_player_net(holder)
+            if cur is not None and cur >= top["net_chips"]:
+                return None
+        prev = await db.transfer_top_net(top["user_id"])
+        display = db.TITLES.get(db.TOP_NET_ID, {}).get("display", db.TOP_NET_ID)
+        msg = f"👑 <@{top['user_id']}> is now **#1 on the net leaderboard** and claims the **{display}** title"
+        if prev and prev != top["user_id"]:
+            msg += f", taking it from <@{prev}>"
+        return msg + "!\nUse `/poker titles` → **Rename #1 Title** to make it your own."
 
 
 async def _process_result(guild, channel, t: TableState):
@@ -2425,6 +2874,15 @@ async def _process_result(guild, channel, t: TableState):
                 lines.append(f"  {icon} **{display}** *{rarity}*")
             achievement_announces.append("\n".join(lines))
 
+        # ── #1 net title handover ─────────────────────────────────────────────
+        try:
+            top_msg = await _check_top_net()
+            if top_msg:
+                achievement_announces.append(top_msg)
+        except Exception as e:
+            print(f"[poker] top_net check error: {e}")
+            traceback.print_exc()
+
         # ── Jackpot split payout ──────────────────────────────────────────────
         folded_ids = getattr(result, "folded_ids", set())
         winner_ids = {w.user_id for w in (result.winners or [])}
@@ -2480,7 +2938,7 @@ async def _process_result(guild, channel, t: TableState):
                 print(f"[Error] Failed to announce Ragebait reveal: {e}")
 
         # 2/7 offsuit bonus on win only
-        if (t.chaos_mode and len(result.winners or []) == 1 and not result.winner_ranks
+        if (len(result.winners or []) == 1 and not result.winner_ranks
                 and "triple_hole" not in t.chaos_modifiers):
             bluffer = result.winners[0]
             if _is_27_offsuit(bluffer.hole_cards):
@@ -2504,7 +2962,7 @@ async def _process_result(guild, channel, t: TableState):
                         print(f"[Error] Failed to announce 2-7 bluff bonus: {e}")
 
         # 67 title
-        if t.chaos_mode and any(_has_six_and_seven(w.hole_cards) for w in (result.winners or [])):
+        if any(_has_six_and_seven(w.hole_cards) for w in (result.winners or [])):
             t.sixseven_bait_active = True
 
     except Exception as e:
@@ -2525,6 +2983,7 @@ async def _process_result(guild, channel, t: TableState):
     except Exception as e:
         print(f"[poker] log_tax error: {e}")
         traceback.print_exc()
+
 
     try:
         log_body = await post_hand_log(channel, t, result)
@@ -2658,19 +3117,30 @@ async def _process_result(guild, channel, t: TableState):
 # ── Showdown reveal (muck / show) ─────────────────────────────────────────────
 
 def _hand_rank_display(hole_cards: list, community: list, community2: list | None,
-                        double_board_active: bool) -> str:
+                        double_board_active: bool, rit_boards: list | None = None) -> str:
     """
-    shows hand's rank on each board for double board
+    shows hand's rank on each board — for Double Board (exactly community2)
+    or Run It Multiple (rit_boards, any length). Never both at once (see
+    engine.py's rit_state docstring), so callers only ever populate one.
     """
+    rit_boards = rit_boards or []
+    rit_active = bool(rit_boards)
+    multi = double_board_active or rit_active
     parts = []
     if len(hole_cards) + len(community) >= 5:
         score = hand_eval.evaluate_any(evaluator, hole_cards, community)
         rank = evaluator.class_to_string(evaluator.get_rank_class(score))
-        parts.append(f"Board 1: {rank}" if double_board_active else rank)
+        parts.append(f"Board 1: {rank}" if multi else rank)
     if double_board_active and community2 and len(hole_cards) + len(community2) >= 5:
         score2 = hand_eval.evaluate_any(evaluator, hole_cards, community2)
         rank2 = evaluator.class_to_string(evaluator.get_rank_class(score2))
         parts.append(f"Board 2: {rank2}")
+    if rit_active:
+        for i, b in enumerate(rit_boards, start=2):
+            if len(hole_cards) + len(b) >= 5:
+                score_b = hand_eval.evaluate_any(evaluator, hole_cards, b)
+                rank_b = evaluator.class_to_string(evaluator.get_rank_class(score_b))
+                parts.append(f"Board {i}: {rank_b}")
     return f" — *{', '.join(parts)}*" if parts else ""
 
 
@@ -2706,7 +3176,8 @@ class ShowdownRevealView(discord.ui.View):
         # chaos modifier the board can have just 1-2 cards on a real street.
         rank_str = _hand_rank_display(sp.hole_cards, self.result.community,
                                        getattr(self.result, "community2", None),
-                                       bool(getattr(self.result, "community2", None)))
+                                       bool(getattr(self.result, "community2", None)),
+                                       getattr(self.result, "rit_boards", None))
 
         shiny = " ✨" if sp.shiny_ids else ""
         caption = f"👁️ **{interaction.user.display_name}** shows: {hand_str(sp.hole_cards)}{shiny}{rank_str}"
@@ -2782,21 +3253,33 @@ async def _reveal_phase(channel, t: TableState, result):
     # ── 2. Contested Showdown ─────────────────────────────
     winner_ids = {w.user_id for w in result.winners}
     double_board_active = bool(result.community2)
+    rit_boards = getattr(result, "rit_boards", None) or []
+    rit_active = bool(rit_boards)
     pot_results = result.pot_results or []
     pot_result_meta = result.pot_result_meta or [(i, 0) for i in range(len(pot_results))]
     ranks = result.winner_ranks or {}
     ranks2 = result.winner_ranks2 or {}
+    rit_ranks = getattr(result, "rit_winner_ranks", None) or []
+
+    def _board_ranks(board_num: int) -> dict:
+        if rit_active:
+            if board_num <= 1:
+                return ranks
+            idx = board_num - 2
+            return rit_ranks[idx] if idx < len(rit_ranks) else {}
+        return ranks2 if board_num == 2 else ranks
 
     # Per winner, the board(s) they ACTUALLY won and the rank they won it
     # with — never a fresh re-evaluation against board 1 alone. Under
-    # Double Board the same hole cards can rank completely differently on
-    # each board (or even tie/lose on one while winning the other), so
-    # this only ever attributes a rank to a winner for a board a pot
-    # result says they won — exactly the same source of truth the Hand
-    # Results embed already uses, so the two can never disagree again.
+    # Double Board or Run It Multiple the same hole cards can rank
+    # completely differently on each board (or even tie/lose on one while
+    # winning another), so this only ever attributes a rank to a winner
+    # for a board a pot result says they won — exactly the same source of
+    # truth the Hand Results embed already uses, so the two can never
+    # disagree again.
     winner_board_ranks: dict[int, list[tuple[int, str]]] = {}
     for (_, pot_winners), (_, board_num) in zip(pot_results, pot_result_meta):
-        board_ranks = ranks2 if board_num == 2 else ranks
+        board_ranks = _board_ranks(board_num)
         for pw in pot_winners:
             rank = board_ranks.get(pw.user_id)
             if not rank:
@@ -2809,8 +3292,15 @@ async def _reveal_phase(channel, t: TableState, result):
     def _winner_rank_str(uid: int, hole_cards: list, community: list) -> str:
         won = winner_board_ranks.get(uid, [])
         if won:
-            if len(won) == 1 or not double_board_active:
+            if not (double_board_active or rit_active):
                 return f" — *{won[0][1]}*"
+            # Multi-board: ALWAYS label which board(s), even when a player
+            # only won exactly one of them — with 2+ boards in play "Pair"
+            # alone is ambiguous about which board that was, whereas the
+            # len(won)==1 shortcut this used to take silently dropped the
+            # label for every winner who happened to win just one board
+            # (i.e. most winners, most hands) while only multi-board
+            # winners ever got a "Board N:" prefix.
             parts = ", ".join(f"Board {bn}: {r}" for bn, r in sorted(won))
             return f" — *{parts}*"
         # Fallback for the rare case a winner isn't in either ranks dict
@@ -2852,7 +3342,8 @@ async def _reveal_phase(channel, t: TableState, result):
         if auto_action == "muck":
             continue
         elif auto_action == "show":
-            rank_str = _hand_rank_display(p.hole_cards, result.community, result.community2, double_board_active)
+            rank_str = _hand_rank_display(p.hole_cards, result.community, result.community2,
+                                           double_board_active, rit_boards)
             caption = f"👁️ **{p.display_name}** shows: {hand_str(p.hole_cards)}{rank_str}"
             if USE_IMAGES:
                 cosmetics = await db.get_cosmetics(p.user_id)
@@ -4741,7 +5232,29 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
     visible_board1 = [c for i, c in enumerate(t.game.community)
                        if i not in t.game.blinded_community_idx]
     double_board_active = "double_board" in t.game.chaos_modifiers
-    if double_board_active:
+    rit_active = t.game.rit_count > 1 and bool(t.game.rit_boards)
+    if rit_active:
+        # Run It Multiple: same idea as Double Board just below — rank
+        # against each board separately, since the same hole cards can be
+        # miles apart in strength across boards. rit_boards has no
+        # "blinded" concept of its own (blindness only ever applies to
+        # the primary board — see rit_state's docstring in engine.py), so
+        # every extra board is shown in full.
+        board_lines = []
+        if len(visible_hole) + len(visible_board1) >= 5:
+            score = hand_eval.evaluate_any(evaluator, visible_hole, visible_board1)
+            rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+            pct = round((1 - score / 7462) * 100, 1)
+            board_lines.append(f"**Board 1:** {rank} (top {100 - pct:.0f}%)")
+        for i, board in enumerate(t.game.rit_boards, start=2):
+            if len(visible_hole) + len(board) >= 5:
+                score = hand_eval.evaluate_any(evaluator, visible_hole, board)
+                rank = evaluator.class_to_string(evaluator.get_rank_class(score))
+                pct = round((1 - score / 7462) * 100, 1)
+                board_lines.append(f"**Board {i}:** {rank} (top {100 - pct:.0f}%)")
+        if board_lines:
+            strength = "\n" + "\n".join(board_lines)
+    elif double_board_active:
         # Double board show the ranking against each board separately
         visible_board2 = [c for i, c in enumerate(t.game.community2)
                            if i not in t.game.blinded_community2_idx]
@@ -4786,7 +5299,17 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
         caption = f"Your hole cards — {target.chips} {get_chip_emoji(t)} at table{strength}\n**Cards:** {cards_text}{shiny}{uno_note}{bounty_note}"
 
     if USE_IMAGES:
-        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            # Interaction already expired by the time this callback got to
+            # run — most commonly a "My Cards" click landing in the
+            # AuctionCardsOnlyView, which gets rebuilt fresh on every
+            # refresh() during a paused/reveal state (e.g. every ~1.2s
+            # through a Run It Multiple sequential board reveal). Nothing
+            # can be done with a dead interaction token; fail silently
+            # rather than letting this propagate as an unhandled 404.
+            return
         try:
             # Card Borders cosmetic
             target_cosmetics = await db.get_cosmetics(target.user_id)
@@ -4812,7 +5335,10 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
             await interaction.followup.send(caption, view=uno_view, ephemeral=True)  # text-only fallback
         return
 
-    await interaction.response.send_message(caption, view=uno_view, ephemeral=True)
+    try:
+        await interaction.response.send_message(caption, view=uno_view, ephemeral=True)
+    except (discord.NotFound, discord.HTTPException):
+        pass  # same expired-interaction race as the USE_IMAGES branch above
 
 
 class AuctionCardsOnlyView(discord.ui.View):
@@ -5264,7 +5790,15 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
                 if info["display"].startswith("<")
                 else f"`{info['display']}`"
             )
-            if tid in owned_titles:
+            if tid == db.TOP_NET_ID:
+                holder = db.top_net_holder_cached()
+                if holder == user_id:
+                    equipped = "  ◀ **equipped**" if tid == active_t else ""
+                    t_lines.append(f"👑 {display_str} — #1 on lb {equipped}")
+                else:
+                    who = f"<@{holder}>" if holder else "nobody yet"
+                    t_lines.append(f"🔒 {display_str} — *Be #1 on the lb. Held by {who}*")
+            elif tid in owned_titles:
                 equipped = "  ◀ **equipped**" if tid == active_t else ""
                 desc = f" — *{info['description']}*" if info.get('description') else ""
                 t_lines.append(f"✅ {display_str}{desc}{equipped}")
@@ -5336,6 +5870,24 @@ def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "
         embed.set_footer(text="Use the dropdown below to equip — only your unlocked items appear.")
     view = CosmeticsView(user_id, owned_titles, owned_msgs, owned_skins, active_t, active_m, active_sk, page)
     return embed, view
+
+class TopNetTitleModal(discord.ui.Modal, title="Rename #1 Title"):
+    text = discord.ui.TextInput(label="Title text", min_length=1, max_length=db.TOP_NET_MAX_LEN,
+                                placeholder="water bottle")
+
+    def __init__(self):
+        super().__init__()
+        self.text.default = db.TITLES.get(db.TOP_NET_ID, {}).get("display", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        saved = await db.set_top_net_display(interaction.user.id, self.text.value)
+        if saved is None:
+            await interaction.response.send_message(
+                f"❌ Couldn't save. You must be #1, the text can't contain @ or backticks, "
+                f"and it must be ≤ {db.TOP_NET_MAX_LEN} chars.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"✅ #1 title is now **{saved}**.", ephemeral=True)
+
 
 class CosmeticsView(discord.ui.View):
     """Attach Select menus and a page toggle button to /poker titles."""
@@ -5420,6 +5972,19 @@ class CosmeticsView(discord.ui.View):
             switch_btn.callback = self._make_switch_callback(target_page)
             self.add_item(switch_btn)
 
+        if self.page == "titles" and db.top_net_holder_cached() == user_id:
+            rename_btn = discord.ui.Button(label="Rename #1 Title", style=discord.ButtonStyle.success,
+                                           row=2, emoji="✏️")
+            rename_btn.callback = self._on_rename_top_net
+            self.add_item(rename_btn)
+
+    async def _on_rename_top_net(self, interaction: discord.Interaction):
+        if not await self._guard(interaction): return
+        if await db.get_top_net_holder() != self.user_id:
+            await interaction.response.send_message("❌ You're no longer #1 — the title has moved on.", ephemeral=True)
+            return
+        await interaction.response.send_modal(TopNetTitleModal())
+
     def _make_switch_callback(self, target_page: str):
         async def _callback(interaction: discord.Interaction):
             await self._on_switch(interaction, target_page)
@@ -5434,6 +5999,7 @@ class CosmeticsView(discord.ui.View):
     async def _on_switch(self, interaction: discord.Interaction, target_page: str):
         if not await self._guard(interaction): return
         cosmetics = await db.get_cosmetics(self.user_id)
+        await db.get_top_net_holder()
         embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=target_page)
         new_view.message = self.message
         await interaction.response.edit_message(embed=embed, view=new_view)
@@ -5444,6 +6010,7 @@ class CosmeticsView(discord.ui.View):
         tid = None if chosen == "none" else chosen
         await db.set_active_title(self.user_id, tid)
         cosmetics = await db.get_cosmetics(self.user_id)
+        await db.get_top_net_holder()
         embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
         new_view.message = self.message
         label = db.TITLES[tid]["display"] if tid else "removed"
@@ -5457,6 +6024,7 @@ class CosmeticsView(discord.ui.View):
         mid = None if chosen == "none" else chosen
         await db.set_active_win_msg(self.user_id, mid)
         cosmetics = await db.get_cosmetics(self.user_id)
+        await db.get_top_net_holder()
         embed, new_view = _build_cosmetics_embed_and_view(self.user_id, cosmetics, page=self.page)
         new_view.message = self.message
         label = db.WIN_MESSAGES[mid]["display"] if mid else "removed"
@@ -6008,7 +6576,7 @@ class PokerCog(commands.Cog):
     @pokermgr.command(name="ban", description="[Manager] Ban a user — omit table name to ban server-wide")
     @app_commands.describe(user="Player to ban", table_name="Table name to ban from (leave blank for server-wide)",
                            reason="Reason for the ban", duration="Ban length, e.g. 7d, 12h, 2w (leave blank for permanent)")
-    async def ban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None,
+    async def ban(self, interaction: discord.Interaction, user: discord.User, table_name: str = None,
                  reason: str = None, duration: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
@@ -6126,7 +6694,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="unban", description="[Manager] Unban a user — omit table name to remove all bans")
     @app_commands.describe(user="Player to unban", table_name="Table to unban from (leave blank to remove all bans)")
-    async def unban(self, interaction: discord.Interaction, user: discord.Member, table_name: str = None):
+    async def unban(self, interaction: discord.Interaction, user: discord.User, table_name: str = None):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
@@ -6215,7 +6783,7 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="wallet", description="Check your chip wallet balance")
     @app_commands.describe(user="Player to check (leave blank for yourself)")
-    async def wallet(self, interaction: discord.Interaction, user: discord.Member = None):
+    async def wallet(self, interaction: discord.Interaction, user: discord.User = None):
         await interaction.response.defer(ephemeral=False)
         target = user or interaction.user
         bal, pending = await db.get_wallet(target.id)
@@ -6372,7 +6940,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="removestats", description="[Manager] Remove a player from the leaderboard")
     @app_commands.describe(user="Player to remove from leaderboard")
-    async def remove_stats(self, interaction: discord.Interaction, user: discord.Member):
+    async def remove_stats(self, interaction: discord.Interaction, user: discord.User):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True);
@@ -6397,13 +6965,13 @@ class PokerCog(commands.Cog):
         rank_str = f"#{rank}" if rank else "Unranked"
 
         # Fire up the interactive View!
-        view = StatsView(interaction.user, row, rank_str)
+        view = StatsView(interaction.user, row, rank_str, hidden)
         await interaction.followup.send(embed=view.build_basic_embed(), view=view, ephemeral=hidden)
 
     # ── Manager settings commands ─────────────────────────────────────────
     @pokermgr.command(name="addchips", description="[Manager] Add chips to a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
-    async def mgr_addchips(self, interaction: discord.Interaction, user: discord.Member, amount: int, note: str = ""):
+    async def mgr_addchips(self, interaction: discord.Interaction, user: discord.User, amount: int, note: str = ""):
         await interaction.response.defer(ephemeral=False)
 
         if not await is_manager(interaction):
@@ -6431,7 +6999,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="removechips", description="[Manager] Remove chips from a player's wallet")
     @app_commands.describe(user="Player", amount="Chips to remove", note="Optional reason")
-    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.Member, amount: int,
+    async def mgr_removechips(self, interaction: discord.Interaction, user: discord.User, amount: int,
                               note: str = ""):
         await interaction.response.defer(ephemeral=False)
 
@@ -6877,7 +7445,7 @@ class PokerCog(commands.Cog):
 
     @pokermgr.command(name="pay_cashout", description="[Manager] Deduct paid chips from pending and send receipt")
     @app_commands.describe(user="Player who was paid", amount="Amount of chips paid")
-    async def pay_cashout(self, interaction: discord.Interaction, user: discord.Member, amount: int):
+    async def pay_cashout(self, interaction: discord.Interaction, user: discord.User, amount: int):
         await interaction.response.defer(ephemeral=False)
         if not await is_manager(interaction):
             await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
@@ -7258,18 +7826,9 @@ class PokerCog(commands.Cog):
 
         file = discord.File(image_data, filename="jackpot.png")
 
-        # Components V2 layout
-        view = discord.ui.LayoutView()
-
-        container = discord.ui.Container(
-            discord.ui.MediaGallery().add_item(
-                media="attachment://jackpot.png"
-            ),
-        )
-
-        view.add_item(container)
-
-        await interaction.followup.send(
+        # Components V2 layout (image + Stats button)
+        view = JackpotView()
+        view.message = await interaction.followup.send(
             view=view,
             file=file,
         )
@@ -7459,6 +8018,7 @@ class PokerCog(commands.Cog):
     async def titles_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         cosmetics = await db.get_cosmetics(interaction.user.id)
+        await db.get_top_net_holder()
         embed, view = _build_cosmetics_embed_and_view(interaction.user.id, cosmetics)
         view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
@@ -7541,7 +8101,7 @@ class PokerCog(commands.Cog):
         app_commands.Choice(name="Card Skin", value="skin"),
     ])
     @app_commands.autocomplete(cosmetic_id=_autocomplete_grant_cosmetic)
-    async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.Member, kind: str, cosmetic_id: str):
+    async def grant_cosmetic(self, interaction: discord.Interaction, user: discord.User, kind: str, cosmetic_id: str):
         if not (interaction.user.guild_permissions.administrator or interaction.user.id in self.DEV_USER_IDS):
             await interaction.response.send_message("❌ Administrators only.", ephemeral=True)
             return
@@ -7742,7 +8302,7 @@ class PokerCog(commands.Cog):
 
     @poker.command(name="currencylog", description="View recent chip transactions")
     @app_commands.describe(minimum="Only show transactions with this many chips or more", user="Player to check (Admins/Devs only, leave blank for yourself)")
-    async def currencylog(self, interaction: discord.Interaction, user: discord.Member = None, minimum: int = None):
+    async def currencylog(self, interaction: discord.Interaction, user: discord.User = None, minimum: int = None):
         target = user or interaction.user
 
         # 🚨 Permission Check
@@ -7839,7 +8399,7 @@ class PokerCog(commands.Cog):
         app_commands.Choice(name="Royal Flush Wins", value="royal_flush_wins"),
         app_commands.Choice(name="Times Wiped (Inactivity)", value="times_wiped"),
     ])
-    async def setstat(self, interaction: discord.Interaction, user: discord.Member, stat: app_commands.Choice[str],
+    async def setstat(self, interaction: discord.Interaction, user: discord.User, stat: app_commands.Choice[str],
                       value: int):
         # 1. Security Check
         if interaction.user.id not in config.DEV_USER_IDS:
@@ -8001,7 +8561,7 @@ class PokerCog(commands.Cog):
             if end:
                 end = parse_date(end).strftime(DATE_FORMAT)
             else:
-                end = date.today().strftime(DATE_FORMAT)
+                end = datetime.now(_tz.utc).date().strftime(DATE_FORMAT)
 
         except ValueError:
             await interaction.followup.send(
@@ -8059,6 +8619,12 @@ class PokerCog(commands.Cog):
     async def user_jackpot(self, interaction: discord.Interaction):
         await self.jackpot_cmd.callback(self, interaction)
 
+    @app_commands.command(name="responsible-gambling", description="Gambling disclaimer and helpline")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def responsible_gaming(self, interaction: discord.Interaction):
+        await interaction.response.send_message(embed=build_disclaimer_embed(), ephemeral=True)
+
     @app_commands.command(name="drawcards", description="Draw cards from a 52 card deck.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -8080,12 +8646,123 @@ class PokerCog(commands.Cog):
         await self.myactivity.callback(self, interaction)
 
 
+class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
+    start_input = discord.ui.TextInput(
+        label="Start (optional)",
+        placeholder="e.g. 2024-01-01, 'last week', 'yesterday' — blank = earliest",
+        required=False,
+        max_length=50,
+    )
+    end_input = discord.ui.TextInput(
+        label="End (optional)",
+        placeholder="e.g. today, '3 days ago' — blank = now",
+        required=False,
+        max_length=50,
+    )
+
+    def __init__(self, target_user: discord.User | discord.Member, display_name: str, hidden: bool):
+        super().__init__()
+        self.target_user = target_user
+        self.display_name = display_name
+        self.hidden = hidden
+
+    @staticmethod
+    def _parse(text: str):
+        return dateparser.parse(
+            text.strip(),
+            settings={  # type: ignore
+                "TIMEZONE": "UTC",
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "PREFER_DATES_FROM": "past",
+                "RELATIVE_BASE": datetime.now(_tz.utc).replace(tzinfo=None),
+            },
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=self.hidden)
+
+        start_dt = end_dt = None
+
+        if self.start_input.value.strip():
+            start_dt = self._parse(self.start_input.value)
+            if start_dt is None:
+                await interaction.followup.send(
+                    f"❌ Couldn't understand start date: `{self.start_input.value}`", ephemeral=True
+                )
+                return
+            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if self.end_input.value.strip():
+            end_dt = self._parse(self.end_input.value)
+            if end_dt is None:
+                await interaction.followup.send(
+                    f"❌ Couldn't understand end date: `{self.end_input.value}`", ephemeral=True
+                )
+                return
+            end_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - timedelta(seconds=1)
+
+        if start_dt and end_dt and start_dt > end_dt:
+            await interaction.followup.send("❌ Start date is after end date.", ephemeral=True)
+            return
+
+        start_ts = int(start_dt.timestamp()) if start_dt else None
+        end_ts = int(end_dt.timestamp()) if end_dt else int(datetime.now(_tz.utc).timestamp())
+
+        history = await asyncio.to_thread(
+            get_net_chips_history, self.target_user.id, start_ts, end_ts
+        )
+
+        if len(history) < 2:
+            if len(history) == 1:
+                v = history[0]["net_chips"]
+                await interaction.followup.send(
+                    f"Only one data point in that range — net chips was "
+                    f"**{'+' if v >= 0 else ''}{v:,}** then. Not enough to graph a trend.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send("No data in that range yet.", ephemeral=True)
+            return
+
+        # CPU-bound rendering — keep it off the event loop.
+        try:
+            buf = await asyncio.to_thread(generate_net_chips_graph, self.display_name, history)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send(
+                "❌ Something went wrong rendering the graph. This didn't affect any game data — try again, "
+                "and if it keeps happening let an admin know.",
+                ephemeral=True,
+            )
+            return
+
+        file = discord.File(buf, filename="net_chips_graph.png")
+
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem("attachment://net_chips_graph.png")
+            ),
+        )
+
+        last_updated_ts = get_csv_last_updated()
+        if last_updated_ts:
+            container.add_item(
+                discord.ui.TextDisplay(f"-# Data last updated <t:{last_updated_ts}:R>")
+            )
+
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+
+        await interaction.followup.send(file=file, view=view, ephemeral=self.hidden)
+
+
 class StatsView(discord.ui.View):
-    def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str):
+    def __init__(self, user: discord.User | discord.Member, row: dict, rank_str: str, hidden: bool = False):
         super().__init__(timeout=120)
         self.user = user
         self.row = row
         self.rank_str = rank_str
+        self.hidden = hidden
 
     def build_basic_embed(self) -> discord.Embed:
         net = self.row['net_chips']
@@ -8149,6 +8826,14 @@ class StatsView(discord.ui.View):
         self.btn_basic.disabled = False
         self.btn_highlights.disabled = True
         await interaction.response.edit_message(embed=self.build_highlights_embed(), view=self)
+
+    @discord.ui.button(label="Graph", style=discord.ButtonStyle.green)
+    async def btn_graph(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        await interaction.response.send_modal(
+            NetChipsGraphModal(self.user, self.row["username"], self.hidden)
+        )
 
 
 async def should_confirm_premove_all_in(t: TableState, user_id: int, move: dict) -> bool:
@@ -8582,6 +9267,112 @@ class RawSQLPaginationView(discord.ui.View):
         self.current_page = self.max_pages - 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.format_page(), view=self)
+
+
+# ── Jackpot stats ─────────────────────────────────────────────────────────────
+
+def _fmt_jp(amt: int) -> str:
+    # Same display convention as the in-channel jackpot announcement.
+    return f"⏣ {amt:,},000,000"
+
+
+def _jp_section(entries: list[dict], width: int, show_tier: bool) -> str:
+    if not entries:
+        return "No hits yet."
+    lines = []
+    for e in entries:
+        tier = f" · {e['tier']}" if show_tier else ""
+        when = f" · <t:{e['ts']}:R>" if e["ts"] else ""
+        lines.append(f"`{_fmt_jp(e['amt']).rjust(width)}`  <@{e['uid']}>{tier}{when}")
+    return "\n".join(lines)
+
+
+def jackpot_stats_items(stats: dict) -> list:
+    sections = (
+        ("Four of a Kind", stats["quads"], False),
+        ("Straight Flush", stats["sf"], False),
+        ("Royal Flush", stats["rf"], False),
+        ("Shiny Hits", stats["shiny"], True),
+        ("Biggest Wins", stats["top"], True),
+    )
+    all_entries = [e for _, es, _ in sections for e in es]
+    width = max((len(_fmt_jp(e["amt"])) for e in all_entries), default=1)
+
+    items = [discord.ui.TextDisplay(
+        f"## Jackpot History\n"
+        f"-# Last 30 days: {_fmt_jp(stats['window_total'])} won across "
+        f"{stats['window_count']} payout{'s' if stats['window_count'] != 1 else ''}\n"
+        f"-# All time: {_fmt_jp(stats['all_total'])} across "
+        f"{stats['all_count']} payout{'s' if stats['all_count'] != 1 else ''}"
+    )]
+    for title, entries, show_tier in sections:
+        items.append(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        items.append(discord.ui.TextDisplay(
+            f"### {title}\n{_jp_section(entries, width, show_tier)}"
+        ))
+    items.append(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    items.append(discord.ui.TextDisplay(
+        "-# At least ⏣ 30,000,000,000 in earlier payouts was not recorded properly, "
+        "so the real total paid out is higher."
+    ))
+    return items
+
+
+class JackpotView(discord.ui.LayoutView):
+    """/jackpot message: image + a Stats button that expands/collapses the stats in place."""
+
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.message: discord.Message | None = None
+        self.stats: dict | None = None  # None = collapsed
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        expanded = self.stats is not None
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://jackpot.png")),
+        )
+        if expanded:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            for item in jackpot_stats_items(self.stats):
+                container.add_item(item)
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        self.stats_btn = discord.ui.Button(
+            label="Hide" if expanded else "History",
+            style=discord.ButtonStyle.blurple if expanded else discord.ButtonStyle.secondary,
+        )
+        self.stats_btn.callback = self._on_stats
+        row = discord.ui.ActionRow()
+        row.add_item(self.stats_btn)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def _on_stats(self, interaction: discord.Interaction):
+        try:
+            if self.stats is None:
+                rows = await db.get_jackpot_payouts()
+                self.stats = jackpot.build_jackpot_stats(rows)
+            else:
+                self.stats = None
+            self._build()
+            await interaction.response.edit_message(view=self)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        except Exception:
+            traceback.print_exc()
+            try:
+                await interaction.response.send_message("Couldn't load jackpot stats.", ephemeral=True)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+    async def on_timeout(self):
+        self.stats_btn.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.Forbidden):
+                pass
 
 
 class ChangelogView(discord.ui.LayoutView):

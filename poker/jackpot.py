@@ -1,4 +1,6 @@
 import math
+import re
+from datetime import datetime, timedelta, timezone
 from . import database as db
 from . import shiny_cards
 from . import chaos
@@ -171,3 +173,75 @@ async def get_jackpot_display_cuts() -> tuple[int, int, int, int, int]:
     sf_cut = math.ceil(jp * 0.20)
     quads_cut = math.ceil(jp * 0.05)
     return jp, shiny_cut, rf_cut, sf_cut, quads_cut
+
+
+# ── Stats (read side) ─────────────────────────────────────────────────────────
+
+# audit_log.detail written by database.pay_jackpot:
+#   "{label}: {amt:,} chips paid out (jackpot was {n:,})"
+SHINY_MIN_AMT = 2000  # stored units; 5000 displays as 5,000,000,000
+_PAYOUT_RE = re.compile(r"^(?P<label>.+?): (?P<amt>[\d,]+) chips paid out")
+_TIER_KINDS = (
+    ("Royal Flush", "rf", "Royal Flush"),
+    ("Straight Flush", "sf", "Straight Flush"),
+    ("Four of a Kind", "quads", "Four of a Kind"),
+)
+_EMOJI_JUNK = re.compile(r"<a?:\w+:\d+>|[^\w\s'.\-]")
+
+
+def _clean_shiny_name(label: str) -> str:
+    for c in shiny_cards.SHINY_CARDS:
+        if c.display_name in label:
+            return c.display_name
+    return _EMOJI_JUNK.sub("", label).strip() or "Shiny"
+
+
+def parse_payout(row: tuple) -> dict | None:
+    """(id, ts, user_id, user_name, detail) -> {uid, amt, kind, tier, ts} or None if unparseable."""
+    _id, ts, uid, _name, detail = row
+    m = _PAYOUT_RE.match(detail or "")
+    if not m:
+        return None
+    label = m.group("label")
+    amt = int(m.group("amt").replace(",", ""))
+    kind, tier = "shiny", None
+    for needle, k, shown in _TIER_KINDS:
+        if needle in label:
+            kind, tier = k, shown
+            break
+    if kind == "shiny":
+        tier = f"Shiny ({_clean_shiny_name(label)})"
+    try:
+        unix = int(datetime.strptime(ts, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc).timestamp())
+    except (TypeError, ValueError):
+        unix = 0
+    return {"uid": uid, "amt": amt, "kind": kind, "tier": tier, "ts": unix}
+
+
+def build_jackpot_stats(rows: list[tuple], top_n: int = 5, window_days: int = 30) -> dict:
+    """
+    rows: newest-first output of db.get_jackpot_payouts().
+    Returns {"window_total", "window_count", "quads", "sf", "rf", "shiny", "top"};
+    each list entry is a parse_payout() dict. Manual chip_log grants are not included.
+    """
+    cutoff = int((datetime.now(timezone.utc) - timedelta(days=window_days)).timestamp())
+    out = {"window_total": 0, "window_count": 0, "all_total": 0, "all_count": 0,
+           "quads": [], "sf": [], "rf": [], "shiny": [], "top": []}
+    parsed = []
+    for row in rows:
+        e = parse_payout(row)
+        if e is None:
+            continue
+        parsed.append(e)
+        out["all_total"] += e["amt"]
+        out["all_count"] += 1
+        if e["ts"] >= cutoff:
+            out["window_total"] += e["amt"]
+            out["window_count"] += 1
+        if e["kind"] == "shiny" and e["amt"] < SHINY_MIN_AMT:
+            continue
+        bucket = out[e["kind"]]
+        if len(bucket) < top_n:
+            bucket.append(e)
+    out["top"] = sorted(parsed, key=lambda e: e["amt"], reverse=True)[:top_n]
+    return out

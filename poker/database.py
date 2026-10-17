@@ -353,7 +353,8 @@ async def init_db():
                 confirm_leave INTEGER DEFAULT 1,
                 confirm_call_raise_mode TEXT DEFAULT 'never',
                 confirm_call_raise_threshold INTEGER DEFAULT 0,
-                card_size TEXT DEFAULT 'normal'
+                card_size TEXT DEFAULT 'normal',
+                run_it_multi_mode TEXT DEFAULT 'ask'
             )
         """)
 
@@ -361,6 +362,19 @@ async def init_db():
         # only applies the card_size column on a brand-new table.
         try:
             await db.execute("ALTER TABLE player_preferences ADD COLUMN card_size TEXT DEFAULT 'normal'")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        # Migration for existing installs — Run It Multiple auto-decline
+        # preference. 'ask' (default) votes normally every time; 'auto_decline'
+        # skips this player straight to a normal single-board run-out with no
+        # vote prompt (see poker.py's _run_rit_vote). Deliberately no
+        # 'auto_accept' — a vote for 2x/3x still needs an actual count chosen
+        # per hand, same as real rooms don't let you pre-commit to a run count
+        # before seeing that hand's pot/opponents.
+        try:
+            await db.execute("ALTER TABLE player_preferences ADD COLUMN run_it_multi_mode TEXT DEFAULT 'ask'")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
@@ -387,9 +401,18 @@ async def init_db():
             )
         """)
 
+        # ── Responsible-gaming disclaimer: fire-once tracking per user ────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS disclaimer_seen (
+                user_id INTEGER PRIMARY KEY,
+                seen_at TEXT NOT NULL
+            )
+        """)
+
         await db.commit()
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
+        await _ensure_top_net(locked=True)
 
 
 # ── Guild settings ────────────────────────────────────────────────────────────
@@ -841,6 +864,24 @@ async def unban_player(guild_id: int, user_id: int, table_name: str | None = Non
         return count
 
 
+async def has_seen_disclaimer(user_id: int) -> bool:
+    db = await _get_db()
+    async with db.execute(
+            "SELECT 1 FROM disclaimer_seen WHERE user_id=?", (user_id,)
+    ) as c:
+        return await c.fetchone() is not None
+
+
+async def mark_disclaimer_seen(user_id: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute(
+            "INSERT OR IGNORE INTO disclaimer_seen (user_id, seen_at) VALUES (?, ?)",
+            (user_id, datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+        )
+        await db.commit()
+
+
 async def is_banned(guild_id: int, user_id: int, table_name: str | None = None) -> bool:
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     db = await _get_db()
@@ -1047,6 +1088,20 @@ async def pay_jackpot(user_id: int, username: str, amount: int, reason: str) -> 
     return actual
 
 
+async def get_jackpot_payouts() -> list[tuple]:
+    """
+    Every JACKPOT_PAYOUT audit row, newest first, as (id, ts, user_id, user_name, detail).
+    Read-only. pay_jackpot() is the only writer of these rows.
+    """
+    db = await _get_db()
+    async with db.execute(
+        "SELECT id, ts, user_id, user_name, detail FROM audit_log "
+        "WHERE action = 'JACKPOT_PAYOUT' ORDER BY id DESC"
+    ) as c:
+        rows = await c.fetchall()
+    return [tuple(r) for r in rows]
+
+
 async def get_revenue_stats() -> dict:
     db = await _get_db()
     now = datetime.utcnow()
@@ -1208,6 +1263,12 @@ TITLES: dict[str, dict] = {
     "sandwich": {
         "display": "🥪",
         "description": "Win 200 all-in hands",
+        "rarity": "rare",
+        "hidden": False,
+    },
+    "pizza": {
+        "display": "🍕",
+        "description": "Win 500 all-in hands",
         "rarity": "rare",
         "hidden": False,
     },
@@ -1803,6 +1864,119 @@ async def create_custom_cosmetic(kind: str, cosmetic_id: str, display: str, desc
             return False
 
 
+# ── #1 Net title (top_net) ────────────────────────────────────────────────────
+# One title id whose *owner* follows the net-chips leaderboard and whose
+# *display text* the current owner can rewrite. State lives in top_net_state.
+TOP_NET_ID = "top_net"
+TOP_NET_MAX_LEN = 40
+_top_net_ready = False
+_top_net_holder: int | None = None  # in-process cache so sync UI builders can gate on it
+
+async def _ensure_top_net(locked: bool = False):
+    global _top_net_ready
+    if _top_net_ready:
+        return
+    db = await _get_db()
+    ddl = """
+        CREATE TABLE IF NOT EXISTS top_net_state (
+            id             INTEGER PRIMARY KEY CHECK (id = 1),
+            holder_id      INTEGER,
+            custom_display TEXT
+        )
+    """
+    if locked:
+        await db.execute(ddl)
+        await db.commit()
+    else:
+        async with _write_lock:
+            await db.execute(ddl)
+            await db.commit()
+    async with db.execute("SELECT custom_display FROM top_net_state WHERE id=1") as c:
+        row = await c.fetchone()
+    if row and row[0] and TOP_NET_ID in TITLES:
+        TITLES[TOP_NET_ID]["display"] = row[0]
+    _top_net_ready = True
+
+
+def sanitize_top_net_display(raw: str) -> str | None:
+    """Collapse whitespace, reject mentions/markdown-breakers/overlong text. None = invalid."""
+    s = " ".join((raw or "").split())
+    if not s or len(s) > TOP_NET_MAX_LEN:
+        return None
+    if any(ch in s for ch in ("@", "`")):
+        return None
+    return s
+
+
+async def get_top_net_holder() -> int | None:
+    """Authoritative read (also refreshes the sync cache)."""
+    global _top_net_holder
+    await _ensure_top_net()
+    db = await _get_db()
+    async with db.execute("SELECT holder_id FROM top_net_state WHERE id=1") as c:
+        row = await c.fetchone()
+    _top_net_holder = row[0] if row else None
+    return _top_net_holder
+
+
+def top_net_holder_cached() -> int | None:
+    return _top_net_holder
+
+
+async def get_player_net(user_id: int) -> int | None:
+    """Net chips for a player, or None if they have no stats row (e.g. removed from the leaderboard)."""
+    db = await _get_db()
+    async with db.execute("SELECT chips_won - chips_lost FROM stats WHERE user_id=?", (user_id,)) as c:
+        row = await c.fetchone()
+    return row[0] if row else None
+
+
+async def transfer_top_net(new_holder_id: int) -> int | None:
+    """Give top_net to new_holder_id and strip it (owned + equipped) from everyone else. Returns previous holder id."""
+    await _ensure_top_net()
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT holder_id FROM top_net_state WHERE id=1") as c:
+            row = await c.fetchone()
+        prev = row[0] if row else None
+        await db.execute("""
+            UPDATE player_cosmetics
+            SET unlocked_titles = COALESCE((SELECT json_group_array(value) FROM json_each(unlocked_titles)
+                                            WHERE value != ?), '[]'),
+                active_title    = CASE WHEN active_title = ? THEN NULL ELSE active_title END
+            WHERE user_id != ?
+              AND (active_title = ?
+                   OR EXISTS (SELECT 1 FROM json_each(unlocked_titles) WHERE value = ?))
+        """, (TOP_NET_ID, TOP_NET_ID, new_holder_id, TOP_NET_ID, TOP_NET_ID))
+        await db.execute("""
+            INSERT INTO top_net_state (id, holder_id) VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET holder_id = excluded.holder_id
+        """, (new_holder_id,))
+        await db.commit()
+    global _top_net_holder
+    _top_net_holder = new_holder_id
+    await unlock_cosmetic(new_holder_id, "title", TOP_NET_ID)  # takes _write_lock itself — must be outside
+    return prev
+
+
+async def set_top_net_display(user_id: int, raw: str) -> str | None:
+    """Rename the title. Only the current holder may. Returns the saved text, or None if rejected."""
+    await _ensure_top_net()
+    text = sanitize_top_net_display(raw)
+    if text is None or TOP_NET_ID not in TITLES:
+        return None
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT holder_id FROM top_net_state WHERE id=1") as c:
+            row = await c.fetchone()
+        if not row or row[0] != user_id:
+            return None
+        await db.execute("UPDATE top_net_state SET custom_display=? WHERE id=1", (text,))
+        await db.commit()
+    TITLES[TOP_NET_ID]["display"] = text
+    return text
+
+
 async def load_custom_cosmetics():
     """Load all custom cosmetics from the database into memory on startup."""
     db = await _get_db()
@@ -1914,6 +2088,7 @@ async def check_achievements(user_id: int, won: bool = False, pot_won: int = 0) 
         "all_in_hero": allin_wins >= 25,
         "bread": allin_wins >= 100,
         "sandwich": allin_wins >= 200,
+        "pizza": allin_wins >= 500,
         "quad_win": quads_wins >= 1,
         "quads_4": quads_wins >= 4,
         "suited_up": sf_wins >= 1,
@@ -2409,7 +2584,8 @@ DEFAULT_PREFERENCES = {
     "confirm_leave": 1,
     "confirm_call_raise_mode": "never",
     "confirm_call_raise_threshold": 0,
-    "card_size": "normal"  # "normal" | "compact" for "My Cards" image size only
+    "card_size": "normal",  # "normal" | "compact" for "My Cards" image size only
+    "run_it_multi_mode": "ask"  # "ask" | "auto_decline" for Run It Multiple votes
 }
 
 async def get_player_preference(user_id: int) -> dict:
@@ -2434,8 +2610,8 @@ async def set_player_preference(user_id: int, **kwargs):
                 confirm_all_in_mode, confirm_all_in_threshold,
                 confirm_fold_mode, confirm_fold_threshold,
                 confirm_leave, confirm_call_raise_mode, confirm_call_raise_threshold,
-                card_size
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                card_size, run_it_multi_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 auto_rebuy_amount = excluded.auto_rebuy_amount,
                 auto_showdown = excluded.auto_showdown,
@@ -2447,7 +2623,8 @@ async def set_player_preference(user_id: int, **kwargs):
                 confirm_leave = excluded.confirm_leave,
                 confirm_call_raise_mode = excluded.confirm_call_raise_mode,
                 confirm_call_raise_threshold = excluded.confirm_call_raise_threshold,
-                card_size = excluded.card_size
+                card_size = excluded.card_size,
+                run_it_multi_mode = excluded.run_it_multi_mode
         """, (
             user_id,
             curr["auto_rebuy_amount"],
@@ -2460,7 +2637,8 @@ async def set_player_preference(user_id: int, **kwargs):
             curr["confirm_leave"],
             curr["confirm_call_raise_mode"],
             curr["confirm_call_raise_threshold"],
-            curr["card_size"]
+            curr["card_size"],
+            curr["run_it_multi_mode"]
         ))
         await db.commit()
 

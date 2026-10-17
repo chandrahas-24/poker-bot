@@ -520,6 +520,40 @@ def make_double_board_strip(board1: list[int], board2: list[int],
     buf.seek(0)
     return discord.File(buf, filename="cards.png")  # matches build_embed's hardcoded attachment:// reference
 
+
+def make_multi_board_strip(boards: list[list[int]], blinds: list[set[int]] | None = None,
+                            cute_mode: bool = False, compact: bool = False) -> discord.File:
+    """
+    Run It Multiple: stack N boards (2 or 3), one per row. Same idea as
+    make_double_board_strip above (kept separate rather than folded into
+    it, since that one is Double Board chaos-modifier-specific and the two
+    features are meant to stay independent — see poker.py's rit_state
+    docstring). No effect from compact, matching make_double_board_strip.
+    """
+    blinds = blinds or [set() for _ in boards]
+
+    def _strip_only(cards, blind, backs):
+        f = make_strip(cards, backs, False, None, blind, cute_mode=cute_mode, compact=compact)
+        f.fp.seek(0)
+        return Image.open(f.fp).convert("RGBA")
+
+    imgs = [_strip_only(b, blinds[i] if i < len(blinds) else set(), max(0, 5 - len(b)))
+            for i, b in enumerate(boards)]
+
+    gap = 6
+    W = max(img.width for img in imgs)
+    H = sum(img.height for img in imgs) + gap * (len(imgs) - 1)
+    combined = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    y = 0
+    for img in imgs:
+        combined.paste(img, (0, y), img)
+        y += img.height + gap
+
+    buf = io.BytesIO()
+    combined.save(buf, "PNG", optimize=True)
+    buf.seek(0)
+    return discord.File(buf, filename="cards.png")
+
 # ── Auto-load cache on module import ──────────────────────────────────────────
 # This runs once when the module is first imported
 _load_cache()

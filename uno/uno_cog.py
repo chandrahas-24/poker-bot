@@ -452,6 +452,9 @@ class GameSession:
         # {"player_id", "card", "engine"}. Only that card may be played, and the
         # decision resolves exactly once under session.lock.
         self.pending_draw: dict | None = None
+        # Set by /uno close mid-round: the table closes (everyone refunded)
+        # once the round in progress has settled.
+        self.close_queued = False
 
         # Serializes state-changing interaction handlers (play/draw/pass/
         # wild color/WD4 accept/challenge/timeout/kick/leave/UNO toggle/
@@ -539,6 +542,7 @@ class GameSession:
             "turn_started_at": self.turn_started_at,
             "callout_balance": {str(k): v for k, v in self.callout_balance.items()},
             "_last_turn_player_id": self._last_turn_player_id,
+            "close_queued": self.close_queued,
         }
 
     @classmethod
@@ -579,6 +583,8 @@ class GameSession:
         self.turn_started_at = d.get("turn_started_at", 0.0)
         self.callout_balance = {int(k): v for k, v in d.get("callout_balance", {}).items()}
         self._last_turn_player_id = d.get("_last_turn_player_id")
+        self.pending_draw = None  # not persisted; resumed turns start without a pending draw decision
+        self.close_queued = bool(d.get("close_queued", False))
         # Fresh lock/generation counter for the resumed session — see the
         # comments on these fields in __init__.
         self.lock = asyncio.Lock()
@@ -988,7 +994,7 @@ class TablePanelView(discord.ui.View):
         self.session = session
         if session.state != "lobby":
             # Start / Cancel only exist before round 1 — after that rounds
-            # start themselves and staff use /uno end.
+            # start themselves and staff use /uno close.
             self.remove_item(self.start)
             self.remove_item(self.cancel)
         cog._track_view(self)
@@ -1487,7 +1493,7 @@ class TableView(discord.ui.LayoutView):
         if not session or not session.engine or session.engine.finished:
             return None
         if not self.cog._is_live(session):
-            # /uno end (or anything else that pops the channel out of
+            # /uno close (or anything else that pops the channel out of
             # self.sessions) doesn't touch this session/engine object —
             # old TableViews kept a direct reference and every check
             # above still passed, so their buttons kept working even
@@ -1702,22 +1708,22 @@ class UnoGame(commands.Cog):
 
     def _is_live(self, session: GameSession) -> bool:
         """True iff `session` is still THE registered session for its
-        channel. /uno end (and any other path that pops a channel out of
+        channel. /uno close (and any other path that pops a channel out of
         self.sessions) doesn't touch the session object itself or its
         engine — old Views (TableView, HandPlayView) and modals
         (PlayCardModal, DrawFollowupView) all hold a direct reference to
-        that same session object in their closures, so after /uno end
+        that same session object in their closures, so after /uno close
         `session.engine` is still non-None/unfinished and every
         engine-level check on it still passes. Without this identity
         check, those stale components kept working — the game "kept
-        going" through old buttons even after /uno end said it ended.
+        going" through old buttons even after /uno close said it ended.
         Every shared action handler below checks this first."""
         return self.sessions.get(session.channel_id) is session
 
     def _stop_session_views(self, session: GameSession):
         """Stops every tracked View belonging to this specific session
         (its buttons show as disabled/dead on next interaction) — used by
-        /uno end so old table/hand messages don't just silently no-op,
+        /uno close so old table/hand messages don't just silently no-op,
         they visibly stop responding. Narrower than cog_unload's
         stop-everything sweep, which is for a full cog reload."""
         for view in list(self._active_views):
@@ -1911,7 +1917,7 @@ class UnoGame(commands.Cog):
                     await interaction.response.send_message(
                         "⚠️ Can't resume safely: " + ", ".join(f"<@{pid}>" for pid in missing) +
                         " no longer have chips on the table (probably refunded with `/unoadmin recoverchips`), "
-                        "so resuming would pay them twice. Use `/uno end` instead.",
+                        "so resuming would pay them twice. Use `/uno close force:True` instead.",
                         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
                     return
         else:
@@ -2225,7 +2231,7 @@ class UnoGame(commands.Cog):
 
     async def close_table(self, session: GameSession, message: str | None):
         """Tears a table down and gives every seat everything it has on the
-        table back (lobby cancelled/expired, /uno end, idle close...).
+        table back (lobby cancelled/expired, /uno close, idle close...).
         Mid-round that voids the round — bets only change when a round is
         settled, so what's on the table IS what each player put in."""
         if session.closed:
@@ -2342,7 +2348,7 @@ class UnoGame(commands.Cog):
             # (it's one DB transaction), and the table plus its save are
             # the only record of that round. After fixing whatever broke,
             # restarting the bot and running /uno resume replays the
-            # finished round (the save holds it), or /uno end voids it
+            # finished round (the save holds it), or /uno close force:True voids it
             # and refunds everyone's bets.
             log.exception("UNO settlement failed for channel %s — table and save file were NOT cleared, "
                            "so this needs manual attention", session.channel_id)
@@ -2350,7 +2356,7 @@ class UnoGame(commands.Cog):
                 await channel.send(
                     "⚠️ Something went wrong finishing this round — nothing was applied and no chips were lost. "
                     "Check the bot's console for the error — after it's fixed, restart the bot and `/uno resume` "
-                    "replays this round, or `/uno end` voids it and refunds everyone."
+                    "replays this round, or `/uno close force:True` voids it and refunds everyone."
                 )
             except discord.HTTPException:
                 pass
@@ -2363,6 +2369,10 @@ class UnoGame(commands.Cog):
 
         session.engine = None
         session.last_action = None
+        if session.close_queued:
+            await self.close_table(session, "🔒 Table closed — the round ended and closing was queued by staff. "
+                                            "Everything on the table was returned to wallets:")
+            return
         if not session.seats:
             await self.close_table(session, "Everyone left — table closed.")
             return
@@ -3067,19 +3077,44 @@ class UnoGame(commands.Cog):
             return
         await self.handle_toggle_arm_uno(interaction, session)
 
-    @uno.command(name="end", description="Close the table in this channel and refund everyone (event staff only)")
-    async def end(self, interaction: discord.Interaction):
+    @uno.command(name="close", description="Close the table after the current round ends (event staff only)")
+    @app_commands.describe(force="Close RIGHT NOW, voiding the round in progress and refunding every bet")
+    async def close_cmd(self, interaction: discord.Interaction, force: bool = False):
         session = self.sessions.get(interaction.channel_id)
-        if not session:
+        if not session or session.closed:
             await interaction.response.send_message("No table open here.", ephemeral=True)
             return
         if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can end this.", ephemeral=True)
+            await interaction.response.send_message("Only event staff can close the table.", ephemeral=True)
             return
         async with session.lock:
-            await interaction.response.defer()
-            await self.close_table(session, "Table closed by staff — everything on the table was refunded:")
-        await interaction.followup.send("Table closed.", ephemeral=True)
+            if session.closed or self.sessions.get(interaction.channel_id) is not session:
+                await interaction.response.send_message("No table open here.", ephemeral=True)
+                return
+            engine = session.engine
+            round_live = session.state == "playing" and engine is not None and not engine.finished
+            # Nothing is at risk outside a live round (or when the round is
+            # stuck unsettled), and `force` is the explicit emergency exit.
+            if force or not round_live:
+                await interaction.response.defer(ephemeral=True)
+                await self.close_table(session, "Table closed by staff — everything on the table was refunded:")
+                await interaction.followup.send("Table closed.", ephemeral=True)
+                return
+            session.close_queued = not session.close_queued
+            self._save_session(session)
+            queued = session.close_queued
+            await interaction.response.send_message(
+                "🔒 Table will close when the current round ends — everyone's chips go back to their wallets. "
+                "Run `/uno close` again to cancel." if queued else
+                "🔓 Close cancelled — the table will keep running.", ephemeral=True)
+        channel = interaction.channel
+        if channel:
+            try:
+                await channel.send(
+                    "🔒 **This table will close after the current round.**" if queued
+                    else "🔓 **Table close cancelled — play continues.**")
+            except discord.HTTPException:
+                pass
 
     @uno.command(name="kick", description="Remove a player from the table (event staff only)")
     @app_commands.describe(user="The user to remove")

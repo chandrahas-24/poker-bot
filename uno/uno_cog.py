@@ -103,7 +103,7 @@ from .unodemo import (
     MAX_BUTTONS_TOTAL,
 )
 
-from ..poker.leaderboard_image import generate_leaderboard_image
+from poker.leaderboard_image import generate_leaderboard_image
 
 log = logging.getLogger("uno")
 

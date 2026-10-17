@@ -93,6 +93,7 @@ def generate_leaderboard_image(
     caller_id,
     caller_row,
     caller_rank,
+    title="Poker Leaderboard",
 ):
     WIDTH = 900
     ROW_HEIGHT = 62
@@ -174,7 +175,7 @@ def generate_leaderboard_image(
 
     draw.text(
         (102, title_y),
-        "Poker Leaderboard",
+        title,
         font=_font(38, True),
         fill=white,
     )
@@ -314,16 +315,12 @@ def generate_leaderboard_image(
         # Win percentage
         # ----------------------------------------------------
 
-        if r["hands_played"]:
+        played = r.get("hands_played") or r.get("rounds_played", 0)
+        won = r.get("hands_won") or r.get("rounds_won", 0)
 
-            win_percentage = (
-                r["hands_won"]
-                / r["hands_played"]
-                * 100
-            )
-
+        if played:
+            win_percentage = (won / played * 100)
             wp_text = f"{win_percentage:.0f}%"
-
         else:
             wp_text = "—"
 
@@ -472,18 +469,12 @@ def generate_leaderboard_image(
             else "—"
         )
 
-        if caller_row["hands_played"]:
+        played = r.get("hands_played") or r.get("rounds_played", 0)
+        won = r.get("hands_won") or r.get("rounds_won", 0)
 
-            caller_win_percentage = (
-                caller_row["hands_won"]
-                / caller_row["hands_played"]
-                * 100
-            )
-
-            caller_wp_text = (
-                f"{caller_win_percentage:.1f}%"
-            )
-
+        if played:
+            win_percentage = (won / played * 100)
+            caller_wp_text = f"{win_percentage:.0f}%"
         else:
             caller_wp_text = "—"
 

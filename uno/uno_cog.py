@@ -103,6 +103,8 @@ from .unodemo import (
     MAX_BUTTONS_TOTAL,
 )
 
+from ..poker.leaderboard_image import generate_leaderboard_image
+
 log = logging.getLogger("uno")
 
 
@@ -3993,19 +3995,18 @@ class UnoGame(commands.Cog):
         caller_row = await db.get_player_stats(interaction.user.id)
         caller_rank = await db.get_player_rank(interaction.user.id) if caller_row else None
 
-        lines = []
-        for i, r in enumerate(rows):
-            net = r["net_chips"]
-            lines.append(
-                f"{PLACEMENT_EMOJI.get(i, f'`#{i+1}`')} <@{r['user_id']}> — "
-                f"**{'+' if net >= 0 else ''}{net:,} **{config.UNO_CHIP_EMOJI}"
-            )
-        embed = discord.Embed(title="🃏 UNO Leaderboard", description="\n".join(lines), color=0xF1C40F)
-        if caller_row and caller_rank and caller_rank > 10:
-            net = caller_row["net_chips"]
-            embed.set_footer(text=f"Your rank: #{caller_rank} ({'+' if net >= 0 else ''}{net:,} net)")
+        # Offload the image generation to a background thread to prevent blocking
+        image_bytes = await asyncio.to_thread(
+            generate_leaderboard_image,
+            rows,
+            interaction.user.id,
+            caller_row,
+            caller_rank,
+            title="UNO Leaderboard"
+        )
 
-        await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        file = discord.File(image_bytes, filename="uno_leaderboard.png")
+        await interaction.followup.send(file=file)
 
     @uno.command(name="request_cashout", description="Lock UNO chips for withdrawal and notify staff")
     @app_commands.describe(amount="Chips to cash out (e.g. 500, 2k)", note="Optional notes")

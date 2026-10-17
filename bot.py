@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
+import asyncio
 import os
 from dotenv import load_dotenv
 import traceback
@@ -194,6 +195,21 @@ async def daily_inactive_wipe():
 # ── Daily UNO inactivity wipe (03:45 UTC — offset from poker's so they don't overlap) ──
 uno_wipe_time = datetime.time(hour=3, minute=45, tzinfo=datetime.timezone.utc)
 
+def _uno_todo(p: dict) -> str:
+    """Unmet requirements reported independently (never negative)."""
+    from uno import database as uno_db
+    rounds_left = max(0, uno_db.MIN_ROUNDS_PER_PERIOD - p["recent_rounds"])
+    wager_left = max(0, uno_db.MIN_CHIPS_WAGERED - p["recent_chips_wagered"])
+    parts = []
+    if rounds_left:
+        parts.append(f"play **{rounds_left}** more round(s)")
+    if wager_left:
+        parts.append(f"wager **{wager_left:,}** more chips")
+    if not parts:
+        return "**You've met the requirements — keep playing to stay safe!**"
+    return "**To keep your chips: " + " and ".join(parts) + " before the wipe!**"
+
+
 @tasks.loop(time=uno_wipe_time)
 async def daily_uno_inactive_wipe():
     """Same shape as daily_inactive_wipe, but against uno/database.py's
@@ -215,8 +231,7 @@ async def daily_uno_inactive_wipe():
                 f"**Your balance:** {player['balance']:,} chips\n"
                 f"**Rounds played:** {player['recent_rounds']} / {uno_db.MIN_ROUNDS_PER_PERIOD} required\n"
                 f"**Chips wagered:** {player['recent_chips_wagered']:,} / {uno_db.MIN_CHIPS_WAGERED:,} required\n\n"
-                f"**Play {uno_db.MIN_ROUNDS_PER_PERIOD - player['recent_rounds']} more round(s) "
-                f"before the wipe to keep your chips!**"
+                f"{_uno_todo(player)}"
             )
             embed.set_footer(text="UNO wipe runs daily at 03:45 UTC")
             if await _try_dm(player["user_id"], embed=embed):
@@ -240,7 +255,7 @@ async def daily_uno_inactive_wipe():
                 f"and your UNO chips have been wiped.\n\n"
                 f"**Chips wiped:** {w['amount_wiped']:,}\n"
                 f"**Inactivity tax ({tax_pct}%):** -{w['tax_amount']:,} chips\n"
-                f"**Auto-queued cashout (80%):** {w['cashout_amount']:,} chips\n\n"
+                f"**Auto-queued cashout ({100 - tax_pct}%):** {w['cashout_amount']:,} chips\n\n"
                 f"**Rounds played:** {w['recent_rounds']} / {uno_db.MIN_ROUNDS_PER_PERIOD} required\n"
                 f"**Chips wagered:** {w['recent_chips_wagered']:,} / {uno_db.MIN_CHIPS_WAGERED:,} required"
             )
@@ -270,6 +285,21 @@ async def daily_uno_inactive_wipe():
                 except Exception:
                     traceback.print_exc()
 
+            # Staff cashout tickets — same layout on_raw_reaction_add parses
+            # (and the UNO chip emoji routes it to the UNO economy).
+            for cashout_channel_id in _as_id_set(getattr(config, "UNO_CASHOUT_CHANNEL_ID", None)):
+                try:
+                    cashout_channel = await bot.fetch_channel(cashout_channel_id)
+                    for w in wiped:
+                        if w.get("cashout_amount", 0) > 0:
+                            await cashout_channel.send(
+                                f"**Username:** <@{w['user_id']}>\n"
+                                f"**Amount:** {w['cashout_amount']:,} {config.UNO_CHIP_EMOJI}\n"
+                                f"**Notes:** Auto-Cashout (Inactivity Wipe)"
+                            )
+                except Exception:
+                    traceback.print_exc()
+
             print(
                 f"[Daily UNO Wipe] Wiped {len(wiped)} player(s) | "
                 f"tax: {sum(w['tax_amount'] for w in wiped):,} | "
@@ -279,13 +309,32 @@ async def daily_uno_inactive_wipe():
     except Exception:
         traceback.print_exc()
 
+_startup_lock = asyncio.Lock()
+
+
+async def _load_ext(name: str):
+    """Idempotent load so a retried startup doesn't trip over extensions
+    that already loaded on the failed attempt."""
+    if name not in bot.extensions:
+        await bot.load_extension(name)
+
+
 @bot.event
 async def on_ready():
     if bot.startup_complete:
         print("🔄 Reconnected to Discord.")
         return
 
-    bot.startup_complete = True
+    async with _startup_lock:
+        if bot.startup_complete:
+            return
+        await _run_startup()
+        # Only after EVERY step succeeded — if anything above raised, the
+        # next on_ready retries instead of being skipped for good.
+        bot.startup_complete = True
+
+
+async def _run_startup():
     await init_db()
     await init_uno_db()
     await init_tutorial_db()
@@ -311,14 +360,14 @@ async def on_ready():
     #     for r in tourney_recovered:
     #         print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
 
-    await bot.load_extension("poker.poker")
-    await bot.load_extension("poker.tutorial_cog")
-    await bot.load_extension("eventlog.eventlog")
-    await bot.load_extension("poker.pokerai")
+    await _load_ext("poker.poker")
+    await _load_ext("poker.tutorial_cog")
+    await _load_ext("eventlog.eventlog")
+    await _load_ext("poker.pokerai")
     #await bot.load_extension("hotpotato")
     #await bot.load_extension("uno.unodemo")
-    await bot.load_extension("uno.uno_cog")
-    await bot.load_extension("highlight")
+    await _load_ext("uno.uno_cog")
+    await _load_ext("highlight")
     # await bot.load_extension("tournament.tournament")
 
 
@@ -332,10 +381,12 @@ async def on_ready():
     print("✅ Synced global/user-install commands")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    daily_inactive_wipe.start()
-    daily_uno_inactive_wipe.start()
+    if not daily_inactive_wipe.is_running():
+        daily_inactive_wipe.start()
+    if not daily_uno_inactive_wipe.is_running():
+        daily_uno_inactive_wipe.start()
 
-    if config.DONATION_CONVERSION_ENABLED:
+    if config.DONATION_CONVERSION_ENABLED and not clear_donation_cache.is_running():
         clear_donation_cache.start()
 
 
@@ -450,26 +501,52 @@ if config.DONATION_CONVERSION_ENABLED:
         if message.guild:
             user = message.guild.get_member(user.id) or user
 
-        # ── 7. Credit chips ───────────────────────────────────────────────────────
+        # ── 7. Claim, then credit ─────────────────────────────────────────────────
+        # The persistent ✅ reaction is the claim marker (step 3.5 checks it),
+        # so it goes on BEFORE crediting: nothing after the credit can leave
+        # a credited donation looking unprocessed.
         try:
-            new_bal = await target_db.add_chips(
-                bot.user.id,
-                bot.user.display_name,
-                user.id,
-                user.name,
-                chips,
-                "Dank Memer Donation Exchange",
-            )
-            await target_db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+            await message.add_reaction("✅")
+        except Exception as e:
+            print(f"[Donation Error] Couldn't claim message {message.id}: {e}")
+            _processed_donations.discard(payload.message_id)
+            return
 
-            print(f"[Donation{'/UNO' if is_uno else ''}] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
+        try:
+            if is_uno:
+                # dedupe record + credit + logs in ONE DB transaction, keyed by message id
+                new_bal = await target_db.credit_donation(
+                    payload.message_id, bot.user.id, bot.user.display_name, user.id, user.name,
+                    chips, "Dank Memer Donation Exchange")
+                if new_bal is None:
+                    print(f"[Donation/UNO] Message {message.id} was already credited — skipping")
+                    return
+            else:
+                new_bal = await target_db.add_chips(
+                    bot.user.id, bot.user.display_name, user.id, user.name, chips,
+                    "Dank Memer Donation Exchange")
+        except Exception as e:
+            print(f"[Donation Error] Failed to process donation for {user.id}: {e}")
+            try:
+                await message.remove_reaction("✅", bot.user)  # nothing was credited — allow a retry
+            except Exception:
+                pass
+            _processed_donations.discard(payload.message_id)
+            return
 
+        if not is_uno:
+            try:
+                await target_db.log_currency_event(user.id, "Cash In", chips, "Dank Memer Donation")
+            except Exception:
+                traceback.print_exc()  # chips are already credited; the audit row is best-effort
+
+        print(f"[Donation{'/UNO' if is_uno else ''}] {user} donated ⏣{donated:,} → +{chips} chip(s) | new balance: {new_bal}")
+        try:
             await message.reply(
                 f"✅ **+{chips:,}** chip(s) → {user.mention} | Balance: **{new_bal:,}** {chip_emoji}"
             )
-            await message.add_reaction("✅")
-        except Exception as e:
-            print(f"[Donation Error] Failed to process donation for {user.id}: {e}")
+        except Exception:
+            traceback.print_exc()
 
 
 _processing_cashouts = set()
@@ -552,19 +629,51 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         target_user_id = int(user_match.group(1))
         amount = int(amount_match.group(1).replace(",", ""))
 
-        # 9. Attempt to process the payment in the database
-        ok = await target_db.pay_cashout(target_user_id, amount)
-        if not ok:
-            await channel.send(
-                f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
-                f"They might not have **{amount:,}** chips in their pending queue anymore.",
-                delete_after=15
-            )
-            return
+        # 9. Pay exactly once.
+        paid_line = f"\n\n-# **PAID** by <@{payload.user_id}>"
+        fail_msg = (f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
+                    f"They might not have **{amount:,}** chips in their pending queue anymore.")
 
-        # 10. Update the ticket visually so staff know it's done
-        new_content = message.content + f"\n\n-# **PAID** by <@{payload.user_id}>"
-        await message.edit(content=new_content)
+        if is_uno:
+            # Idempotent by ticket (message id), recorded in the same DB
+            # transaction as the deduction. The message edit is display only.
+            if await target_db.is_ticket_paid(payload.message_id):
+                try:
+                    await message.edit(content=message.content + paid_line)  # repair the display
+                except Exception:
+                    traceback.print_exc()
+                return
+            if not await target_db.pay_cashout(target_user_id, amount, ticket_id=payload.message_id):
+                await channel.send(fail_msg, delete_after=15)
+                return
+            try:
+                await message.edit(content=message.content + paid_line)
+            except Exception:
+                traceback.print_exc()  # payment is recorded; a retry just repairs the display
+        else:
+            # poker's pay_cashout keeps no per-ticket record, so mark the
+            # ticket FIRST and pay second: if the edit fails nothing is paid,
+            # and if the payment fails the mark is reverted.
+            original = message.content
+            try:
+                await message.edit(content=original + paid_line)
+            except Exception:
+                traceback.print_exc()
+                await channel.send(f"❌ <@{payload.user_id}>, couldn't mark the ticket as paid — nothing was paid out.",
+                                   delete_after=15)
+                return
+            try:
+                ok = await target_db.pay_cashout(target_user_id, amount)
+            except Exception:
+                traceback.print_exc()
+                ok = False
+            if not ok:
+                try:
+                    await message.edit(content=original)
+                except Exception:
+                    traceback.print_exc()
+                await channel.send(fail_msg, delete_after=15)
+                return
     finally:
         _processing_cashouts.discard(payload.message_id)
 
@@ -625,6 +734,7 @@ async def reload(ctx, cog_name: str = None):
 
     helpers_to_reload = []
     cogs_to_reload = []
+    UNO_HELPERS = ["config", "uno.cards", "uno.hand_render", "uno.uno_engine", "uno.database", "uno.unodemo"]
 
     def resolve_target(name_lower, name_raw):
         """Returns (helpers, cogs) for a single target token."""
@@ -638,7 +748,7 @@ async def reload(ctx, cog_name: str = None):
         elif name_lower in ("ai", "pokerai"):
             return (["config"], ["poker.pokerai"])
         elif name_lower in ("uno",):
-            return (["config"], ["uno.uno_cog"])
+            return (UNO_HELPERS, ["uno.uno_cog"])
         elif name_lower in ("highlight", "hl"):
             return (["config"], ["highlight"])
         else:
@@ -660,8 +770,8 @@ async def reload(ctx, cog_name: str = None):
                 return ([name_raw], [])
 
     if cog_name is None:
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"]
-        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "highlight"]
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"] + [h for h in UNO_HELPERS if h != "config"]
+        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "uno.uno_cog", "highlight"]
     else:
         # Comma-separated list of targets — aliases, dotted helper modules, or cogs, any mix.
         for token in [t.strip() for t in cog_name.split(",") if t.strip()]:

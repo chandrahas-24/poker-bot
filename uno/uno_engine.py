@@ -619,6 +619,10 @@ class GameState:
         self.left_early.add(player_id)
 
         was_current = idx == self.current_index
+        # The color choice for a pending Wild is owed by the CURRENT player
+        # (the turn doesn't advance until they pick). Only their departure
+        # voids it — an unrelated player leaving must not touch it.
+        owed_color_left = self.pending_wild and was_current
         wd4_involved = self.pending_wd4_challenge is not None and player_id in (
             self.pending_wd4_challenge["wd4_player_id"], self.pending_wd4_challenge["target_id"]
         )
@@ -663,10 +667,13 @@ class GameState:
         else:
             self.current_index %= len(self.players)
 
-        if self.pending_wild:
-            # the departing player owed a color choice — clear the pending state
+        if owed_color_left:
+            # the departing player owed a color choice — resolve it with a
+            # random color (same as a Wild color timeout) so the discard
+            # pile's top card and current_color stay in agreement.
             self.pending_wild = False
             self.pending_wild_card = None
+            self.current_color = random.choice(COLORS)
 
         self._check_win()
 

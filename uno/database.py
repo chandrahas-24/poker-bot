@@ -24,7 +24,33 @@ MIN_CHIPS_WAGERED = config.UNO_MIN_CHIPS_WAGERED
 WIPE_TAX_RATE = config.UNO_WIPE_TAX_RATE
 
 _db: aiosqlite.Connection | None = None
-_write_lock = asyncio.Lock()
+class _RollbackLock:
+    """asyncio lock that rolls back the shared connection if the guarded block
+    exits with ANY exception (incl. cancellation). Without this, an error
+    between a write and its commit() leaves the implicit transaction open on
+    the global connection and the next caller's commit() persists the
+    half-finished work."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is not None and _db is not None:
+                try:
+                    await _db.rollback()
+                except Exception:
+                    pass
+        finally:
+            self._lock.release()
+        return False
+
+
+_write_lock = _RollbackLock()
 
 
 async def _get_db() -> aiosqlite.Connection:
@@ -270,6 +296,26 @@ async def init_db():
             except aiosqlite.OperationalError as e:
                 if "duplicate column name" not in str(e).lower():
                     raise
+        # Idempotency records: a staff cashout ticket (keyed by its Discord
+        # message id) can be paid at most once, and a donation message can
+        # be credited at most once, regardless of what happens to the
+        # Discord-side display afterwards.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS paid_cashout_tickets (
+                ticket_id INTEGER PRIMARY KEY,
+                user_id   INTEGER NOT NULL,
+                amount    INTEGER NOT NULL,
+                ts        TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS processed_donations (
+                message_id INTEGER PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                chips      INTEGER NOT NULL,
+                ts         TEXT NOT NULL
+            )
+        """)
         await db.commit()
 
 
@@ -457,14 +503,25 @@ async def request_cashout(user_id: int, amount: int) -> bool:
         return success
 
 
-async def pay_cashout(user_id: int, amount: int) -> bool:
-    """Staff confirms a payout: deducts the amount from the pending vault."""
+async def pay_cashout(user_id: int, amount: int, ticket_id: int | None = None) -> bool:
+    """Staff confirms a payout: deducts the amount from the pending vault.
+    With ticket_id (the ticket's Discord message id) the payment is
+    idempotent: the ticket is recorded in the SAME transaction as the
+    deduction, so a second attempt for the same ticket returns False and
+    changes nothing, whatever happened to the message edit."""
     db = await _get_db()
     async with _write_lock:
+        if ticket_id is not None:
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO paid_cashout_tickets (ticket_id, user_id, amount, ts) VALUES (?,?,?,?)",
+                (ticket_id, user_id, amount, datetime.utcnow().isoformat()))
+            if cur.rowcount == 0:
+                return False
         async with db.execute("SELECT pending_cashout FROM wallets WHERE user_id=?", (user_id,)) as c:
             row = await c.fetchone()
             pending = row[0] if row else 0
         if pending < amount:
+            await db.rollback()  # also discards the ticket record
             return False
         await db.execute(
             "UPDATE wallets SET pending_cashout = pending_cashout - ? WHERE user_id = ?",
@@ -472,6 +529,50 @@ async def pay_cashout(user_id: int, amount: int) -> bool:
         )
         await db.commit()
         return True
+
+
+async def is_ticket_paid(ticket_id: int) -> bool:
+    db = await _get_db()
+    async with db.execute("SELECT 1 FROM paid_cashout_tickets WHERE ticket_id=?", (ticket_id,)) as c:
+        return bool(await c.fetchone())
+
+
+async def credit_donation(message_id: int, admin_id: int, admin_name: str, user_id: int, user_name: str,
+                          chips: int, note: str = "") -> int | None:
+    """Credits a donation exactly once per Discord message id: the dedupe
+    record, wallet credit, chip_log and currency_log all commit together.
+    Returns the new balance, or None if this message was already credited."""
+    db = await _get_db()
+    now = datetime.utcnow().isoformat()
+    async with _write_lock:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO processed_donations (message_id, user_id, chips, ts) VALUES (?,?,?,?)",
+            (message_id, user_id, chips, now))
+        if cur.rowcount == 0:
+            return None
+        await db.execute("""
+            INSERT INTO wallets (user_id, username, balance, last_activity, recent_rounds, recent_chips_wagered)
+            VALUES (?, ?, MAX(0, ?), ?, 0, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                last_activity = CASE WHEN balance < ? THEN ? ELSE COALESCE(wallets.last_activity, ?) END,
+                recent_rounds = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_rounds, 0) END,
+                recent_chips_wagered = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_chips_wagered, 0) END,
+                balance = MAX(0, balance + ?)
+        """, (user_id, user_name, chips, now,
+              config.UNO_MIN_BET, now, now, config.UNO_MIN_BET, config.UNO_MIN_BET, chips))
+        await db.execute("""
+            INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note, table_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+        """, (now, admin_id, admin_name, user_id, user_name, chips, note))
+        await db.execute("""
+            INSERT INTO currency_log (user_id, event_type, amount, description, ts)
+            VALUES (?, 'Cash In', ?, 'Dank Memer Donation', ?)
+        """, (user_id, chips, now))
+        async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+        await db.commit()
+        return row[0] if row else 0
 
 
 # ── Currency log (per-transaction audit trail for /uno currencylog) ────────
@@ -969,6 +1070,69 @@ async def apply_round_settlement(round_uuid: str, guild_id: int, channel_id: int
 
 # ── Tips ─────────────────────────────────────────────────────────────────────
 
+async def tip_transfer(user_id: int, username: str, dealer_id: int, dealer_name: str,
+                       tip: int, from_table: int = 0, table_id: str | None = None,
+                       round_num: int | None = None) -> tuple[bool, int]:
+    """Whole tip in ONE transaction: optionally pull `from_table` chips off the
+    tipper's table amount into their wallet, deduct `tip` from the wallet,
+    credit the dealer, and write chip_log / tips / currency_log. Either
+    everything applies or nothing does. Returns (ok, new_table_amount);
+    new_table_amount is the authoritative chips_in_play value after the call."""
+    now = datetime.utcnow().isoformat()
+    async with _write_lock:
+        db = await _get_db()
+        async with db.execute("SELECT amount FROM chips_in_play WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+        table_amt = row[0] if row else 0
+        if from_table > 0:
+            if table_amt < from_table:
+                return False, table_amt
+            table_amt -= from_table
+            await db.execute("""
+                INSERT INTO wallets (user_id, username, balance) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+            """, (user_id, username, from_table, from_table))
+            if table_amt > 0:
+                await db.execute("UPDATE chips_in_play SET amount=? WHERE user_id=?", (table_amt, user_id))
+            else:
+                await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (user_id,))
+        cur = await db.execute(
+            "UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+            (tip, user_id, tip))
+        if cur.rowcount <= 0:
+            await db.rollback()
+            return False, (table_amt + from_table)
+        await db.execute("""
+            INSERT INTO wallets (user_id, username, balance, last_activity, recent_rounds, recent_chips_wagered)
+            VALUES (?, ?, MAX(0, ?), ?, 0, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                last_activity = CASE WHEN balance < ? THEN ? ELSE COALESCE(wallets.last_activity, ?) END,
+                recent_rounds = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_rounds, 0) END,
+                recent_chips_wagered = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_chips_wagered, 0) END,
+                balance = MAX(0, balance + ?)
+        """, (dealer_id, dealer_name, tip, now,
+              config.UNO_MIN_BET, now, now, config.UNO_MIN_BET, config.UNO_MIN_BET, tip))
+        await db.execute("""
+            INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note, table_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, user_id, username, dealer_id, dealer_name, tip, f"Tip from {username}", table_id))
+        await db.execute("""
+            INSERT INTO stats (user_id, username, total_tipped) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                total_tipped = COALESCE(total_tipped, 0) + ?
+        """, (user_id, username, tip, tip))
+        for uid, amt, desc in ((user_id, -tip, f"Tipped {dealer_name}"),
+                               (dealer_id, tip, f"Tip from {username}")):
+            await db.execute("""
+                INSERT INTO currency_log (user_id, event_type, amount, description, ts, table_id, round_num)
+                VALUES (?, 'Tip', ?, ?, ?, ?, ?)
+            """, (uid, amt, desc, now, table_id, round_num))
+        await db.commit()
+        return True, table_amt
+
+
 async def record_tip(user_id: int, username: str, amount: int):
     db = await _get_db()
     async with _write_lock:
@@ -1137,13 +1301,14 @@ async def wipe_inactive_players() -> list[dict]:
     """Wipe chips from inactive players — 20% tax (logged as house revenue),
     the remaining 80% auto-queued as a pending cashout. Same split poker uses."""
     now = datetime.utcnow().isoformat()
-    inactive = await get_inactive_players()
-    if not inactive:
-        return []
-
     db = await _get_db()
     wiped = []
     async with _write_lock:
+        # Eligibility and balances are read INSIDE the write lock so nothing
+        # can credit a wallet or mark a player active between the read and
+        # the wipe; the UPDATE below additionally requires the balance to be
+        # unchanged.
+        inactive = await get_inactive_players()
         for player in inactive:
             user_id, username, balance = player["user_id"], player["username"], player["balance"]
             if balance <= 0:
@@ -1152,15 +1317,17 @@ async def wipe_inactive_players() -> list[dict]:
             tax_amount = math.ceil(balance * WIPE_TAX_RATE)
             cashout_amount = balance - tax_amount
 
-            await db.execute("""
+            cur = await db.execute("""
                 UPDATE wallets
                 SET balance = 0,
                     pending_cashout = pending_cashout + ?,
                     recent_rounds = 0,
                     recent_chips_wagered = 0,
                     last_activity = ?
-                WHERE user_id = ?
-            """, (cashout_amount, now, user_id))
+                WHERE user_id = ? AND balance = ?
+            """, (cashout_amount, now, user_id, balance))
+            if cur.rowcount != 1:
+                continue
             await db.execute("""
                 INSERT INTO stats (user_id, username, times_wiped) VALUES (?, ?, 1)
                 ON CONFLICT(user_id) DO UPDATE SET
@@ -1185,8 +1352,8 @@ async def wipe_inactive_players() -> list[dict]:
             if tax_amount > 0:
                 await db.execute("""
                     INSERT INTO currency_log (user_id, event_type, amount, description, ts)
-                    VALUES (?, 'Wipe', ?, 'Inactivity Tax (20%)', ?)
-                """, (user_id, -tax_amount, now))
+                    VALUES (?, 'Wipe', ?, ?, ?)
+                """, (user_id, -tax_amount, f"Inactivity Tax ({round(WIPE_TAX_RATE * 100)}%)", now))
             if cashout_amount > 0:
                 await db.execute("""
                     INSERT INTO currency_log (user_id, event_type, amount, description, ts)

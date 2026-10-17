@@ -108,12 +108,14 @@ log = logging.getLogger("uno")
 
 def _parse_chips(value: str) -> int | None:
     """Parse chip amounts like 500, 2k, 1.5k, 2000."""
+    from decimal import Decimal, InvalidOperation
     try:
         v = value.strip().lower().replace(",", "")
-        if v.endswith("k"):
-            return int(float(v[:-1]) * 1000)
-        return int(float(v))
-    except (ValueError, TypeError):
+        n = Decimal(v[:-1]) * 1000 if v.endswith("k") else Decimal(v)
+        if not n.is_finite() or n != n.to_integral_value():
+            return None  # e.g. "1.9" — reject instead of silently truncating
+        return int(n)
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
         return None
 
 # Where in-progress games get checkpointed so a bot crash/restart mid-game
@@ -444,6 +446,10 @@ class GameSession:
         self.turn_started_at: float = 0.0  # unix time the current turn's timer started, for the <t:...> display
         self.callout_balance: dict[int, int] = {}  # player_id -> false-callouts remaining (missing = 1, default)
         self._last_turn_player_id: int | None = None  # tracks turn changes so callout_balance refreshes correctly
+        # Set while a player holds a drawn, playable card and owes a Play/No decision:
+        # {"player_id", "card", "engine"}. Only that card may be played, and the
+        # decision resolves exactly once under session.lock.
+        self.pending_draw: dict | None = None
 
         # Serializes state-changing interaction handlers (play/draw/pass/
         # wild color/WD4 accept/challenge/timeout/kick/leave/UNO toggle/
@@ -876,7 +882,6 @@ def build_settings_embed(s: dict) -> discord.Embed:
     e.add_field(name="Decks", value=str(s["num_decks"]), inline=True)
     e.add_field(name="Log channel", value=(f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "Not set"), inline=True)
     e.add_field(name="Manager role", value=(f"<@&{s['manager_role_id']}>" if s.get("manager_role_id") else "Not set"), inline=True)
-    e.set_footer(text=f"Winners tax: {config.UNO_WINNERS_TAX_RATE:.0%} of profit (set in config.py)")
     return e
 
 
@@ -1100,6 +1105,11 @@ class DrawFollowupView(discord.ui.View):
         strike, even when reached via the timeout path."""
         async with self.session.lock:
             engine = self.session.engine
+            # Resolve the pending decision exactly once: if it was already
+            # settled (card played / declined / superseded) this is a no-op.
+            if not self.cog._pending_draw_for(self.session, player_id):
+                return
+            self.session.pending_draw = None
             if not engine or engine.finished or engine.current_player().player_id != player_id:
                 return
             engine.pass_turn(player_id)
@@ -1680,6 +1690,13 @@ class UnoGame(commands.Cog):
 
     def _track_view(self, view: discord.ui.View):
         self._active_views.add(view)
+
+    @staticmethod
+    def _pending_draw_for(session: GameSession, user_id: int) -> dict | None:
+        pd = session.pending_draw
+        if pd and pd["player_id"] == user_id and pd["engine"] is session.engine:
+            return pd
+        return None
 
     def _is_live(self, session: GameSession) -> bool:
         """True iff `session` is still THE registered session for its
@@ -2412,8 +2429,8 @@ class UnoGame(commands.Cog):
         if log_channel_id and winner is not None:
             log_channel = self.bot.get_channel(int(log_channel_id))
             if log_channel:
-                header = (f"Round #{n} | Table: #{channel_name} ({session.table_id}) | "
-                          f"Dealer: {session.dealer_name} | Pot: {collected} | Tax: {total_tax}")
+                header = (f"Round #{n} | ({session.table_id}) | "
+                          f"Pot: {collected} | Tax: {total_tax}")
                 rows = "\n".join(
                     f"  {p['username']} ({p['user_id']}): Bet: {p['bet']}  Net: {'+' if p['net'] >= 0 else ''}{p['net']}"
                     for p in players
@@ -2458,8 +2475,17 @@ class UnoGame(commands.Cog):
             return
 
         async with session.lock:
+            if not self._is_live(session) or session.engine is not engine or engine.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                return
             if engine.current_player().player_id != interaction.user.id:
                 await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                return
+
+            pd = self._pending_draw_for(session, interaction.user.id)
+            if pd and card != pd["card"]:
+                await interaction.response.send_message(
+                    f"⚠️ You drew **{pd['card']}** — you can only play that card or keep it.", ephemeral=True)
                 return
 
             try:
@@ -2471,6 +2497,8 @@ class UnoGame(commands.Cog):
                 await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
                 return
 
+            if pd:
+                session.pending_draw = None
             engine.record_action(interaction.user.id)
 
             # Consume the Call UNO pre-arm (set via the Hand toggle at 2 cards):
@@ -2519,6 +2547,9 @@ class UnoGame(commands.Cog):
             return
 
         async with session.lock:
+            if not self._is_live(session) or session.engine is not engine or engine.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                return
             if engine.pending_wd4_challenge:
                 pc = engine.pending_wd4_challenge
                 if interaction.user.id != pc["target_id"]:
@@ -2538,6 +2569,11 @@ class UnoGame(commands.Cog):
                 await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
                 return
 
+            if self._pending_draw_for(session, interaction.user.id):
+                await interaction.response.send_message(
+                    "⚠️ Decide on the card you just drew first — play it or keep it.", ephemeral=True)
+                return
+
             result = engine.draw_card(interaction.user.id)
             drawn = result["drawn"]
             # engine.draw_card() already clears armed_uno itself when the
@@ -2545,6 +2581,7 @@ class UnoGame(commands.Cog):
             # armed_uno invariant note in uno_engine.py.
 
             if result["still_playable"]:
+                session.pending_draw = {"player_id": interaction.user.id, "card": drawn, "engine": engine}
                 session.cancel_timer()
                 view = DrawFollowupView(self, session, drawn, interaction.user.id)
                 await interaction.response.send_message(f"You drew **{drawn}**. Play it?", view=view, ephemeral=True)
@@ -2582,6 +2619,9 @@ class UnoGame(commands.Cog):
             return
 
         async with session.lock:
+            if not self._is_live(session) or session.engine is not engine or engine.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                return
             balance = session.callout_balance.get(interaction.user.id, 1)
             if balance <= 0:
                 await interaction.response.send_message(
@@ -2637,6 +2677,9 @@ class UnoGame(commands.Cog):
             return
 
         async with session.lock:
+            if not self._is_live(session) or session.engine is not engine or engine.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                return
             player = engine.player_by_id(interaction.user.id)
             if not player or len(player.hand) not in (1, 2):
                 await interaction.response.send_message("⚠️ You don't have 1 or 2 cards left.", ephemeral=True)
@@ -3161,28 +3204,19 @@ class UnoGame(commands.Cog):
                         f"**{session.min_bet}** minimum. Wallet: **{wallet_bal}**, table: **{seat.bet}**.",
                         ephemeral=True)
                     return
-                ok, _old = await db.table_set_amount(uid, interaction.user.display_name, seat.bet - from_table)
-                if not ok:
-                    await interaction.followup.send("❌ Failed to move chips off the table.", ephemeral=True)
-                    return
-                seat.bet -= from_table
                 pulled = True
 
-            if not await db.deduct_chips(uid, tip):
-                if pulled:  # put the chips back on the table
-                    await db.table_set_amount(uid, interaction.user.display_name, seat.bet + from_table)
-                    seat.bet += from_table
-                await interaction.followup.send("❌ Failed to deduct chips.", ephemeral=True)
-                return
-
             dealer_name = session.dealer_name
-            await db.add_chips(uid, interaction.user.display_name, session.dealer_id, dealer_name, tip,
-                               f"Tip from {interaction.user.display_name}", table_id=session.table_id)
-            await db.record_tip(uid, interaction.user.display_name, tip)
-            await db.log_currency_event(uid, "Tip", -tip, f"Tipped {dealer_name}", session.table_id, session.round_num)
-            await db.log_currency_event(session.dealer_id, "Tip", tip, f"Tip from {interaction.user.display_name}",
-                                        session.table_id, session.round_num)
+            ok, table_amt = await db.tip_transfer(
+                uid, interaction.user.display_name, session.dealer_id, dealer_name, tip,
+                from_table=from_table, table_id=session.table_id, round_num=session.round_num)
+            if not ok:
+                if pulled:  # resync to the DB's authoritative table amount (nothing was applied)
+                    seat.bet = table_amt
+                await interaction.followup.send("❌ Not enough chips (balance changed). Try again.", ephemeral=True)
+                return
             if pulled:
+                seat.bet = table_amt
                 self._save_session(session)
                 await self._log_seat(session, uid, interaction.user.display_name, "change_bet", seat.bet,
                                      f"tip pulled {from_table} from the table")

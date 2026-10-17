@@ -17,6 +17,7 @@ import random
 import re
 import json
 import uuid
+from decimal import Decimal, ROUND_CEILING
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -236,7 +237,8 @@ class GameState:
 
     def __init__(self, players: list[tuple[int, str]], num_decks: int = 1,
                  hand_size: int = 7, wild_draw4_challenge: bool = True,
-                 target_winners: int = 1, bets: Optional[dict[int, int]] = None):
+                 bets: Optional[dict[int, int]] = None,
+                 table_id: Optional[str] = None, round_num: int = 0):
         if len(players) < 2:
             raise UnoError("Need at least 2 players")
         pids = [pid for pid, _ in players]
@@ -254,7 +256,6 @@ class GameState:
 
         self.num_decks = num_decks
         self.wild_draw4_challenge = wild_draw4_challenge
-        self.target_winners = max(1, min(target_winners, len(players) - 1))
 
         # Identifies this round across turn_log/round_log rows in the DB —
         # generated once here (not by the cog) so it's stable even across a
@@ -262,6 +263,8 @@ class GameState:
         # regenerating). The cog never sees a "round" until this object
         # exists, so this is the one place that can hand out the id.
         self.round_uuid: str = str(uuid.uuid4())
+        self.table_id: Optional[str] = table_id
+        self.round_num: int = round_num
         # Full per-turn action log — batched, not written to the DB by this
         # class (pure game logic, no DB access). The cog layer drains this
         # periodically via pop_turn_events(). Ephemeral: NOT persisted in
@@ -272,18 +275,11 @@ class GameState:
         self._turn_counter: int = 0
 
         bets = bets or {}
-        adjusted_bets, self.starting_refunds = self._trim_uncontested_excess(dict(bets))
-        # starting_refunds: {pid: amount} — the caller (cog layer) is
-        # responsible for actually crediting these back to the wallet
-        # (this class never touches the DB); self.bets already reflects
-        # the trimmed amount, so nothing else needs to treat this specially.
-        self.players: list[Player] = [Player(pid, name, bet=adjusted_bets.get(pid, 0)) for pid, name in players]
+        self.players: list[Player] = [Player(pid, name, bet=bets.get(pid, 0)) for pid, name in players]
         self.all_names: dict[int, str] = {pid: name for pid, name in players}  # survives players leaving/finishing
-        self.bets: dict[int, int] = adjusted_bets  # pid -> chips wagered to join; persists after they leave/finish, same as poker's total_bet counting toward the pot after a fold
-        self.left_early: set[int] = set()  # player_ids removed mid-round (AFK kick/left) — money stays in the pot, but not eligible to win any of it, same as a poker fold
-        self.finishers: list[int] = []  # player_ids in the order they emptied their hand (placement order)
-        self.side_pots: list[dict] = []       # filled in once the round ends — [{"amount": int, "eligible": [pid,...]}]
-        self.pot_results: list[tuple[int, list[int]]] = []  # [(amount, [winner_pid,...]), ...] one entry per pot, filled once the round ends
+        self.bets: dict[int, int] = dict(bets)  # pid -> chips on the line this round; persists after they leave/finish, same as poker's total_bet counting toward the pot after a fold
+        self.left_early: set[int] = set()  # player_ids removed mid-round (quit/AFK kick/left) — their bet is forfeited to the winner (see compute_settlement), same as a poker fold
+        self.finishers: list[int] = []  # [winner] once the round ends — kept as a list so display code written for placements still works
         self.draw_pile: list[str] = build_deck(num_decks)
         self.discard_pile: list[str] = []
 
@@ -330,6 +326,8 @@ class GameState:
         self._turn_counter += 1
         self.turn_events.append({
             "round_uuid": self.round_uuid,
+            "table_id": self.table_id,
+            "round_num": self.round_num,
             "turn_num": self._turn_counter,
             "ts": datetime.utcnow().isoformat(),
             "user_id": player_id,
@@ -356,7 +354,6 @@ class GameState:
             "players": [p.to_dict() for p in self.players],
             "all_names": dict(self.all_names),
             "finishers": list(self.finishers),
-            "target_winners": self.target_winners,
             "draw_pile": list(self.draw_pile),
             "discard_pile": list(self.discard_pile),
             "current_color": self.current_color,
@@ -375,9 +372,9 @@ class GameState:
             "last_summary": self.last_summary,
             "bets": dict(self.bets),
             "left_early": list(self.left_early),
-            "side_pots": [dict(sp) for sp in self.side_pots],
-            "pot_results": [[amt, list(winners)] for amt, winners in self.pot_results],
             "round_uuid": self.round_uuid,
+            "table_id": self.table_id,
+            "round_num": self.round_num,
             "turn_counter": self._turn_counter,
         }
 
@@ -439,12 +436,6 @@ class GameState:
             if fid not in self.all_names:
                 raise UnoError(f"Corrupt save data — finisher {fid!r} is not a known player.")
 
-        max_target = max(len(self.players) + len(self.finishers) - 1, 1)
-        target_winners = d.get("target_winners", 1)
-        if not isinstance(target_winners, int) or target_winners < 1:
-            target_winners = 1
-        self.target_winners = min(target_winners, max_target)
-
         self.pending_wild = d.get("pending_wild", False)
         self.pending_wild_card = d.get("pending_wild_card")
         if self.pending_wild and not self.pending_wild_card:
@@ -479,14 +470,6 @@ class GameState:
         raw_bets = d.get("bets") or {}
         self.bets = {int(k): v for k, v in raw_bets.items()}
         self.left_early = set(int(pid) for pid in d.get("left_early", []))
-        self.side_pots = []
-        for sp in d.get("side_pots", []):
-            sp = dict(sp)
-            if "payouts" in sp:
-                sp["payouts"] = {int(k): v for k, v in sp["payouts"].items()}
-            self.side_pots.append(sp)
-        self.pot_results = [(amt, list(winners)) for amt, winners in d.get("pot_results", [])]
-        self.starting_refunds = {}  # one-time construction artifact — already processed by the cog layer, nothing to redo on reload
         self.round_uuid = d.get("round_uuid") or str(uuid.uuid4())  # fallback covers saves written before this field existed
         self._turn_counter = d.get("turn_counter", 0)
         self.turn_events = []  # buffer is ephemeral, never persisted — see the comment on __init__'s definition
@@ -671,9 +654,7 @@ class GameState:
 
         if not self.players:
             self.finished = True
-            self.winner = None
-            if self.bets:
-                self._settle_pots()  # everyone left_early — no eligible winners, pots refund below
+            self.winner = None  # everyone left — void round, compute_settlement refunds every bet in full
             return
 
         if next_player_id is not None:
@@ -1065,156 +1046,75 @@ class GameState:
             self.current_index %= len(self.players)
 
     def _check_win(self):
+        """A round ends the moment one player empties their hand — rounds
+        are short and the table keeps going afterward (see uno_cog's table
+        lifecycle), so there's no placement list beyond the winner. If
+        everyone else leaves/gets removed first, whoever's left wins by
+        attrition. If literally everyone leaves, the round is void
+        (winner stays None) and compute_settlement refunds every bet."""
         if self.finished:
             return
 
-        # a player may have just emptied their hand — move them from active
-        # rotation into the finishers/placement list. Loop defensively in
-        # case more than one hits zero in the same pass.
-        progressed = True
-        while progressed:
-            progressed = False
-            for p in list(self.players):
-                if len(p.hand) == 0 and p.player_id not in self.finishers:
-                    self.finishers.append(p.player_id)
-                    self._log_event("finish", p.player_id, p.name, hand_size_after=0,
-                                     extra={"placement": len(self.finishers)})
-                    self._finish_player(p.player_id)
-                    progressed = True
-                    break
-
-        if self.bets:
-            # Economy mode: don't force play until everyone's finished.
-            # Each pot's winner is simply whichever eligible player
-            # finishes first (finish order == best rank) — so a pot is
-            # "settled" the moment either (a) one of its eligible players
-            # has already finished, or (b) it's down to a single eligible
-            # player left playing (wins by attrition, same as poker
-            # winning an uncontested pot). Stop as soon as every pot is
-            # settled — no need to play out the whole table.
-            self.finished = self._pots_resolved()
-            if self.finished and len(self.players) == 1 and self.players[0].player_id not in self.finishers:
-                self.finishers.append(self.players[0].player_id)
+        for p in list(self.players):
+            if len(p.hand) == 0:
+                self.finishers.append(p.player_id)
+                self._log_event("finish", p.player_id, p.name, hand_size_after=0, extra={"placement": 1})
+                self._finish_player(p.player_id)
+                self.finished = True
+                self.winner = p.player_id
+                break
         else:
-            if len(self.finishers) >= self.target_winners:
+            if len(self.players) == 1:
+                self.finishers.append(self.players[0].player_id)
                 self.finished = True
-            elif len(self.players) <= 1:
-                # everyone else finished or left — whoever's left "wins" by attrition
-                if len(self.players) == 1 and self.players[0].player_id not in self.finishers:
-                    self.finishers.append(self.players[0].player_id)
-                self.finished = True
+                self.winner = self.players[0].player_id
 
         if self.finished:
-            self.winner = self.finishers[0] if self.finishers else None
-            if self.finishers:
-                names = [self.all_names.get(pid, str(pid)) for pid in self.finishers]
-                self.last_summary = "Game over! Placements: " + ", ".join(
-                    f"{i+1}. {n}" for i, n in enumerate(names)
-                )
+            if self.winner is not None:
+                self.last_summary = f"Round over! {self.all_names.get(self.winner, str(self.winner))} wins."
             else:
-                self.last_summary = "Game over."
+                self.last_summary = "Round over."
 
-            if self.bets:
-                self._settle_pots()
-
-    def _pots_resolved(self) -> bool:
-        """True once every side pot already has a determined winner —
-        i.e. further play can't change who wins any money. Used instead
-        of target_winners in economy mode so the round doesn't have to
-        run until every single player empties their hand."""
-        finished_set = set(self.finishers)
-        for sp in self._compute_side_pots():
-            eligible = set(sp["eligible"])
-            if eligible & finished_set:
-                continue  # someone eligible already finished — they lock in this pot, later finishers can't beat them
-            still_playing = eligible - finished_set
-            if len(still_playing) > 1:
-                return False  # still genuinely contested
-        return True
-
-    # ---------- economy: side pots ----------
+    # ---------- economy: round settlement ----------
     #
-    # Direct port of poker's engine.py:_compute_side_pots / _showdown.
-    # Poker keys pots off `total_bet` (varies within a hand via streets/
-    # all-ins); UNO has no raises, so the equivalent is each player's
-    # fixed table buy-in (`self.bets`). Eligibility for a pot ("did they
-    # make it to showdown") is poker's `players_in_hand` (not folded);
-    # here it's "finished normally or was still seated when the round
-    # ended" — i.e. everyone except `self.left_early`. Poker's hand-rank
-    # (lower score = better) becomes UNO's finish order — whoever in a
-    # pot's eligible set finished earliest wins it; a pot decided early
-    # by attrition (only one eligible player left playing) goes to them.
+    # Rounds end on the first win, so there are no side pots to resolve
+    # across later finishers. Instead the winner can only win from each
+    # opponent up to the winner's OWN bet — anything an opponent put up
+    # beyond that was never actually at risk and simply stays theirs
+    # (it carries over as their leftover on the table). Players who
+    # quit/were removed mid-round (left_early) are treated like any other
+    # opponent: they lose min(their bet, winner's bet), same as if they'd
+    # played it out and lost.
 
     @staticmethod
-    def _trim_uncontested_excess(bets: dict[int, int]) -> tuple[dict[int, int], dict[int, int]]:
-        """If the single highest bettor's amount is above everyone else's,
-        the portion above the next-highest bet can never be contested by
-        anyone — it would just sit in its own side pot and get handed
-        straight back to them at settlement anyway. Trim it off and refund
-        it immediately at game start instead. Only the very top tier can
-        ever be a lone singleton this way: the next-highest value by
-        definition already has at least one other bettor at it, so once
-        the top player is brought down to that level they're tied with
-        someone — a single pass is always enough, no loop needed."""
-        if len(bets) < 2:
-            return dict(bets), {}
-        values = sorted(set(bets.values()), reverse=True)
-        top = values[0]
-        top_players = [pid for pid, b in bets.items() if b == top]
-        if len(top_players) != 1 or len(values) < 2:
-            return dict(bets), {}
-        pid = top_players[0]
-        second = values[1]
-        excess = top - second
-        adjusted = dict(bets)
-        adjusted[pid] = second
-        return adjusted, ({pid: excess} if excess > 0 else {})
+    def _ceil_tax(gain: int, rate) -> int:
+        """ceil(gain * rate) in exact decimal arithmetic — float math
+        gives e.g. 140 * 0.05 == 7.000000000000001, which a naive ceil()
+        rounds up to 8 and over-taxes by a chip."""
+        if gain <= 0 or not rate:
+            return 0
+        return int((Decimal(gain) * Decimal(str(rate))).to_integral_value(rounding=ROUND_CEILING))
 
-    def _pot_winner(self, eligible: list[int]) -> Optional[int]:
-        """Winner for one pot: the earliest (best-ranked) eligible player
-        who's already finished, or — if none has — the sole eligible
-        player still playing (attrition). Returns None only if a pot
-        somehow has zero eligible players still in the running (shouldn't
-        happen once _pots_resolved() is true, but handled defensively)."""
-        finisher_rank = {pid: i for i, pid in enumerate(self.finishers)}
-        finished_eligible = [pid for pid in eligible if pid in finisher_rank]
-        if finished_eligible:
-            return min(finished_eligible, key=lambda pid: finisher_rank[pid])
-        still_playing = [pid for pid in eligible if pid not in finisher_rank]
-        if len(still_playing) == 1:
-            return still_playing[0]
-        return None
-
-    def _compute_side_pots(self) -> list[dict]:
-        eligible_ids = set(self.bets) - self.left_early
-        levels = sorted(set(b for pid, b in self.bets.items() if b > 0))
-        pots: list[dict] = []
-        prev = 0
-        for level in levels:
-            amount = sum(min(b, level) - min(b, prev) for b in self.bets.values())
-            eligible = [pid for pid in eligible_ids if self.bets.get(pid, 0) >= level]
-            if amount > 0 and eligible:
-                pots.append({"amount": amount, "eligible": eligible})
-            prev = level
-        return pots
-
-    def _settle_pots(self):
-        pots = self._compute_side_pots()
-        results: list[tuple[int, list[int]]] = []
-        for sp in pots:
-            eligible = sp["eligible"]
-            winner = self._pot_winner(eligible) if eligible else None
-            if winner is None:
-                # Nobody who contributed to this level is still eligible
-                # (e.g. everyone at the table left_early before the round
-                # ended) — no winner to declare. Leave it as an empty
-                # result; the caller (cog layer) should treat any pot with
-                # no winners as a straight refund of each contributor's own
-                # bet rather than the engine guessing at a split.
-                sp["payouts"] = {}
-                results.append((sp["amount"], []))
-                continue
-            sp["payouts"] = {winner: sp["amount"]}
-            results.append((sp["amount"], [winner]))
-        self.side_pots = pots
-        self.pot_results = results
+    def compute_settlement(self, tax_rate) -> dict[int, dict]:
+        """Pure money math for a finished round — no DB, no side effects.
+        Returns {pid: {bet, change, tax, net, new_bet, winner, left}}:
+          change  = pre-tax delta (winner +sum of what they collect,
+                    everyone else -min(their bet, winner's bet))
+          tax     = winners tax on the winner's profit only
+          net     = change - tax (what actually hits their table amount)
+          new_bet = bet + net, i.e. what's left on the table for them
+        A void round (nobody won) leaves every bet untouched."""
+        out: dict[int, dict] = {}
+        w = self.winner if self.finished else None
+        w_bet = self.bets.get(w, 0) if w is not None else 0
+        collected = 0
+        for pid, bet in self.bets.items():
+            loss = min(bet, w_bet) if (w is not None and pid != w) else 0
+            collected += loss
+            out[pid] = {"bet": bet, "change": -loss, "tax": 0, "net": -loss,
+                        "new_bet": bet - loss, "winner": False, "left": pid in self.left_early}
+        if w is not None and w in out:
+            tax = self._ceil_tax(collected, tax_rate)
+            out[w].update({"change": collected, "tax": tax, "net": collected - tax,
+                           "new_bet": w_bet + collected - tax, "winner": True})
+        return out

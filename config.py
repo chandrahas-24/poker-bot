@@ -83,6 +83,16 @@ UNO_INACTIVITY_DAYS = 2        # same grace window poker uses
 UNO_MIN_ROUNDS_PER_PERIOD = 2  # UNO rounds run longer than poker hands, so a lower bar than MIN_HANDS_PER_PERIOD
 UNO_MIN_CHIPS_WAGERED = 100    # a single min-bet round should count as activity
 
+# Defaults for the per-guild settings (/unoset settings) — a guild that's never
+# changed a setting follows these; changing one here changes it for them too.
+UNO_MAX_BET = 0                # 0 = no limit
+UNO_TURN_TIMEOUT = 45          # seconds per turn
+UNO_BET_WINDOW = 25            # seconds between rounds to join / change bet
+UNO_RESEND_AFTER_MSGS = 7      # chat messages before the table/panel is reposted at the bottom
+UNO_MAX_PLAYERS = 6
+UNO_NUM_DECKS = 4
+UNO_IDLE_CLOSE_SECONDS = 600   # a table with fewer than 2 players this long closes and refunds everyone
+
 # ── UNO SERVER & CHANNELS ── (TODO: fill in real IDs — 0/empty placeholders for now)
 UNO_CASHOUT_CHANNEL_ID = 1485495899722354809
 UNO_INACTIVITY_CHANNEL_ID = 1535033665426297036

@@ -203,6 +203,73 @@ async def init_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_turn_log_round ON turn_log(round_uuid, turn_num)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_turn_log_user ON turn_log(user_id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS table_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         TEXT NOT NULL,
+                guild_id   INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                table_id   TEXT NOT NULL,
+                round_num  INTEGER,
+                event      TEXT NOT NULL,
+                actor_id   INTEGER,
+                detail     TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_table_log_table ON table_log(table_id, ts)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seat_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         TEXT NOT NULL,
+                table_id   TEXT NOT NULL,
+                round_num  INTEGER,
+                round_uuid TEXT,
+                user_id    INTEGER NOT NULL,
+                username   TEXT NOT NULL,
+                event      TEXT NOT NULL,
+                amount     INTEGER,
+                detail     TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_seat_log_table ON seat_log(table_id, ts)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_seat_log_user ON seat_log(user_id)")
+
+        # Columns added after a table already existed on disk — CREATE TABLE
+        # IF NOT EXISTS never adds them to an existing file, so each needs an
+        # explicit ALTER (same pattern/reason as the guild_settings and
+        # round_log.round_uuid migrations above).
+        for table, col, coltype in [
+            ("guild_settings", "min_bet", "INTEGER"),
+            ("guild_settings", "max_bet", "INTEGER"),
+            ("guild_settings", "turn_timeout", "INTEGER"),
+            ("guild_settings", "bet_window", "INTEGER"),
+            ("guild_settings", "resend_after_msgs", "INTEGER"),
+            ("guild_settings", "max_players", "INTEGER"),
+            ("guild_settings", "num_decks", "INTEGER"),
+            ("stats", "total_tipped", "INTEGER DEFAULT 0"),
+            ("round_log", "table_id", "TEXT"),
+            ("round_log", "round_num", "INTEGER"),
+            ("round_log", "tax_rate", "REAL"),
+            ("round_log", "dealer_id", "INTEGER"),
+            ("round_log", "dealer_name", "TEXT"),
+            ("round_log_players", "round_uuid", "TEXT"),
+            ("round_log_players", "table_id", "TEXT"),
+            ("round_log_players", "round_num", "INTEGER"),
+            ("turn_log", "table_id", "TEXT"),
+            ("turn_log", "round_num", "INTEGER"),
+            ("currency_log", "table_id", "TEXT"),
+            ("currency_log", "round_num", "INTEGER"),
+            ("currency_log", "round_uuid", "TEXT"),
+            ("house_revenue", "table_id", "TEXT"),
+            ("house_revenue", "round_num", "INTEGER"),
+            ("house_revenue", "round_uuid", "TEXT"),
+            ("chip_log", "table_id", "TEXT"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
         await db.commit()
 
 
@@ -249,12 +316,13 @@ async def log_turn_events_bulk(events: list[dict]):
     db = await _get_db()
     async with _write_lock:
         await db.executemany("""
-            INSERT INTO turn_log (round_uuid, turn_num, ts, user_id, username, action,
-                                   card, chosen_color, hand_size_after, direction, extra)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO turn_log (round_uuid, turn_num, ts, user_id, username, action,
+                                   card, chosen_color, hand_size_after, direction, extra, table_id, round_num)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [
             (e["round_uuid"], e["turn_num"], e["ts"], e["user_id"], e["username"], e["action"],
-             e.get("card"), e.get("chosen_color"), e.get("hand_size_after"), e.get("direction"), e.get("extra"))
+             e.get("card"), e.get("chosen_color"), e.get("hand_size_after"), e.get("direction"), e.get("extra"),
+             e.get("table_id"), e.get("round_num"))
             for e in events
         ])
         await db.commit()
@@ -298,7 +366,7 @@ async def credit_wallet(user_id: int, username: str, amount: int) -> int:
 
 
 async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str,
-                     amount: int, note: str = "") -> int:
+                     amount: int, note: str = "", table_id: str | None = None) -> int:
     db = await _get_db()
     now = datetime.utcnow().isoformat()
     async with _write_lock:
@@ -319,9 +387,9 @@ async def add_chips(admin_id: int, admin_name: str, user_id: int, user_name: str
               amount))
 
         await db.execute("""
-            INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (now, admin_id, admin_name, user_id, user_name, amount, note))
+                        INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note, table_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, admin_id, admin_name, user_id, user_name, amount, note, table_id))
         await db.commit()
 
         async with db.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)) as c:
@@ -408,16 +476,18 @@ async def pay_cashout(user_id: int, amount: int) -> bool:
 
 # ── Currency log (per-transaction audit trail for /uno currencylog) ────────
 
-async def log_currency_event(user_id: int, event_type: str, amount: int, description: str):
+async def log_currency_event(user_id: int, event_type: str, amount: int, description: str,
+                              table_id: str | None = None, round_num: int | None = None,
+                              round_uuid: str | None = None):
     """event_type: 'Round', 'Cash In', 'Cash Out', 'Wipe', or similar — mirrors poker's convention."""
     if amount == 0:
         return  # don't clutter the log with 0-chip events
     db = await _get_db()
     async with _write_lock:
         await db.execute("""
-            INSERT INTO currency_log (user_id, event_type, amount, description, ts)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, event_type, amount, description, datetime.utcnow().isoformat()))
+            INSERT INTO currency_log (user_id, event_type, amount, description, ts, table_id, round_num, round_uuid)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, event_type, amount, description, datetime.utcnow().isoformat(), table_id, round_num, round_uuid))
         await db.commit()
 
 
@@ -484,6 +554,27 @@ _settings_cache: dict[int, dict] = {}
 _cache_lock = asyncio.Lock()
 
 
+SETTING_KEYS = ("manager_role_id", "log_channel_id", "min_bet", "max_bet", "turn_timeout",
+                "bet_window", "resend_after_msgs", "max_players", "num_decks")
+
+
+def _setting_defaults() -> dict:
+    """Fallbacks for any guild_settings column that's still NULL — kept in
+    config.py so a deployment's defaults change in one place without
+    having to touch every guild's stored row."""
+    return {
+        "manager_role_id": None,
+        "log_channel_id": None,
+        "min_bet": config.UNO_MIN_BET,
+        "max_bet": config.UNO_MAX_BET,                      # 0 = no limit
+        "turn_timeout": config.UNO_TURN_TIMEOUT,
+        "bet_window": config.UNO_BET_WINDOW,
+        "resend_after_msgs": config.UNO_RESEND_AFTER_MSGS,
+        "max_players": config.UNO_MAX_PLAYERS,
+        "num_decks": config.UNO_NUM_DECKS,
+    }
+
+
 async def get_settings(guild_id: int) -> dict:
     async with _cache_lock:
         if guild_id in _settings_cache:
@@ -492,7 +583,12 @@ async def get_settings(guild_id: int) -> dict:
     db = await _get_db()
     async with db.execute("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,)) as c:
         row = await c.fetchone()
-        settings = dict(row) if row else {"guild_id": guild_id, "manager_role_id": None, "log_channel_id": None}
+    stored = dict(row) if row else {}
+
+    settings = {"guild_id": guild_id}
+    for key, default in _setting_defaults().items():
+        value = stored.get(key)
+        settings[key] = default if value is None else value
 
     async with _cache_lock:
         _settings_cache[guild_id] = settings.copy()
@@ -500,20 +596,20 @@ async def get_settings(guild_id: int) -> dict:
 
 
 async def set_settings(guild_id: int, **kwargs):
-    current = await get_settings(guild_id)
-    current.update({k: v for k, v in kwargs.items() if v is not None})
+    """Writes ONLY the keys passed (NULL elsewhere stays NULL, so unset
+    settings keep following config.py defaults instead of being frozen
+    at whatever the default was the first time anyone touched settings)."""
+    changes = {k: v for k, v in kwargs.items() if k in SETTING_KEYS and v is not None}
+    if not changes:
+        return
     db = await _get_db()
     async with _write_lock:
-        await db.execute("""
-            INSERT INTO guild_settings (guild_id, manager_role_id, log_channel_id)
-            VALUES (:guild_id, :manager_role_id, :log_channel_id)
-            ON CONFLICT(guild_id) DO UPDATE SET
-                manager_role_id = excluded.manager_role_id,
-                log_channel_id  = excluded.log_channel_id
-        """, current)
+        await db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
+        cols = ", ".join(f"{k} = ?" for k in changes)
+        await db.execute(f"UPDATE guild_settings SET {cols} WHERE guild_id = ?", (*changes.values(), guild_id))
         await db.commit()
     async with _cache_lock:
-        _settings_cache[guild_id] = current.copy()
+        _settings_cache.pop(guild_id, None)
 
 
 # ── Player stats / leaderboard ──────────────────────────────────────────────
@@ -596,12 +692,14 @@ async def delete_player_stats(user_id: int) -> bool:
 
 # ── Revenue / economy dashboards ────────────────────────────────────────────
 
-async def log_house_revenue(amount: int, source: str = 'game'):
+async def log_house_revenue(amount: int, source: str = 'game', table_id: str | None = None,
+                             round_num: int | None = None, round_uuid: str | None = None):
     """source='wipe_tax' (inactivity wipes) or 'adjustment' (manual /unoadmin adjustrevenue)."""
     db = await _get_db()
     async with _write_lock:
-        await db.execute("INSERT INTO house_revenue (ts, amount, source) VALUES (?, ?, ?)",
-                          (datetime.utcnow().isoformat(), amount, source))
+        await db.execute("INSERT INTO house_revenue (ts, amount, source, table_id, round_num, round_uuid) "
+                         "VALUES (?, ?, ?, ?, ?, ?)",
+                         (datetime.utcnow().isoformat(), amount, source, table_id, round_num, round_uuid))
         await db.commit()
 
 
@@ -694,36 +792,240 @@ async def recover_chips_in_play() -> list[dict]:
         await db.commit()
     return rows
 
+async def log_table_event(guild_id: int, channel_id: int, table_id: str, event: str,
+                           round_num: int | None = None, actor_id: int | None = None, detail: str | None = None):
+    """event: 'open', 'close', 'dealer', 'settings'."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO table_log (ts, guild_id, channel_id, table_id, round_num, event, actor_id, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (datetime.utcnow().isoformat(), guild_id, channel_id, table_id, round_num, event, actor_id, detail))
+        await db.commit()
+
+
+async def log_seat_event(table_id: str, round_num: int | None, round_uuid: str | None, user_id: int,
+                          username: str, event: str, amount: int | None = None, detail: str | None = None):
+    """event: join, change_bet, leave_queued, leave_cancelled, leave, quit, kick, left_guild,
+    cashed_out (settlement-time cashout; detail = quit/kicked/left_guild/afk_kick/leave), below_min, closed.
+    amount = chips on the table after the event, or chips returned to the wallet for events that remove the seat."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO seat_log (ts, table_id, round_num, round_uuid, user_id, username, event, amount, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (datetime.utcnow().isoformat(), table_id, round_num, round_uuid, user_id, username, event, amount, detail))
+        await db.commit()
+
+# ── Table money (a seat's amount lives in chips_in_play for as long as they're seated) ──
+
+async def table_set_amount(user_id: int, username: str, new_amount: int) -> tuple[bool, int]:
+    """Atomically sets a player's on-table amount to `new_amount`, moving
+    the difference from/to their wallet in the SAME transaction — a join
+    (0 -> bet), a raise (needs wallet chips) or a lower bet (refunds the
+    difference) can't leave wallet and table out of step if the bot dies
+    between two separate statements. Returns (ok, previous_amount); ok is
+    False (nothing changed) if the wallet can't cover an increase."""
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT amount FROM chips_in_play WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+        old = row[0] if row else 0
+        diff = new_amount - old
+        if diff > 0:
+            await db.execute("UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+                              (diff, user_id, diff))
+            async with db.execute("SELECT changes()") as c:
+                ch = await c.fetchone()
+            if not (ch and ch[0] > 0):
+                await db.rollback()
+                return False, old
+        elif diff < 0:
+            await db.execute("""
+                INSERT INTO wallets (user_id, username, balance) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+            """, (user_id, username, -diff, -diff))
+        if new_amount > 0:
+            await db.execute("""
+                INSERT INTO chips_in_play (user_id, username, amount) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, amount = excluded.amount
+            """, (user_id, username, new_amount))
+        else:
+            await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (user_id,))
+        await db.commit()
+        return True, old
+
+
+async def table_cash_out(user_id: int, username: str = "Unknown Player") -> int:
+    """Everything a player has on the table goes back to their wallet and
+    their chips_in_play row is removed, in one transaction. Returns the
+    amount moved (0 if they had nothing on the table)."""
+    db = await _get_db()
+    async with _write_lock:
+        async with db.execute("SELECT amount FROM chips_in_play WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+        amount = row[0] if row else 0
+        if amount > 0:
+            await db.execute("""
+                INSERT INTO wallets (user_id, username, balance) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+            """, (user_id, username, amount, amount))
+        await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (user_id,))
+        await db.commit()
+        return amount
+
+
+async def round_exists(round_uuid: str) -> bool:
+    """True if this round's settlement has already been applied."""
+    db = await _get_db()
+    async with db.execute("SELECT 1 FROM round_log WHERE round_uuid=?", (round_uuid,)) as c:
+        return bool(await c.fetchone())
+
+
+async def get_table_amount(user_id: int) -> int:
+    db = await _get_db()
+    async with db.execute("SELECT amount FROM chips_in_play WHERE user_id=?", (user_id,)) as c:
+        row = await c.fetchone()
+        return row[0] if row else 0
+
+
+async def apply_round_settlement(round_uuid: str, guild_id: int, channel_id: int, table_id: str,
+                                  round_num: int, num_decks: int, winner_id: int | None,
+                                winner_name: str | None, players: list[dict], channel_label: str,
+                                 dealer_id: int | None = None, dealer_name: str | None = None,
+                                 tax_rate: float | None = None) -> int | None:
+    """Applies one finished round's money + bookkeeping as a SINGLE
+    transaction: new on-table amounts, house revenue, round_log(+players),
+    stats, activity and currency_log all commit together or not at all.
+    Idempotent on round_uuid — if that round was already applied (a
+    crash/resume replaying settlement for a round that had in fact
+    already committed), it returns None and changes nothing, so a
+    resumed table can never pay the same round out twice.
+
+    players: [{user_id, username, bet, change, tax, net, new_bet, placement, won}]"""
+    db = await _get_db()
+    ts = datetime.utcnow().isoformat()
+    total_tax = sum(p["tax"] for p in players)
+    async with _write_lock:
+        try:
+            async with db.execute("SELECT id FROM round_log WHERE round_uuid=?", (round_uuid,)) as c:
+                if await c.fetchone():
+                    return None
+            cursor = await db.execute("""
+                                INSERT INTO round_log (round_uuid, ts, guild_id, channel_id, num_players, num_decks,
+                                        total_pot, total_tax, winner_id, winner_name, table_id, round_num,
+                                        tax_rate, dealer_id, dealer_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (round_uuid, ts, guild_id, channel_id, len(players), num_decks,
+                  sum(p["bet"] for p in players), total_tax, winner_id, winner_name, table_id, round_num,
+                  tax_rate, dealer_id, dealer_name))
+            round_id = cursor.lastrowid
+            await db.executemany("""
+                                INSERT INTO round_log_players (round_id, user_id, username, bet, gross, tax, net, placement, won,
+                                               round_uuid, table_id, round_num)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [(round_id, p["user_id"], p["username"], p["bet"], p["bet"] + p["change"], p["tax"],
+                   p["net"], p.get("placement"), 1 if p["won"] else 0, round_uuid, table_id, round_num)
+                  for p in players])
+
+            for p in players:
+                uid, net = p["user_id"], p["net"]
+                if p["new_bet"] > 0:
+                    await db.execute("""
+                        INSERT INTO chips_in_play (user_id, username, amount) VALUES (?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, amount = excluded.amount
+                    """, (uid, p["username"], p["new_bet"]))
+                else:
+                    await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (uid,))
+                await db.execute("""
+                    INSERT INTO stats (user_id, username, rounds_played, rounds_won, chips_won, chips_lost)
+                    VALUES (?, ?, 1, ?, MAX(0,?), MAX(0,?))
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username      = excluded.username,
+                        rounds_played = rounds_played + 1,
+                        rounds_won    = rounds_won    + ?,
+                        chips_won     = chips_won     + MAX(0, ?),
+                        chips_lost    = chips_lost    + MAX(0, ?)
+                """, (uid, p["username"], 1 if p["won"] else 0, net, -net,
+                      1 if p["won"] else 0, net, -net))
+                await _mark_player_active_tx(db, uid, max(abs(net), p["bet"]))
+                if net != 0:
+                    await db.execute("""
+                        INSERT INTO currency_log (user_id, event_type, amount, description, ts,
+                                                  table_id, round_num, round_uuid)
+                        VALUES (?, 'Round', ?, ?, ?, ?, ?, ?)
+                    """, (uid, net, f"UNO round #{round_num} (table {table_id}) in #{channel_label}", ts,
+                          table_id, round_num, round_uuid))
+            if total_tax > 0:
+                await db.execute("INSERT INTO house_revenue (ts, amount, source, table_id, round_num, round_uuid) "
+                                 "VALUES (?, ?, 'winners_tax', ?, ?, ?)",
+                                 (ts, total_tax, table_id, round_num, round_uuid))
+            await db.commit()
+            return round_id
+        except Exception:
+            await db.rollback()
+            raise
+
+
+# ── Tips ─────────────────────────────────────────────────────────────────────
+
+async def record_tip(user_id: int, username: str, amount: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            INSERT INTO stats (user_id, username, total_tipped) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                total_tipped = COALESCE(total_tipped, 0) + ?
+        """, (user_id, username, amount, amount))
+        await db.commit()
+
+
+async def get_tip_leaderboard(limit: int = 10) -> list[dict]:
+    db = await _get_db()
+    async with db.execute("""
+        SELECT user_id, username, total_tipped FROM stats
+        WHERE COALESCE(total_tipped, 0) > 0 ORDER BY total_tipped DESC LIMIT ?
+    """, (limit,)) as c:
+        return [dict(r) for r in await c.fetchall()]
+
 
 # ── Inactivity wipe ──────────────────────────────────────────────────────────
 # Same shape as poker's: a rolling "did they play enough recently" window,
 # and a same-rate (20%) tax + auto-cashout of the rest for anyone who didn't.
+
+async def _mark_player_active_tx(db, user_id: int, chips_wagered: int = 0):
+    """The UPDATE itself, without taking the write lock or committing —
+    so apply_round_settlement can fold it into its one big transaction."""
+    now = datetime.utcnow().isoformat()
+    wager_bar = MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0
+    await db.execute("""
+        UPDATE wallets SET
+            recent_rounds = CASE
+                WHEN (recent_rounds + 1) >= ? AND (recent_chips_wagered + ?) >= ?
+                THEN 0 ELSE recent_rounds + 1 END,
+            recent_chips_wagered = CASE
+                WHEN (recent_rounds + 1) >= ? AND (recent_chips_wagered + ?) >= ?
+                THEN 0 ELSE recent_chips_wagered + ? END,
+            last_activity = CASE
+                WHEN (recent_rounds + 1) >= ? AND (recent_chips_wagered + ?) >= ?
+                THEN MAX(COALESCE(last_activity, ?), ?) ELSE COALESCE(last_activity, ?) END
+        WHERE user_id = ?
+    """, (
+        MIN_ROUNDS_PER_PERIOD, chips_wagered, wager_bar,
+        MIN_ROUNDS_PER_PERIOD, chips_wagered, wager_bar, chips_wagered,
+        MIN_ROUNDS_PER_PERIOD, chips_wagered, wager_bar, now, now, now,
+        user_id,
+    ))
+
 
 async def mark_player_active(user_id: int, chips_wagered: int = 0):
     """Call once per player when a round they bet in ends. Bumps the rolling
     window, resetting it (and the inactivity clock) once they've cleared
     both the round-count and chips-wagered bar for the period."""
     db = await _get_db()
-    now = datetime.utcnow().isoformat()
     async with _write_lock:
-        await db.execute("""
-            UPDATE wallets SET
-                recent_rounds = CASE
-                    WHEN (recent_rounds + 1) >= ? AND (recent_chips_wagered + ?) >= ?
-                    THEN 0 ELSE recent_rounds + 1 END,
-                recent_chips_wagered = CASE
-                    WHEN (recent_rounds + 1) >= ? AND (recent_chips_wagered + ?) >= ?
-                    THEN 0 ELSE recent_chips_wagered + ? END,
-                last_activity = CASE
-                    WHEN (recent_rounds + 1) >= ? AND (recent_chips_wagered + ?) >= ?
-                    THEN MAX(COALESCE(last_activity, ?), ?) ELSE COALESCE(last_activity, ?) END
-            WHERE user_id = ?
-        """, (
-            MIN_ROUNDS_PER_PERIOD, chips_wagered, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0,
-            MIN_ROUNDS_PER_PERIOD, chips_wagered, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0, chips_wagered,
-            MIN_ROUNDS_PER_PERIOD, chips_wagered, MIN_CHIPS_WAGERED if MIN_CHIPS_WAGERED > 0 else 0, now, now, now,
-            user_id,
-        ))
+        await _mark_player_active_tx(db, user_id, chips_wagered)
         await db.commit()
 
 
@@ -765,6 +1067,8 @@ async def reset_database(admin_id: int, admin_name: str):
         await db.execute("DELETE FROM uno_bans")
         await db.execute("DELETE FROM house_revenue")
         await db.execute("DELETE FROM currency_log")
+        await db.execute("DELETE FROM table_log")
+        await db.execute("DELETE FROM seat_log")
         await db.execute("""
             INSERT INTO audit_log (ts, action, user_id, user_name, detail)
             VALUES (?, 'DATABASE_RESET', ?, ?, 'Full UNO database reset performed')

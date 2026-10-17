@@ -12,16 +12,22 @@ and should check len(hand) > MAX_BUTTONS_TOTAL up front to skip straight
 to the modal.
 
 Features implemented here:
-  - Lobby (Join / Leave / Settings / Start / Cancel). The host is auto-
-    added as a player by default. Moderator powers (settings/kick/start/
-    cancel) belong to event staff (see is_event_staff: admins, configured
-    staff roles, or developer IDs) — NOT to the host specifically. A host
-    who also happens to be event staff can Leave and still run/start the
-    game; a host who isn't staff has no special powers here.
-  - "Winners" setting = how many players can finish (empty their hand,
-    placing 1st/2nd/3rd/...) before the game ends — not a match-restart.
-    The engine keeps finished players out of turn rotation and keeps the
-    remaining players going until that many have placed.
+  - Persistent table (like a poker table). /uno open posts a join panel;
+    joining = placing a bet, which is moved from the wallet onto the table
+    (chips_in_play) and stays there. Host/staff press Start for round 1;
+    after that rounds follow each other on their own: a round ends on the
+    first player to empty their hand, the win/loss is applied straight to
+    the bets on the table (the winner collects from each opponent at most
+    their OWN bet, so no side pots), a bet_window-second panel pings
+    everyone seated to change their bet or join, then the next round
+    deals. Leftover chips carry over as the next bet; under the minimum
+    -> removed from the table. Leave queues until the round ends,
+    /uno quit leaves instantly and forfeits the bet. Moderator powers
+    (kick/end/start) belong to event staff (see is_event_staff) — and the
+    host can Start their own round 1.
+  - All tunables (min/max bet, turn timer, bet window, resend threshold,
+    max players, decks, log channel, manager role) live in the guild's
+    settings — /unoset settings.
   - The per-turn table message is Components V2 (TableView(LayoutView)),
     not an embed — deliberately, so @mentions in it (e.g. "it's <@id>'s
     turn") actually trigger a ping. Discord does not send notifications
@@ -43,21 +49,21 @@ Features implemented here:
     order pauses on the target's decision — the AFK timer auto-accepts on
     their behalf if they don't respond in time, rather than misfiring
     against the WD4 player (who already acted).
-  - Turn timer: TURN_TIMEOUT_SECONDS per turn; on expiry, auto-draws for
+  - Turn timer: the guild's turn_timer setting per turn; on expiry, auto-draws for
     the AFK player. MAX_MISSED_TURNS (from the engine) consecutive
     timeouts in a row -> that player is removed from the game.
-  - Table auto-resends every TABLE_REFRESH_EVERY_MESSAGES channel
+  - Table/panel auto-resends every resend_after channel
     messages, or on manual "Table" button / /uno table command. (Note:
     the "Table" *button* was repurposed into the turn-order popup above —
-    manual full-table refresh is the /uno table slash command instead.)
+    manual full-table refresh is the /uno refresh slash command instead.)
   - on_member_remove / on_member_ban: auto-removes that player from any
-    session (lobby or active game) they're in.
+    table they're seated at (mid-round that forfeits their bet).
   - Callout (UNO challenge) is hardened: only active players can call
     someone out, self-callouts are blocked, and the engine itself already
     prevents repeat-farming the same target (a successful challenge takes
     their hand off exactly 1 card, so a second challenge against them
     fails until they're legitimately back down to 1 card).
-  - /uno kick <user> — event staff can remove a player from lobby or game.
+  - /uno kick <user> — event staff can remove a player from a table.
 """
 
 import asyncio
@@ -71,6 +77,7 @@ import random
 import collections
 import weakref
 import zipfile
+import uuid
 import discord
 import logging
 import config
@@ -188,8 +195,6 @@ async def report_component_error(interaction: discord.Interaction, error: Except
         pass
 
 
-TURN_TIMEOUT_SECONDS = 45
-TABLE_REFRESH_EVERY_MESSAGES = 7
 # MAX_BUTTONS_TOTAL is imported from unodemo (both are Discord's 5x5 = 25 button ceiling)
 
 COLOR_TO_DISCORD = {
@@ -203,7 +208,6 @@ PLACEMENT_EMOJI = config.PLACEMENT_EMOJI
 
 MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT = 2, 20
 MIN_DECKS, MAX_DECKS = 1, 6
-MIN_TARGET_WINNERS, MAX_TARGET_WINNERS = 1, 19
 MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT = 30, 600
 
 
@@ -241,7 +245,7 @@ def describe_last_action(session: "GameSession") -> str:
     if not action:
         engine = session.engine
         total = engine.num_decks * 108 if engine else 0
-        return f"Game started! ({engine.num_decks if engine else '?'} deck{'s' if engine and engine.num_decks != 1 else ''}, {total} cards)"
+        return f"Round {session.round_num} started! ({engine.num_decks if engine else '?'} deck{'s' if engine and engine.num_decks != 1 else ''}, {total} cards)"
 
     t = action["type"]
     actor = _plain_name(session, action.get("actor_id"))
@@ -339,7 +343,7 @@ def _build_table_text(session: "GameSession") -> str:
     lines.append("")
     # Was "Decks: N (X cards) | Remaining: Y | Discarded: Z" — deck count
     # never changes turn to turn (it's a lobby setting), so it now only
-    # appears once, in the "Game started!" headline above. What's left
+    # appears once, in the "Round N started!" headline above. What's left
     # here is just the two numbers that actually change every turn, kept
     # short enough to survive mobile wrapping, and marked as Discord
     # markdown subtext ("-# ") so it visually reads as a footnote rather
@@ -351,16 +355,11 @@ def _build_table_text(session: "GameSession") -> str:
             f"{PLACEMENT_EMOJI.get(i, f'{i+1}.')} {_plain_name(session, pid)}"
             for i, pid in enumerate(engine.finishers)
         )
-        if engine.bets:
-            # target_winners isn't what ends an economy round — pots
-            # settling is — so drop the "/N" that implies a fixed target.
-            lines.append(f"<:uno_trophy:1536135332863676548> Finished: {placed}")
-        else:
-            lines.append(f"<:uno_trophy:1536135332863676548> Finished ({len(engine.finishers)}/{engine.target_winners}): {placed}")
+        lines.append(f"<:uno_trophy:1536135332863676548> Finished: {placed}")
 
     if engine.bets:
         pot_total = sum(engine.bets.values())
-        lines.append(f"Pot: **{pot_total}** {config.UNO_CHIP_EMOJI}")
+        lines.append(f"Round #{session.round_num} · Pot: **{pot_total}** {config.UNO_CHIP_EMOJI}")
 
     lines.append("")
     if session.turn_started_at:
@@ -372,24 +371,74 @@ def _build_table_text(session: "GameSession") -> str:
     return "\n".join(lines)
 
 
+class Seat:
+    """One player's place at the table. `bet` is everything they currently
+    have on it (always equal to their chips_in_play row): it's what they
+    risk each round, and after a round the win/loss is applied straight to
+    it, so whatever is left simply carries over as their next bet.
+
+    in_round      - dealt into the round currently being played
+    leave_queued  - clicked Leave mid-round; cashed out when the round ends
+    quit          - removed from the round already (quit/kicked/AFK/left the
+                    server) and just waiting for the round to settle
+    missed_turns  - consecutive AFK turns, carried across rounds so being
+                    away for several rounds still gets you removed
+    """
+    __slots__ = ("name", "bet", "in_round", "leave_queued", "quit", "missed_turns", "exit_reason")
+
+    def __init__(self, name: str, bet: int, in_round: bool = False, leave_queued: bool = False,
+                 quit: bool = False, missed_turns: int = 0, exit_reason: str | None = None):
+        self.name = name
+        self.bet = bet
+        self.in_round = in_round
+        self.leave_queued = leave_queued
+        self.quit = quit
+        self.missed_turns = missed_turns
+        self.exit_reason = exit_reason
+
+    def to_dict(self):
+        return {"name": self.name, "bet": self.bet, "in_round": self.in_round,
+                "leave_queued": self.leave_queued, "quit": self.quit, "missed_turns": self.missed_turns}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["name"], int(d["bet"]), d.get("in_round", False), d.get("leave_queued", False),
+                   d.get("quit", False), d.get("missed_turns", 0))
+
+
 class GameSession:
-    def __init__(self, guild_id: int, channel_id: int, host_id: int, host_name: str):
+    """A persistent table, like a poker table: seats come and go between
+    rounds while the table (and each seat's chips on it) carries on.
+    `engine` is only ever the round currently being played.
+
+    state: "lobby"   - before round 1, host/staff presses Start
+           "window"  - between rounds, bet_window seconds to join / change bet
+           "waiting" - fewer than 2 seats; idle until someone joins
+           "playing" - a round is in progress"""
+
+    def __init__(self, guild_id: int, channel_id: int, host_id: int, host_name: str, settings: dict | None = None):
         self.guild_id = guild_id
         self.channel_id = channel_id
         self.host_id = host_id
         self.host_name = host_name
-        # Host does NOT auto-join — they show up in the lobby list only
-        # once they click Join and submit a bet, exactly like anyone else.
-        # host_id/host_name are kept purely for the "Host" embed field and
-        # don't imply they're playing.
-        self.lobby_players: dict[int, str] = {}
-        self.lobby_bets: dict[int, int] = {}  # pid -> chips wagered — a pid only ever appears in lobby_players once it's also here
-        self.min_bet = config.UNO_MIN_BET
-        self.started = False
+        # The dealer is who /uno tip pays — defaults to whoever opened the
+        # table, /unomgr setdealer changes it (same as poker).
+        self.dealer_id = host_id
+        self.dealer_name = host_name
+        self.table_id = uuid.uuid4().hex[:8]
+        self.round_num = 0
+        self.state = "lobby"
+        self.closed = False  # set by close_table so stale modals/buttons can tell the table is gone
+        # Host does NOT auto-join — a pid only ever appears in `seats` once
+        # it has put a bet on the table.
+        self.seats: dict[int, Seat] = {}
         self.engine: ue.GameState | None = None
         self.table_message: discord.Message | None = None
-        self.lobby_message: discord.Message | None = None
+        self.lobby_message: discord.Message | None = None  # the join/bet panel
         self.timer_task: asyncio.Task | None = None
+        self.window_task: asyncio.Task | None = None
+        self.window_generation = 0
+        self.window_ends_at = 0.0
         self.msg_count = 0
         self.last_action: dict | None = None  # feeds describe_last_action() for the table message
         self.turn_started_at: float = 0.0  # unix time the current turn's timer started, for the <t:...> display
@@ -397,54 +446,72 @@ class GameSession:
         self._last_turn_player_id: int | None = None  # tracks turn changes so callout_balance refreshes correctly
 
         # Serializes state-changing interaction handlers (play/draw/pass/
-        # wild color/WD4 accept/challenge/timeout/kick/leave/UNO toggle) so
-        # two near-simultaneous actions on the same session can't both read
-        # the pre-mutation engine state and then both mutate it. Not
-        # persisted — a resumed session just gets a fresh lock.
+        # wild color/WD4 accept/challenge/timeout/kick/leave/UNO toggle/
+        # bet changes/round transitions) so two near-simultaneous actions
+        # on the same session can't both read the pre-mutation state and
+        # then both mutate it. Not persisted — a resumed session just gets
+        # a fresh lock.
         self.lock = asyncio.Lock()
         # Bumped every time a new turn starts (see restart_timer). A timer
         # task captures the generation it was started with and checks it
         # again after waking up from sleep — if the number has moved on,
-        # some other action already resolved this turn (a manual play/draw/
-        # etc, or another timer), so the stale timer does nothing instead
-        # of double-acting on a turn that's already over.
+        # some other action already resolved this turn, so the stale timer
+        # does nothing instead of double-acting on a turn that's already over.
         self.turn_generation = 0
 
-        # configurable via the Settings button, event-staff-only
-        self.max_players = 6
-        self.num_decks = 4
-        self.turn_timeout = TURN_TIMEOUT_SECONDS
-        # NOT configurable — economy rounds end dynamically once every side
-        # pot already has a determined winner (see GameState._pots_resolved),
-        # not at a fixed "N players finished" target. Passed to GameState
-        # purely for its non-economy fallback code path, which UNO never
-        # actually takes now that every table requires bets to join.
-        self.target_winners = 1
+        self.apply_settings(settings or db._setting_defaults())
+
+    def apply_settings(self, s: dict):
+        """Copies the guild's current settings onto the table. Re-run at
+        every window/round start (and by /unoset settings) so changes take
+        effect without reopening the table."""
+        self.min_bet = int(s["min_bet"])
+        self.max_bet = int(s["max_bet"])  # 0 = no limit
+        self.turn_timeout = int(s["turn_timeout"])
+        self.bet_window = int(s["bet_window"])
+        self.resend_after = int(s["resend_after_msgs"])
+        self.max_players = int(s["max_players"])
+        self.num_decks = int(s["num_decks"])
+
+    @property
+    def started(self) -> bool:
+        """True while a round is being played (the engine exists)."""
+        return self.state == "playing"
 
     def cancel_timer(self):
         # Guard against self-cancellation: _timer_loop calls
-        # announce_and_cleanup() on itself when the game ends on an AFK
+        # announce_and_cleanup() on itself when a round ends on an AFK
         # timeout, which calls this. session.timer_task at that point is
         # STILL the currently-running task (nothing reassigns it before
         # this call), so cancelling it here would throw CancelledError
         # into this same coroutine at its next `await` — aborting
-        # announce_and_cleanup before it ever sends the win message, with
+        # announce_and_cleanup before it ever settles the round, with
         # no error logged (safe_task's wrapper deliberately re-raises
         # CancelledError rather than logging it). Cross-task cancels
-        # (e.g. from /uno kick or /uno leave, which run on the
+        # (e.g. from /uno kick or /uno quit, which run on the
         # interaction-handler task, not the timer task) are unaffected
         # and still cancel normally.
         if self.timer_task and not self.timer_task.done() and self.timer_task is not asyncio.current_task():
             self.timer_task.cancel()
         self.timer_task = None
 
+    def cancel_window(self):
+        """Cancels the between-rounds countdown / idle-close timer. Same
+        self-cancel guard as cancel_timer: the window task calls
+        begin_round/close_table, which call this, while it's still the
+        current task."""
+        self.window_generation += 1
+        if self.window_task and not self.window_task.done() and self.window_task is not asyncio.current_task():
+            self.window_task.cancel()
+        self.window_task = None
+
     # ---------- persistence ----------
-    # Only ever called for started games (see UnoGame.post_table) — an
-    # un-started lobby is cheap to just recreate with /uno start, so it's
-    # not worth the complexity of saving/restoring LobbyView state too.
-    # table_message/lobby_message (discord.Message objects) and timer_task
-    # (an asyncio.Task) aren't JSON-serializable and don't need to be —
-    # restore just posts a fresh table message and restarts the timer.
+    # The whole table is saved, not just a round in progress — seats'
+    # chips stay locked in chips_in_play for as long as the table exists,
+    # so a crash between rounds has to be resumable too.
+    # table_message/lobby_message (discord.Message objects) and the timer
+    # tasks (asyncio.Tasks) aren't JSON-serializable and don't need to be —
+    # restore just posts a fresh table/panel and restarts the timers.
 
     def to_dict(self):
         return {
@@ -452,110 +519,64 @@ class GameSession:
             "channel_id": self.channel_id,
             "host_id": self.host_id,
             "host_name": self.host_name,
-            "lobby_players": {str(k): v for k, v in self.lobby_players.items()},
-            "started": self.started,
+            "dealer_id": self.dealer_id,
+            "dealer_name": self.dealer_name,
+            "table_id": self.table_id,
+            "round_num": self.round_num,
+            "state": self.state,
+            "seats": {str(pid): seat.to_dict() for pid, seat in self.seats.items()},
             "engine": self.engine.to_dict() if self.engine else None,
             "msg_count": self.msg_count,
             "last_action": self.last_action,
             "turn_started_at": self.turn_started_at,
             "callout_balance": {str(k): v for k, v in self.callout_balance.items()},
             "_last_turn_player_id": self._last_turn_player_id,
-            "max_players": self.max_players,
-            "num_decks": self.num_decks,
-            "target_winners": self.target_winners,
-            "turn_timeout": self.turn_timeout,
         }
 
     @classmethod
-    def from_dict(cls, d):
+    def from_dict(cls, d, settings: dict | None = None):
         self = cls.__new__(cls)
         self.guild_id = d["guild_id"]
         self.channel_id = d["channel_id"]
         self.host_id = d["host_id"]
         self.host_name = d["host_name"]
-        self.lobby_players = {int(k): v for k, v in d.get("lobby_players", {}).items()}
-        self.started = d.get("started", True)
+        self.dealer_id = d.get("dealer_id", self.host_id)
+        self.dealer_name = d.get("dealer_name", self.host_name)
+        self.table_id = d.get("table_id") or uuid.uuid4().hex[:8]
         self.engine = ue.GameState.from_dict(d["engine"]) if d.get("engine") else None
+        if "seats" in d:
+            self.seats = {int(k): Seat.from_dict(v) for k, v in d["seats"].items()}
+            self.state = d.get("state", "playing" if self.engine else "window")
+            self.round_num = d.get("round_num", 0)
+        else:
+            # Save written before tables persisted across rounds (one
+            # round per table, bets only on the engine): rebuild the seats
+            # from the engine's bets so that round can still be finished.
+            self.seats = {}
+            if self.engine:
+                for pid, bet in self.engine.bets.items():
+                    self.seats[pid] = Seat(self.engine.all_names.get(pid, str(pid)), bet, in_round=True,
+                                           quit=pid in self.engine.left_early)
+            self.state = "playing"
+            self.round_num = 1
+        self.closed = False
         self.table_message = None
         self.lobby_message = None
         self.timer_task = None
+        self.window_task = None
+        self.window_generation = 0
+        self.window_ends_at = 0.0
         self.msg_count = d.get("msg_count", 0)
         self.last_action = d.get("last_action")
         self.turn_started_at = d.get("turn_started_at", 0.0)
         self.callout_balance = {int(k): v for k, v in d.get("callout_balance", {}).items()}
         self._last_turn_player_id = d.get("_last_turn_player_id")
-        self.max_players = d.get("max_players", 10)
-        self.num_decks = d.get("num_decks", 1)
-        self.target_winners = d.get("target_winners", 1)
-        self.turn_timeout = d.get("turn_timeout", TURN_TIMEOUT_SECONDS)
         # Fresh lock/generation counter for the resumed session — see the
         # comments on these fields in __init__.
         self.lock = asyncio.Lock()
         self.turn_generation = 0
+        self.apply_settings(settings or db._setting_defaults())
         return self
-
-
-# ---------------------------------------------------------------------------
-# Lobby view
-# ---------------------------------------------------------------------------
-
-class LobbySettingsModal(discord.ui.Modal, title="UNO — Lobby Settings"):
-    max_players_input = discord.ui.TextInput(label="Max players (2–20)", max_length=2)
-    decks_input = discord.ui.TextInput(label="Decks (1–6)", max_length=1)
-    turn_timeout_input = discord.ui.TextInput(label="Turn timeout seconds (30–600)", max_length=3)
-
-    def __init__(self, cog: "UnoGame", session: GameSession):
-        super().__init__()
-        self.cog = cog
-        self.session = session
-        self.max_players_input.default = str(session.max_players)
-        self.decks_input.default = str(session.num_decks)
-        self.turn_timeout_input.default = str(session.turn_timeout)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        async with self.session.lock:
-            if self.session.started:
-                await interaction.response.send_message(
-                    "⚠️ The game has already started.", ephemeral=True,
-                )
-                return
-
-            def parse(field, lo, hi, current):
-                try:
-                    v = int(field.value.strip())
-                except ValueError:
-                    return current, False
-                if not (lo <= v <= hi):
-                    return current, False
-                return v, True
-
-            max_players, ok1 = parse(self.max_players_input, MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT, self.session.max_players)
-            decks, ok2 = parse(self.decks_input, MIN_DECKS, MAX_DECKS, self.session.num_decks)
-            turn_timeout, ok3 = parse(self.turn_timeout_input, MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT, self.session.turn_timeout)
-
-            if not (ok1 and ok2 and ok3):
-                await interaction.response.send_message(
-                    "⚠️ One or more values were out of range — settings left unchanged.", ephemeral=True
-                )
-                return
-
-            if max_players < len(self.session.lobby_players):
-                await interaction.response.send_message(
-                    f"⚠️ Can't set max players below the {len(self.session.lobby_players)} already in the lobby.",
-                    ephemeral=True,
-                )
-                return
-
-            self.session.max_players = max_players
-            self.session.num_decks = decks
-            self.session.turn_timeout = turn_timeout
-
-            await interaction.response.send_message("✅ Settings updated.", ephemeral=True)
-            if self.session.lobby_message:
-                await self.session.lobby_message.edit(embed=LobbyView.build_embed(self.session))
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        await report_component_error(interaction, error, None, "LobbySettingsModal")
 
 
 class UnoConfirmResetView1(discord.ui.View):
@@ -797,254 +818,255 @@ class UnoCurrencyLogView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
-class BetModal(discord.ui.Modal, title="UNO — Place Your Bet"):
-    def __init__(self, cog: "UnoGame", session: GameSession, balance: int):
-        super().__init__()
+def _seat_lines(session: "GameSession") -> str:
+    lines = []
+    for pid, seat in session.seats.items():
+        flags = []
+        if session.state == "playing" and not seat.in_round:
+            flags.append("⏳")
+        if seat.leave_queued:
+            flags.append("leaving")
+        if session.state in ("window", "waiting") and seat.bet < session.min_bet:
+            flags.append("⚠️")
+        extra = f" _({', '.join(flags)})_" if flags else ""
+        lines.append(f"<@{pid}> — **{seat.bet}** {config.UNO_CHIP_EMOJI}{extra}")
+    return "\n".join(lines) or "_nobody yet_"
+
+
+def build_panel_embed(session: "GameSession") -> discord.Embed:
+    """The join / change-bet panel — the lobby before round 1, the
+    countdown between rounds, and the 'waiting for players' state."""
+    n = session.round_num
+    if session.state == "lobby":
+        title = "<:uno:1536135137232953451> UNO — Round 1"
+        desc = "Place a bet to take a seat. The host or staff presses **Start** once everyone's in."
+    elif session.state == "window":
+        title = f"<:uno:1536135137232953451> UNO — Round {n + 1} next"
+        desc = (f"Round {n + 1} starts <t:{int(session.window_ends_at)}:R>. Join with a bet, or change yours — "
+                f"whatever you have left on the table carries over as your next bet "
+                f"(minimum {session.min_bet}, or you'll be removed).")
+    elif session.state == "waiting":
+        title = "<:uno:1536135137232953451> UNO — waiting for players"
+        desc = (f"The next round starts "
+                f"{session.bet_window}s after the second seat fills.")
+    else:
+        title = f"<:uno:1536135137232953451> UNO — Round {n} in progress"
+        desc = "Place a bet to take a seat — you'll be dealt in next round."
+
+    e = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
+    e.add_field(name="<:uno_host:1536135395933159556> Dealer", value=f"<@{session.dealer_id}>", inline=True)
+    e.add_field(name="👥 Players", value=f"{len(session.seats)}/{session.max_players}", inline=True)
+    e.add_field(name="<:uno_deck:1536135257789829120> Decks", value=str(session.num_decks), inline=True)
+    limits = f"{session.min_bet}" + (f" – {session.max_bet}" if session.max_bet else "+")
+    e.add_field(name=f"Bet — {limits} {config.UNO_CHIP_EMOJI}", value=_seat_lines(session), inline=False)
+    e.set_footer(text=f"Table {session.table_id}")
+    e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
+    return e
+
+
+def build_settings_embed(s: dict) -> discord.Embed:
+    """Current UNO settings for a guild — shown by /unoset settings."""
+    e = discord.Embed(title="⚙️ UNO Settings", color=discord.Color.blurple())
+    e.add_field(name="Min bet", value=f"{s['min_bet']} {config.UNO_CHIP_EMOJI}", inline=True)
+    e.add_field(name="Max bet", value=(f"{s['max_bet']} {config.UNO_CHIP_EMOJI}" if s["max_bet"] else "No limit"), inline=True)
+    e.add_field(name="Turn timer", value=f"{s['turn_timeout']}s", inline=True)
+    e.add_field(name="Bet window", value=f"{s['bet_window']}s", inline=True)
+    e.add_field(name="Resend after", value=f"{s['resend_after_msgs']} messages", inline=True)
+    e.add_field(name="Max players", value=str(s["max_players"]), inline=True)
+    e.add_field(name="Decks", value=str(s["num_decks"]), inline=True)
+    e.add_field(name="Log channel", value=(f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "Not set"), inline=True)
+    e.add_field(name="Manager role", value=(f"<@&{s['manager_role_id']}>" if s.get("manager_role_id") else "Not set"), inline=True)
+    e.set_footer(text=f"Winners tax: {config.UNO_WINNERS_TAX_RATE:.0%} of profit (set in config.py)")
+    return e
+
+
+class BetModal(discord.ui.Modal):
+    """Join (place a first bet) or change the bet already on the table.
+    Either way the number entered is the TOTAL on the table afterward —
+    raising it pulls the difference from the wallet, lowering it returns
+    the difference, both atomically (db.table_set_amount)."""
+
+    def __init__(self, cog: "UnoGame", session: "GameSession", balance: int, mode: str = "join",
+                 current_bet: int = 0):
+        super().__init__(title="UNO — Place Your Bet" if mode == "join"
+        else f"UNO — Change Bet (current {current_bet:,})")
         self.cog = cog
         self.session = session
         self.balance = balance
-        self.bet_input = discord.ui.TextInput(
-            label="How many chips to bet?",
-            placeholder=f"min {session.min_bet}  (wallet: {balance})",
-            min_length=1, max_length=8,
-        )
+        self.mode = mode
+        self.current_bet = current_bet
+        # A change re-sets the TOTAL bet, so what's available is the wallet PLUS what's already on the table.
+        available = balance + current_bet
+        if mode == "join":
+            label = "How many chips to bet?"
+            placeholder = f"Total available chips: {available:,} (min {session.min_bet})"
+        else:
+            label = "New total bet"
+            placeholder = f"Total available chips: {available:,}"
+        self.bet_input = discord.ui.TextInput(label=label, placeholder=placeholder[:100], min_length=1, max_length=8)
         self.add_item(self.bet_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        async with self.session.lock:
-            if self.session.started:
-                await interaction.response.send_message("⚠️ The game has already started.", ephemeral=True)
+        s = self.session
+        uid = interaction.user.id
+        async with s.lock:
+            def deny(msg):
+                return interaction.response.send_message(msg, ephemeral=True)
+
+            if s.closed:
+                await deny("⚠️ This table has closed.")
                 return
-            if interaction.user.id in self.session.lobby_bets:
-                await interaction.response.send_message("You're already in with a bet placed.", ephemeral=True)
-                return
-            if await db.is_banned(interaction.guild_id, interaction.user.id):
-                await interaction.response.send_message("🚫 You're banned from UNO in this server.", ephemeral=True)
-                return
-            if len(self.session.lobby_players) >= self.session.max_players:
-                await interaction.response.send_message("Lobby is full.", ephemeral=True)
-                return
+            seat = s.seats.get(uid)
+            if self.mode == "join":
+                if seat:
+                    await deny("You're already seated — use **Change bet** instead.")
+                    return
+                if await db.is_banned(interaction.guild_id, uid):
+                    await deny("🚫 You're banned from UNO in this server.")
+                    return
+                if len(s.seats) >= s.max_players:
+                    await deny("The table is full.")
+                    return
+            else:
+                if not seat:
+                    await deny("You're not seated — hit **Join** first.")
+                    return
+                if s.state == "playing" and seat.in_round:
+                    await deny("Your bet is locked in until this round ends.")
+                    return
 
             bet = _parse_chips(self.bet_input.value)
             if bet is None:
-                await interaction.response.send_message("⚠️ Enter a valid amount (e.g. 500, 2k).", ephemeral=True)
+                await deny("⚠️ Enter a valid amount (e.g. 500, 2k).")
                 return
-            if bet < self.session.min_bet:
-                await interaction.response.send_message(
-                    f"⚠️ Minimum bet is **{self.session.min_bet}** {config.UNO_CHIP_EMOJI}.", ephemeral=True
-                )
+            if bet < s.min_bet:
+                await deny(f"⚠️ Minimum bet is **{s.min_bet}** {config.UNO_CHIP_EMOJI}.")
                 return
-            if bet > self.balance:
-                await interaction.response.send_message(
-                    f"⚠️ You only have **{self.balance}** {config.UNO_CHIP_EMOJI} available.", ephemeral=True
-                )
+            if s.max_bet and bet > s.max_bet:
+                await deny(f"⚠️ Maximum bet is **{s.max_bet}** {config.UNO_CHIP_EMOJI}.")
                 return
 
-            await db.upsert_wallet_name(interaction.user.id, interaction.user.name)
-            ok = await db.deduct_chips(interaction.user.id, bet)
+            await db.upsert_wallet_name(uid, interaction.user.name)
+            ok, old = await db.table_set_amount(uid, interaction.user.display_name, bet)
             if not ok:
-                # balance moved between opening the modal and submitting it — the
-                # cached self.balance we validated against above is now stale
-                await interaction.response.send_message(
-                    "⚠️ Insufficient balance for that bet — your wallet may have changed since you opened this. "
-                    "Hit Join again to try with your current balance.", ephemeral=True
-                )
+                bal = await db.get_balance(uid)
+                await deny(f"⚠️ Not enough chips — you have **{bal + old:,}** {config.UNO_CHIP_EMOJI} available "
+                           f"in total (wallet **{bal:,}** + **{old:,}** already bet).")
                 return
-            await db.mark_chips_in_play(interaction.user.id, interaction.user.display_name, bet)
 
-            self.session.lobby_players[interaction.user.id] = interaction.user.display_name
-            self.session.lobby_bets[interaction.user.id] = bet
+            if seat:
+                seat.bet = bet
+                seat.name = interaction.user.display_name
+                await self.cog._log_seat(s, uid, seat.name, "change_bet", bet, f"from {old}")
+            else:
+                s.seats[uid] = Seat(interaction.user.display_name, bet)
+                await self.cog._log_seat(s, uid, interaction.user.display_name, "join", bet)
 
-            await interaction.response.edit_message(embed=LobbyView.build_embed(self.session))
+            await interaction.response.edit_message(embed=build_panel_embed(s))
+            clicked = getattr(interaction, "message", None)
+            if s.lobby_message and clicked is not None and s.lobby_message.id != clicked.id:
+                await self.cog.refresh_panel(s, create=False)  # they used an older panel — keep the live one current too
+            # Second seat just filled an idle table -> start counting down to a round
+            if s.state == "waiting" and len(s.seats) >= 2:
+                await self.cog.open_window(s, interaction.channel)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await report_component_error(interaction, error, None, "BetModal")
 
 
-class LobbyView(discord.ui.View):
-    def __init__(self, cog: "UnoGame", session: GameSession):
+class TablePanelView(discord.ui.View):
+    def __init__(self, cog: "UnoGame", session: "GameSession"):
         super().__init__(timeout=1800)
         self.cog = cog
         self.session = session
+        if session.state != "lobby":
+            # Start / Cancel only exist before round 1 — after that rounds
+            # start themselves and staff use /uno end.
+            self.remove_item(self.start)
+            self.remove_item(self.cancel)
         cog._track_view(self)
 
     async def on_timeout(self):
-        # The lobby message itself just goes stale/uninteractable when a
-        # View times out — but the session was still sitting in
-        # self.cog.sessions, permanently blocking /uno start in this
-        # channel until someone noticed and ran /uno end. Only clean up if
-        # the game never actually started (a started game has its own
-        # lifecycle/timer and must not be touched here).
-        if not self.session.started:
-            self.cog.sessions.pop(self.session.channel_id, None)
-            for pid, bet in self.session.lobby_bets.items():
-                await db.return_chips(pid, bet)
-                await db.clear_chips_in_play(pid)
-            if self.session.lobby_message:
-                try:
-                    await self.session.lobby_message.edit(
-                        content="Lobby expired. Any bets placed have been refunded.", embed=None, view=None
-                    )
-                except discord.HTTPException:
-                    pass
+        # Only the pre-round-1 lobby needs cleaning up when its panel times
+        # out — a running table has its own timers and replaces its panel
+        # every round.
+        s = self.session
+        if s.state == "lobby" and not s.closed:
+            async with s.lock:
+                if s.state == "lobby" and not s.closed:
+                    await self.cog.close_table(s, "Lobby expired — all bets were refunded.")
         self.stop()
 
-    @staticmethod
-    def build_embed(session: GameSession) -> discord.Embed:
-        host_mention = f"<@{session.host_id}>"
-        names = "\n".join(
-            f"<@{pid}> — **{session.lobby_bets[pid]}** {config.UNO_CHIP_EMOJI}"
-            for pid in session.lobby_players
-        ) or "_nobody yet_"
-
-        e = discord.Embed(
-            title="<:uno:1536135137232953451> UNO",
-            description="A new game is starting in this channel — hit **Join** to grab a seat.",
-            color=discord.Color.blurple(),
-        )
-        e.add_field(name="<:uno_host:1536135395933159556> Host", value=f"  {host_mention}", inline=False)
-        e.add_field(
-            name="👥 Players",
-            value=f"{len(session.lobby_players)}/{session.max_players}",
-            inline=True
-        )
-        e.add_field(
-            name="<:uno_deck:1536135257789829120>  Decks",
-            value=f"\u200b\u200b{session.num_decks}",
-            inline=True
-        )
-        e.add_field(name=f"Minimum bet - {session.min_bet} {config.UNO_CHIP_EMOJI}", value=names, inline=False)
-        e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
-        return e
-
-    async def _refresh(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(embed=self.build_embed(self.session), view=self)
-
-    @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="uno_lobby_join", row=0)
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.success, row=0)
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        async with self.session.lock:
-            if interaction.user.id in self.session.lobby_bets:
-                await interaction.response.send_message("You're already in with a bet placed.", ephemeral=True)
-                return
-            if len(self.session.lobby_players) >= self.session.max_players:
-                await interaction.response.send_message("Lobby is full.", ephemeral=True)
-                return
+        s = self.session
+        if s.closed:
+            await interaction.response.send_message("This table has closed.", ephemeral=True)
+            return
+        if interaction.user.id in s.seats:
+            await interaction.response.send_message("You're already seated — use **Change bet**.", ephemeral=True)
+            return
+        if len(s.seats) >= s.max_players:
+            await interaction.response.send_message("The table is full.", ephemeral=True)
+            return
         balance = await db.get_balance(interaction.user.id)
-        await interaction.response.send_modal(BetModal(self.cog, self.session, balance))
+        await interaction.response.send_modal(BetModal(self.cog, s, balance, "join"))
 
-    @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger, custom_id="uno_lobby_leave", row=0)
+    @discord.ui.button(label="Change bet", style=discord.ButtonStyle.primary, row=0)
+    async def change_bet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        seat = s.seats.get(interaction.user.id)
+        if s.closed:
+            await interaction.response.send_message("This table has closed.", ephemeral=True)
+            return
+        if not seat:
+            await interaction.response.send_message("You're not seated — hit **Join** first.", ephemeral=True)
+            return
+        if s.state == "playing" and seat.in_round:
+            await interaction.response.send_message("Your bet is locked in until this round ends.", ephemeral=True)
+            return
+        balance = await db.get_balance(interaction.user.id)
+        await interaction.response.send_modal(BetModal(self.cog, s, balance, "change", seat.bet))
+
+    @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger, row=0)
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        async with self.session.lock:
-            if interaction.user.id not in self.session.lobby_players:
-                await interaction.response.send_message("You're not in this lobby.", ephemeral=True)
-                return
-            del self.session.lobby_players[interaction.user.id]
-            bet = self.session.lobby_bets.pop(interaction.user.id, None)
-            if bet is not None:
-                await db.return_chips(interaction.user.id, bet)
-                await db.clear_chips_in_play(interaction.user.id)
-            await self._refresh(interaction)
+        await self.cog.handle_leave(interaction)
 
-    @discord.ui.button(label="Rules",style=discord.ButtonStyle.secondary,custom_id="uno_lobby_rules",row=0)
+    @discord.ui.button(label="Rules", style=discord.ButtonStyle.secondary, row=0)
     async def rules(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.rules_cmd.callback(self.cog, interaction)
 
-    @discord.ui.button(label="Settings", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="uno_lobby_settings", row=1)
-    async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can change settings.", ephemeral=True)
-            return
-        # Only the modal-open itself needs no lock (nothing is mutated yet);
-        # LobbySettingsModal.on_submit acquires session.lock around its own
-        # mutation, and separately re-checks session.started to guard
-        # against a stale modal being submitted after the game starts.
-        await interaction.response.send_modal(LobbySettingsModal(self.cog, self.session))
-
-    @discord.ui.button(label="Start", style=discord.ButtonStyle.primary, custom_id="uno_lobby_start", row=1)
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.primary, row=1)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can start the game.", ephemeral=True)
+        s = self.session
+        if not (interaction.user.id == s.host_id or await is_event_staff(interaction)):
+            await interaction.response.send_message("Only the host or event staff can start the game.", ephemeral=True)
             return
-
-        async with self.session.lock:
-            if self.session.started:
+        async with s.lock:
+            if s.closed or s.state != "lobby":
                 await interaction.response.send_message("This game has already started.", ephemeral=True)
                 return
-
-            players = list(self.session.lobby_players.items())
-            if len(players) < 2:
+            if len(s.seats) < 2:
                 await interaction.response.send_message("Need at least 2 players to start.", ephemeral=True)
                 return
-            # No unbetted-player check needed here: a pid only ever enters
-            # lobby_players once BetModal has already collected a bet for
-            # it (see the Join button below) — there's no path to a lobby
-            # member without one.
+            await interaction.response.defer()
+            await self.cog.begin_round(s, interaction.channel)
 
-            required_cards = len(players) * 7 + 1  # hand_size is always 7 here
-            available_cards = self.session.num_decks * 108
-            if required_cards > available_cards:
-                await interaction.response.send_message(
-                    f"⚠️ Not enough cards for {len(players)} players with "
-                    f"{self.session.num_decks} deck(s).",
-                    ephemeral=True,
-                )
-                return
-
-            random.shuffle(players)  # turn order shouldn't depend on join order
-            try:
-                self.session.engine = ue.GameState(players, num_decks=self.session.num_decks,
-                                                    target_winners=self.session.target_winners,
-                                                    bets=dict(self.session.lobby_bets))
-            except ue.UnoError as e:
-                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
-                return
-
-            # Refund anyone whose buy-in was uncontested from the start
-            # (see GameState._trim_uncontested_excess) — right back to
-            # their wallet now, before a single card is played.
-            refund_lines = []
-            for pid, excess in self.session.engine.starting_refunds.items():
-                await db.return_chips(pid, excess)
-                await db.update_chips_in_play(pid, self.session.engine.bets[pid])
-                refund_lines.append(
-                    f"<@{pid}> — **{excess}** {config.UNO_CHIP_EMOJI} refunded "
-                    f"(no one else covered that much, bet trimmed to **{self.session.engine.bets[pid]}**)"
-                )
-
-            self.session.started = True
-            self.stop()
-
-            # Leave the original lobby embed exactly as it is — don't edit or clear
-            # it. Just disable its buttons (so Join/Leave/etc can't be clicked on a
-            # stale lobby) and post the table as a brand-new message.
-            for child in self.children:
-                child.disabled = True
-            await interaction.response.edit_message(view=self)
-
-            if refund_lines:
-                await interaction.channel.send(
-                    "💰 **Uncontested buy-in refunded:**\n" + "\n".join(refund_lines),
-                    allowed_mentions=discord.AllowedMentions(users=True),
-                )
-
-            await self.cog.post_table(self.session, interaction.channel)
-            self.cog.restart_timer(self.session)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, custom_id="uno_lobby_cancel",row=1)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_event_staff(interaction):
             await interaction.response.send_message("Only event staff can cancel the lobby.", ephemeral=True)
             return
-        async with self.session.lock:
-            self.cog.sessions.pop(self.session.channel_id, None)
-            for pid, bet in self.session.lobby_bets.items():
-                await db.return_chips(pid, bet)
-                await db.clear_chips_in_play(pid)
-            self.stop()
-            await interaction.response.edit_message(content="Lobby cancelled.", embed=None, view=None)
+        s = self.session
+        async with s.lock:
+            if s.closed or s.state != "lobby":
+                await interaction.response.send_message("This game has already started.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            await self.cog.close_table(s, "Lobby cancelled — all bets were refunded.")
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-        await report_component_error(interaction, error, item, "LobbyView")
+        await report_component_error(interaction, error, item, "TablePanelView")
 
 
 # ---------------------------------------------------------------------------
@@ -1708,7 +1730,8 @@ class UnoGame(commands.Cog):
         """
         for session in list(self.sessions.values()):
             session.cancel_timer()
-            if session.started and session.engine:
+            session.cancel_window()
+            if not session.closed:
                 try:
                     await asyncio.to_thread(self._save_session, session)
                 except Exception:
@@ -1791,7 +1814,7 @@ class UnoGame(commands.Cog):
         file and os.replace()s it into place so a crash mid-write can't
         leave a half-written, unreadable save behind.
         """
-        if not session.engine:
+        if session.closed:
             return
         try:
             SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1816,66 +1839,94 @@ class UnoGame(commands.Cog):
         except Exception:
             log.exception("Failed to delete save file for channel %s", channel_id)
 
-    @uno.command(name="resume", description="Resume this channel's game from its last saved checkpoint")
+    @uno.command(name="resume", description="Resume this channel's table from its last saved checkpoint")
     async def resume_cmd(self, interaction: discord.Interaction):
         """
-        Deliberately manual, not automatic — a save on disk is a checkpoint
-        taken after every turn (see post_table), so if the bot crashed or a
-        bug corrupted state mid-game, the save file is the recovery point:
-        hand-fix the JSON if needed, then run this to pick back up from it.
-        No auto-restore-on-boot, on purpose — that would resume every saved
-        game unconditionally on every restart, with no chance to inspect or
-        fix a save first if the crash was caused by bad game state.
+        Deliberately manual, not automatic — the whole table (seats, bets,
+        and the round in progress, if any) is checkpointed to disk, so if
+        the bot crashed or a bug corrupted state, the save file is the
+        recovery point: hand-fix the JSON if needed, then run this to pick
+        back up from it. No auto-restore-on-boot, on purpose — that would
+        resume every saved table unconditionally on every restart, with no
+        chance to inspect or fix a save first if the crash was caused by
+        bad state. The chips stay locked on the table (chips_in_play) the
+        whole time, which is what makes resuming safe.
         """
         if interaction.channel_id in self.sessions:
             await interaction.response.send_message(
-                "There's already a game or lobby active in this channel — end it first.", ephemeral=True
-            )
+                "There's already a table open in this channel — end it first.", ephemeral=True)
             return
 
         path = self._save_path(interaction.channel_id)
         if not path.exists():
-            await interaction.response.send_message("No saved game found for this channel.", ephemeral=True)
+            await interaction.response.send_message("No saved table found for this channel.", ephemeral=True)
             return
 
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-            session = GameSession.from_dict(data)
+            session = GameSession.from_dict(data, await db.get_settings(data["guild_id"]))
         except Exception:
             log.exception("Failed to parse save file for channel %s", interaction.channel_id)
             await interaction.response.send_message(
                 "⚠️ That save file didn't load — check the logs for the exact error "
-                "(bad/edited JSON, wrong field, etc.), fix it, and try again.",
-                ephemeral=True,
-            )
-            return
-
-        if not session.engine:
-            await interaction.response.send_message("⚠️ That save has no game state to resume.", ephemeral=True)
+                "(bad/edited JSON, wrong field, etc.), fix it, and try again.", ephemeral=True)
             return
 
         if not await is_event_staff(interaction):
-            await interaction.response.send_message(
-                "Only event staff can resume this save.", ephemeral=True
-            )
+            await interaction.response.send_message("Only event staff can resume this save.", ephemeral=True)
             return
+
+        engine = session.engine
+        if engine:
+            # A round in progress (or finished but not yet settled) has its
+            # bets locked in chips_in_play. If they're gone — e.g.
+            # /unoadmin recoverchips refunded them — resuming would pay the
+            # round out on top of chips already returned to wallets. The
+            # one exception is a round whose settlement already committed
+            # (a crash right after it): replaying that is a harmless no-op.
+            already_settled = engine.finished and await db.round_exists(engine.round_uuid)
+            if not already_settled:
+                missing = [pid for pid in engine.bets if await db.get_table_amount(pid) <= 0]
+                if missing:
+                    await interaction.response.send_message(
+                        "⚠️ Can't resume safely: " + ", ".join(f"<@{pid}>" for pid in missing) +
+                        " no longer have chips on the table (probably refunded with `/unoadmin recoverchips`), "
+                        "so resuming would pay them twice. Use `/uno end` instead.",
+                        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+                    return
+        else:
+            # Between rounds the DB is the source of truth for what's on the table
+            for pid, seat in list(session.seats.items()):
+                amount = await db.get_table_amount(pid)
+                if amount <= 0 and seat.bet > 0:
+                    del session.seats[pid]  # refunded out from under the save
+                else:
+                    seat.bet = amount if amount > 0 else seat.bet
 
         self.sessions[interaction.channel_id] = session
         try:
-            await interaction.response.send_message("🔄 Resuming saved game — table posted below.", ephemeral=True)
-            await self.post_table(session, interaction.channel)
-            self.restart_timer(session)
+            await interaction.response.send_message("🔄 Resuming saved table — posted below.", ephemeral=True)
+            async with session.lock:
+                if engine and engine.finished:
+                    await self.announce_and_cleanup(session)
+                elif engine:
+                    session.state = "playing"
+                    await self.post_table(session, interaction.channel)
+                    self.restart_timer(session)
+                elif session.state == "lobby":
+                    await self.post_panel(session, interaction.channel)
+                else:
+                    await self.open_window(session, interaction.channel)
         except Exception:
-            log.exception("Failed to resume game for channel %s", interaction.channel_id)
+            log.exception("Failed to resume table for channel %s", interaction.channel_id)
             self.sessions.pop(interaction.channel_id, None)
             # Deliberately NOT deleting the save here — a failed resume
             # (e.g. a bad emoji/image render) shouldn't destroy the one
-            # copy of the game state; leave it on disk so /uno resume can
+            # copy of the table state; leave it on disk so /uno resume can
             # just be retried after whatever broke gets fixed.
             await interaction.followup.send(
-                "⚠️ Resume failed partway through — the save file is untouched, you can try again.", ephemeral=True
-            )
+                "⚠️ Resume failed partway through — the save file is untouched, you can try again.", ephemeral=True)
 
     # ---------------- card emoji (shared with the button-grid hand UI) ----------------
 
@@ -1988,186 +2039,406 @@ class UnoGame(commands.Cog):
             return
         await self.post_table(session, channel)
 
+    # ---------------- table lifecycle ----------------
+    #
+    # A table outlives its rounds: lobby -> (round -> window -> round ...) with
+    # chips staying on the table (chips_in_play) between rounds. Every method
+    # below that mutates the table expects the caller to hold session.lock —
+    # the interaction handlers, the turn timer and the window timer all take
+    # it before calling in — so none of them acquire it themselves.
+
+    async def _reload_settings(self, session: GameSession):
+        session.apply_settings(await db.get_settings(session.guild_id))
+
+    def _save_session_now(self, session: GameSession):
+        self._save_session(session)
+
+    async def _log_seat(self, session: GameSession, uid: int, name: str, event: str,
+                        amount: int | None = None, detail: str | None = None):
+        """round_num = round in progress, or the last finished one between rounds. Never breaks gameplay."""
+        try:
+            await db.log_seat_event(session.table_id, session.round_num,
+                                    session.engine.round_uuid if session.engine else None,
+                                    uid, name, event, amount, detail)
+        except Exception:
+            log.exception("seat_log write failed (%s, table %s)", event, session.table_id)
+
+    async def _log_table(self, session: GameSession, event: str, actor_id: int | None = None,
+                         detail: str | None = None):
+        try:
+            await db.log_table_event(session.guild_id, session.channel_id, session.table_id, event,
+                                     session.round_num, actor_id, detail)
+        except Exception:
+            log.exception("table_log write failed (%s, table %s)", event, session.table_id)
+
+    async def _retire_panel(self, session: GameSession):
+        old, session.lobby_message = session.lobby_message, None
+        if old:
+            try:
+                await old.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    async def post_panel(self, session: GameSession, channel: discord.abc.Messageable, ping: bool = False):
+        """Posts a fresh join / change-bet panel at the bottom of the
+        channel, retiring the previous one. ping=True also @s everyone
+        seated (start of every between-rounds window)."""
+        await self._retire_panel(session)
+        content = None
+        if ping and session.seats:
+            content = f"🃏 **Round {session.round_num + 1}** — " + " ".join(f"<@{pid}>" for pid in session.seats)
+        session.lobby_message = await channel.send(
+            content=content, embed=build_panel_embed(session), view=TablePanelView(self, session),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+        session.msg_count = 0
+
+    async def refresh_panel(self, session: GameSession, create: bool = True):
+        """Updates the existing panel in place after a seat/bet change; posts a new one if it's gone."""
+        if session.lobby_message:
+            try:
+                await session.lobby_message.edit(embed=build_panel_embed(session))
+                return
+            except discord.HTTPException:
+                session.lobby_message = None
+        if create:
+            channel = self.bot.get_channel(session.channel_id)
+            if channel:
+                await self.post_panel(session, channel)
+
+    async def open_window(self, session: GameSession, channel: discord.abc.Messageable):
+        """Between rounds: ping everyone seated, post the join / change-bet
+        panel and count down to the next round — or, with fewer than 2
+        seats, wait for players instead."""
+        session.cancel_timer()
+        session.cancel_window()
+        await self._reload_settings(session)
+        if len(session.seats) < 2:
+            await self._enter_waiting(session, channel)
+            return
+        session.state = "window"
+        session.window_ends_at = time.time() + session.bet_window
+        await self.post_panel(session, channel, ping=True)
+        session.window_task = safe_task(self._window_timer(session, session.window_generation),
+                                        name=f"uno-window-{session.channel_id}")
+        self._save_session(session)
+
+    async def _enter_waiting(self, session: GameSession, channel: discord.abc.Messageable):
+        session.cancel_window()
+        session.state = "waiting"
+        session.window_ends_at = 0.0
+        await self.post_panel(session, channel)
+        session.window_task = safe_task(self._idle_timer(session, session.window_generation),
+                                        name=f"uno-idle-{session.channel_id}")
+        self._save_session(session)
+
+    async def _window_timer(self, session: GameSession, generation: int):
+        await asyncio.sleep(max(0.0, session.window_ends_at - time.time()))
+        async with session.lock:
+            if session.closed or generation != session.window_generation or session.state != "window":
+                return
+            channel = self.bot.get_channel(session.channel_id)
+            if not channel:
+                await self.close_table(session, None)
+                return
+            await self.begin_round(session, channel)
+
+    async def _idle_timer(self, session: GameSession, generation: int):
+        await asyncio.sleep(config.UNO_IDLE_CLOSE_SECONDS)
+        async with session.lock:
+            if session.closed or generation != session.window_generation or session.state != "waiting":
+                return
+            await self.close_table(session, "Table closed — not enough players for a while. "
+                                            "Everyone's chips were returned to their wallets.")
+
+    async def begin_round(self, session: GameSession, channel: discord.abc.Messageable):
+        """Deals the next round to everyone seated with a valid bet."""
+        session.cancel_window()
+        await self._reload_settings(session)
+
+        # Anyone still under the minimum when the window closes (their
+        # leftover didn't cover it and they didn't top up) is removed and
+        # their leftover goes back to their wallet.
+        removed = []
+        for pid, seat in list(session.seats.items()):
+            if seat.bet < session.min_bet:
+                amount = await db.table_cash_out(pid, seat.name)
+                del session.seats[pid]
+                await self._log_seat(session, pid, seat.name, "below_min", amount,
+                                     f"below the {session.min_bet} minimum — returned to wallet")
+                removed.append(f"<@{pid}> — **{amount}** {config.UNO_CHIP_EMOJI} returned to wallet")
+        if removed:
+            await channel.send("🚪**Removed from the table (below the {} minimum bet):**\n{}".format(
+                session.min_bet, "\n".join(removed)), allowed_mentions=discord.AllowedMentions(users=True))
+
+        if len(session.seats) < 2:
+            await self._enter_waiting(session, channel)
+            return
+
+        players = [(pid, seat.name) for pid, seat in session.seats.items()]
+        random.shuffle(players)  # turn order shouldn't depend on join order
+        try:
+            engine = ue.GameState(players, num_decks=session.num_decks,
+                                  bets={pid: seat.bet for pid, seat in session.seats.items()},
+                                  table_id=session.table_id, round_num=session.round_num + 1)
+        except ue.UnoError as e:
+            await channel.send(f"⚠️ Couldn't deal the round: {e}")
+            await self._enter_waiting(session, channel)
+            return
+
+        for pid, seat in session.seats.items():
+            seat.in_round = True
+            seat.leave_queued = False
+            seat.quit = False
+            player = engine.player_by_id(pid)
+            if player:
+                player.missed_turns = seat.missed_turns  # AFK streaks carry across rounds
+
+        session.engine = engine
+        session.state = "playing"
+        session.round_num += 1
+        session.last_action = None
+        session.callout_balance = {}
+        session._last_turn_player_id = None
+        await self._retire_panel(session)
+        await self.post_table(session, channel)  # also checkpoints the table
+        self.restart_timer(session)
+
+    async def close_table(self, session: GameSession, message: str | None):
+        """Tears a table down and gives every seat everything it has on the
+        table back (lobby cancelled/expired, /uno end, idle close...).
+        Mid-round that voids the round — bets only change when a round is
+        settled, so what's on the table IS what each player put in."""
+        if session.closed:
+            return
+        session.closed = True
+        session.cancel_timer()
+        session.cancel_window()
+        if session.engine:
+            try:
+                await db.log_turn_events_bulk(session.engine.pop_turn_events())
+            except Exception:
+                log.exception("Failed to flush turn log while closing channel %s", session.channel_id)
+        refunds = []
+        for pid, seat in list(session.seats.items()):
+            amount = await db.table_cash_out(pid, seat.name)
+            await self._log_seat(session, pid, seat.name, "closed", amount, "table closed — bets returned to wallet")
+            refunds.append(f"<@{pid}> — **{amount}** {config.UNO_CHIP_EMOJI}")
+        await self._log_table(session, "close", detail=(message or "")[:200])
+        session.seats.clear()
+        if self.sessions.get(session.channel_id) is session:
+            self.sessions.pop(session.channel_id, None)
+        # Old table/hand messages' buttons hold a direct reference to this
+        # session object — stopping the Views makes them visibly dead
+        # immediately instead of only failing silently on next click.
+        self._stop_session_views(session)
+        await self._retire_panel(session)
+        await asyncio.to_thread(self._delete_save, session.channel_id)
+        channel = self.bot.get_channel(session.channel_id)
+        if channel and message:
+            text = message + ("\n" + "\n".join(refunds) if refunds else "")
+            try:
+                await channel.send(text, allowed_mentions=discord.AllowedMentions(users=True))
+            except discord.HTTPException:
+                pass
+
+    async def _after_seat_change(self, session: GameSession, channel: discord.abc.Messageable):
+        """Called after a seat is removed outside a round: an emptied
+        running table closes, a window left with <2 seats falls back to
+        waiting, otherwise just refresh the panel."""
+        if not session.seats and session.state in ("window", "waiting"):
+            await self.close_table(session, "Everyone left — table closed.")
+        elif session.state == "window" and len(session.seats) < 2:
+            await self._enter_waiting(session, channel)
+        else:
+            await self.refresh_panel(session, create=False)
+            self._save_session(session)
+
+    async def handle_leave(self, interaction: discord.Interaction):
+        """Leave button / /uno leave. Mid-round this QUEUES the leave until
+        the round ends (the bet is already in play); anywhere else it takes
+        effect immediately and the player's chips go back to their wallet."""
+        session = self.sessions.get(interaction.channel_id)
+        uid = interaction.user.id
+        if not session or uid not in session.seats:
+            await interaction.response.send_message("You're not seated at a table here.", ephemeral=True)
+            return
+        async with session.lock:
+            seat = session.seats.get(uid)
+            if not seat:
+                await interaction.response.send_message("You're not seated at a table here.", ephemeral=True)
+                return
+            if session.state == "playing" and seat.in_round:
+                if seat.quit:
+                    await interaction.response.send_message("You're already out of this round.", ephemeral=True)
+                    return
+                seat.leave_queued = not seat.leave_queued
+                await self._log_seat(session, uid, seat.name,
+                                     "leave_queued" if seat.leave_queued else "leave_cancelled", seat.bet)
+                self._save_session(session)
+                await interaction.response.send_message(
+                    "🚪 You'll leave when this round ends and your chips go back to your wallet. "
+                    "(`/uno quit` leaves right now and forfeits your bet.)" if seat.leave_queued
+                    else "You'll stay at the table.", ephemeral=True)
+                return
+            amount = await db.table_cash_out(uid, seat.name)
+            del session.seats[uid]
+            await self._log_seat(session, uid, seat.name, "leave", amount, "returned to wallet")
+            await interaction.response.send_message(
+                f"You left the table — **{amount}** {config.UNO_CHIP_EMOJI} returned to your wallet.", ephemeral=True)
+            await self._after_seat_change(session, interaction.channel)
+
+    async def _drop_from_round(self, session: GameSession, pid: int, reason: str) -> bool:
+        """Removes a player from the round in progress (quit / kicked / left
+        the server). Their seat stays until the round settles — their bet
+        is forfeited like any other loss — then settlement cashes it out.
+        Returns False if they weren't an active player. Caller holds the lock."""
+        engine = session.engine
+        seat = session.seats.get(pid)
+        if not (engine and seat and seat.in_round and not engine.finished and engine.player_by_id(pid)):
+            return False
+        engine.remove_player(pid, reason=reason)
+        seat.quit = True
+        seat.exit_reason = reason
+        await self._log_seat(session, pid, seat.name, {"kicked": "kick"}.get(reason, reason), seat.bet,
+                             "bet forfeited, seat cashed out when the round settles")
+        return True
+
     async def announce_and_cleanup(self, session: GameSession):
-        """Called once the game has fully ended — posts final placements and tears the session down."""
+        """Called once a round has ended: settles the money, posts the
+        result, then opens the next window — the table keeps going."""
         channel = self.bot.get_channel(session.channel_id)
         engine = session.engine
         session.cancel_timer()
 
         if not channel or not engine:
-            self.sessions.pop(session.channel_id, None)
-            await asyncio.to_thread(self._delete_save, session.channel_id)
+            await self.close_table(session, None)
             return
 
         try:
-            net_lines, embed = await self._settle_round(session, channel, engine)
+            embed = await self._settle_round(session, channel, engine)
         except Exception:
-            # Deliberately do NOT pop the session or delete the save file
-            # here — if settlement itself blew up (this is exactly how a
-            # bad config value like a mistyped tax rate surfaced before),
-            # the round's payouts never got recorded. Popping/deleting
-            # first (the old order) meant a crash here silently destroyed
-            # the only copy of that round's state with no way to recover
-            # or even retry — chips_in_play still shows who had what
-            # locked in, but the actual settlement has to be reconstructed
-            # by hand. Leaving everything in place at least preserves
-            # that evidence for /unoadmin recoverchips or a manual fix.
-            log.exception("UNO settlement failed for channel %s — session and save file were NOT cleared, "
+            # Deliberately do NOT close the table or delete the save file
+            # here — if settlement itself blew up, nothing was applied
+            # (it's one DB transaction), and the table plus its save are
+            # the only record of that round. After fixing whatever broke,
+            # restarting the bot and running /uno resume replays the
+            # finished round (the save holds it), or /uno end voids it
+            # and refunds everyone's bets.
+            log.exception("UNO settlement failed for channel %s — table and save file were NOT cleared, "
                            "so this needs manual attention", session.channel_id)
             try:
                 await channel.send(
-                    "⚠️ Something went wrong finishing this round — settlement did not complete. "
-                    "No chips were silently lost: check the bot's console for the error, then use "
-                    "`/unoadmin recoverchips` once you've confirmed there's nothing left to salvage."
+                    "⚠️ Something went wrong finishing this round — nothing was applied and no chips were lost. "
+                    "Check the bot's console for the error — after it's fixed, restart the bot and `/uno resume` "
+                    "replays this round, or `/uno end` voids it and refunds everyone."
                 )
             except discord.HTTPException:
                 pass
             return
 
-        self.sessions.pop(session.channel_id, None)
-        await asyncio.to_thread(self._delete_save, session.channel_id)
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Failed to post the round result for channel %s", session.channel_id)
 
-        if not engine.finishers:
-            await channel.send(
-                "Game ended — no one finished (not enough players remaining)."
-                + ("\n" + "\n".join(net_lines) if net_lines else "")
-            )
+        session.engine = None
+        session.last_action = None
+        if not session.seats:
+            await self.close_table(session, "Everyone left — table closed.")
             return
+        await self.open_window(session, channel)
 
-        await channel.send(embed=embed)
+    async def _settle_round(self, session: GameSession, channel, engine: ue.GameState) -> discord.Embed:
+        """Applies the finished round (one DB transaction, idempotent on
+        round_uuid), updates the seats from the result, cashes out anyone
+        who quit / queued a leave, posts the log line and returns the
+        round-result embed."""
+        results = engine.compute_settlement(config.UNO_WINNERS_TAX_RATE)
+        channel_name = getattr(channel, "name", str(session.channel_id))
+        winner = engine.winner
+        n = session.round_num
+        total_tax = sum(r["tax"] for r in results.values())
+        collected = results[winner]["change"] if winner in results else 0
 
-    async def _settle_round(self, session: GameSession, channel, engine: ue.GameState):
-        """Does the actual payout/logging work for announce_and_cleanup,
-        split out so the caller can wrap it in one try/except without a
-        huge indented block. Returns (net_lines, embed) — embed may be
-        built even when engine.finishers is empty; the caller decides
-        whether to use it."""
-        net_lines = []
-        if engine.bets:
-            # Every original bettor's buy-in is done being "in play" the
-            # moment the round ends, win or lose. Nothing gets credited to
-            # a wallet until we know each player's NET result for the whole
-            # round (gross winnings across every pot they took, minus their
-            # own bet) — same order poker's engine.py applies its tax in
-            # (_showdown/_advance): distribute the raw pots first, then tax
-            # each player once off their total net profit for the hand/round,
-            # only if that net is actually positive.
-            gross_payout: dict[int, int] = collections.defaultdict(int)
-            for sp in engine.side_pots:
-                payouts = sp.get("payouts") or {}
-                if payouts:
-                    for pid, amount in payouts.items():
-                        gross_payout[pid] += amount
-                else:
-                    # Shouldn't normally happen (_pots_resolved() guarantees
-                    # a winner before the round ends) — defensive fallback
-                    # for the one edge case that can still reach here (every
-                    # remaining player got removed simultaneously). Split
-                    # the pot evenly across its eligible contributors rather
-                    # than returning each of them their FULL bet (which
-                    # would double-pay anyone eligible for more than one pot).
-                    eligible = sp["eligible"] or list(engine.bets)
-                    share, remainder = divmod(sp["amount"], len(eligible))
-                    for i, pid in enumerate(eligible):
-                        amt = share + (remainder if i == 0 else 0)
-                        if amt:
-                            gross_payout[pid] += amt
+        players = [{
+            "user_id": pid, "username": engine.all_names.get(pid, str(pid)), "bet": r["bet"],
+            "change": r["change"], "tax": r["tax"], "net": r["net"], "new_bet": r["new_bet"],
+            "placement": 1 if r["winner"] else None, "won": r["winner"],
+        } for pid, r in results.items()]
 
-            tax_rate = config.UNO_WINNERS_TAX_RATE
-            placements = {pid: i + 1 for i, pid in enumerate(engine.finishers)}
-            round_players = []
-            total_tax = 0
-            for pid in engine.bets:
-                name = engine.all_names.get(pid, str(pid))
-                gross = gross_payout.get(pid, 0)
-                bet = engine.bets[pid]
-                net = gross - bet
-                tax = math.ceil(net * tax_rate) if net > 0 else 0
-                credited = gross - tax
-
-                if credited > 0:
-                    # credit_wallet, not add_chips — this is an automatic
-                    # game payout, not a staff action, so it shouldn't
-                    # write a chip_log entry (see credit_wallet's docstring).
-                    await db.credit_wallet(pid, name, credited)
-                await db.clear_chips_in_play(pid)
-
-                net_after_tax = net - tax
-                await db.record_round_result(
-                    pid, name, won=net_after_tax > 0,
-                    net_chips=net_after_tax, chips_wagered=bet,
-                )
-                await db.log_currency_event(
-                    pid, "Round", net_after_tax,
-                    f"UNO round in #{channel.name if hasattr(channel, 'name') else session.channel_id}"
-                )
-                if tax > 0:
-                    await db.log_house_revenue(tax, source="winners_tax")
-                    total_tax += tax
-
-                round_players.append({
-                    "user_id": pid, "username": name, "bet": bet, "gross": gross,
-                    "tax": tax, "net": net_after_tax, "placement": placements.get(pid),
-                    "won": net_after_tax > 0,
-                })
-
-                sign = "+" if net_after_tax >= 0 else ""
-                net_lines.append(f"{_mention(pid)} **{sign}{net_after_tax}** {config.UNO_CHIP_EMOJI}")
-
-            winner_pid = engine.finishers[0] if engine.finishers else None
-            round_id = await db.log_round(
-                engine.round_uuid, session.guild_id, session.channel_id, len(engine.bets), engine.num_decks,
-                sum(engine.bets.values()), total_tax, winner_pid,
-                engine.all_names.get(winner_pid) if winner_pid else None, round_players,
-            )
-            # Catch anything played since the last periodic flush so the
-            # full turn-by-turn log is complete before the session (and
-            # its engine, along with any unflushed events still sitting on
-            # it) gets torn down by the caller.
+        # A round nobody won (every player left) changes no balances and
+        # isn't recorded. apply_round_settlement returning None means this
+        # exact round was already applied — a resume replaying a round
+        # that had in fact committed — so the DB is already right and the
+        # seats below simply re-sync from it.
+        if winner is not None:
+            await db.apply_round_settlement(engine.round_uuid, session.guild_id, session.channel_id,
+                                            session.table_id, n, engine.num_decks, winner,
+                                            engine.all_names.get(winner), players, channel_name,
+                                            dealer_id=session.dealer_id, dealer_name=session.dealer_name,
+                                            tax_rate=config.UNO_WINNERS_TAX_RATE)
+        try:
             await db.log_turn_events_bulk(engine.pop_turn_events())
+        except Exception:
+            log.exception("Failed to flush turn log for channel %s", session.channel_id)
 
-            settings = await db.get_settings(session.guild_id)
-            log_channel_id = settings.get("log_channel_id")
-            if log_channel_id:
-                log_channel = self.bot.get_channel(int(log_channel_id))
-                if log_channel:
-                    channel_name = getattr(channel, "name", str(session.channel_id))
-                    short_id = engine.round_uuid[:8]
-                    header = f"Round #{round_id} | Table: #{channel_name} ({short_id}) | Pot: {sum(engine.bets.values())} | Tax: {total_tax}"
-                    rows = "\n".join(
-                        f"  {p['username']} ({p['user_id']}): Bet: {p['bet']}  Net: {'+' if p['net'] >= 0 else ''}{p['net']}"
-                        for p in round_players
-                    )
-                    body = header + "\n" + rows
-                    try:
-                        await log_channel.send(f"```\n{body}\n```")
-                    except discord.HTTPException:
-                        pass
+        leaving: set[int] = set()
+        for pid in engine.bets:
+            seat = session.seats.get(pid)
+            if not seat:
+                continue
+            seat.in_round = False
+            seat.bet = await db.get_table_amount(pid)
+            player = engine.player_by_id(pid)
+            seat.missed_turns = player.missed_turns if player else 0
+            if seat.quit or seat.leave_queued or pid in engine.left_early:
+                leaving.add(pid)
+        for pid in leaving:
+            seat = session.seats.pop(pid, None)
+            if seat:
+                returned = await db.table_cash_out(pid, seat.name)
+                if seat.exit_reason:  # quit / kicked / left_guild
+                    why = seat.exit_reason
+                elif pid in engine.left_early:  # removed by the AFK timer
+                    why = "afk_kick"
+                else:  # queued Leave
+                    why = "leave"
+                await self._log_seat(session, pid, seat.name, "cashed_out", returned, why)
+        self._save_session(session)
 
-        if not engine.finishers:
-            return net_lines, None
+        settings = await db.get_settings(session.guild_id)
+        log_channel_id = settings.get("log_channel_id")
+        if log_channel_id and winner is not None:
+            log_channel = self.bot.get_channel(int(log_channel_id))
+            if log_channel:
+                header = (f"Round #{n} | Table: #{channel_name} ({session.table_id}) | "
+                          f"Dealer: {session.dealer_name} | Pot: {collected} | Tax: {total_tax}")
+                rows = "\n".join(
+                    f"  {p['username']} ({p['user_id']}): Bet: {p['bet']}  Net: {'+' if p['net'] >= 0 else ''}{p['net']}"
+                    for p in players
+                )
+                try:
+                    await log_channel.send(f"```\n{header}\n{rows}\n```")
+                except discord.HTTPException:
+                    pass
 
-        winner_id = engine.finishers[0]
-        embed = discord.Embed(
-            title="<:uno_trophy:1536135332863676548> Game Over!",
-            color=discord.Color.gold(),
-        )
+        if winner is None:
+            return discord.Embed(title=f"Round {n} voided",
+                                 description="Everyone left — no bets changed hands.", color=discord.Color.light_grey())
+        embed = discord.Embed(title=f"<:uno_trophy:1536135332863676548> Round {n} complete", color=discord.Color.gold())
+        ordered = sorted(results.items(), key=lambda kv: (not kv[1]["winner"], -kv[1]["net"]))
+        lines = []
+        for pid, r in ordered:
+            medal = f"{PLACEMENT_EMOJI.get(0, '')} " if r["winner"] else ""
+            sign = "+" if r["net"] >= 0 else ""
+            where = "returned to wallet" if pid in leaving else "on the table"
+            lines.append(f"{medal}{_mention(pid)} **{sign}{r['net']}** {config.UNO_CHIP_EMOJI} → "
+                         f"**{r['new_bet']}** {where}")
+        embed.add_field(name="Net", value="\n".join(lines), inline=False)
+        embed.set_footer(text=f"Table {session.table_id} · Round {n} · Dealer {session.dealer_name}")
+        return embed
 
-        placements = "\n".join(
-            f"{PLACEMENT_EMOJI.get(i, f'`#{i+1}`')} {_mention(pid)}"
-            for i, pid in enumerate(engine.finishers)
-        )
-        embed.add_field(name="Placements", value=placements, inline=False)
-
-        if engine.players:
-            still_in = ", ".join(_mention(p.player_id) for p in engine.players)
-            embed.add_field(name="Still had cards left", value=still_in, inline=False)
-
-        if net_lines:
-            embed.add_field(name="Net", value="\n".join(net_lines), inline=False)
-
-        embed.set_footer(text=f"{len(engine.finishers)} finisher(s) • {engine.num_decks} deck(s)")
-        return net_lines, embed
 
     # ---------------- shared action handlers (used by buttons AND slash commands) ----------------
 
@@ -2557,35 +2828,51 @@ class UnoGame(commands.Cog):
 
     # ---------------- commands ----------------
 
-    @uno.command(name="open", description="Open a new UNO lobby in this channel")
+    @uno.command(name="open", description="Open a new UNO table in this channel")
     async def start(self, interaction: discord.Interaction):
-        # Guards the check-then-insert below — without this, two /uno start
+        # Guards the check-then-insert below — without this, two /uno open
         # calls landing in the same channel within the same event-loop tick
         # (e.g. two people double-clicking, or a client retry) can both
         # read self.sessions before either has inserted into it, and both
-        # go on to create a lobby. Whichever one loses the lock's ordering
+        # go on to create a table. Whichever one loses the lock's ordering
         # will re-check afterward and see the other's session already
         # there.
         async with self._start_locks[interaction.channel_id]:
             if interaction.channel_id in self.sessions:
-                await interaction.response.send_message("There's already a game or lobby active in this channel.", ephemeral=True)
+                await interaction.response.send_message("There's already a table open in this channel.", ephemeral=True)
                 return
 
-            session = GameSession(interaction.guild_id, interaction.channel_id, interaction.user.id, interaction.user.display_name)
+            settings = await db.get_settings(interaction.guild_id)
+            session = GameSession(interaction.guild_id, interaction.channel_id, interaction.user.id,
+                                  interaction.user.display_name, settings)
             self.sessions[interaction.channel_id] = session
+            await self._log_table(session, "open", interaction.user.id,
+                                  f"min_bet={session.min_bet} max_players={session.max_players} decks={session.num_decks}")
 
-            view = LobbyView(self, session)
-            await interaction.response.send_message(embed=LobbyView.build_embed(session), view=view)
-            session.lobby_message = await interaction.original_response()
+            await interaction.response.send_message(embed=build_panel_embed(session), view=TablePanelView(self, session))
+            msg = await interaction.original_response()
+            try:
+                # A plain channel message rather than the interaction's
+                # webhook message — those can only be edited for 15 minutes
+                # and this panel gets edited for as long as the lobby is open.
+                session.lobby_message = await interaction.channel.fetch_message(msg.id)
+            except discord.HTTPException:
+                session.lobby_message = msg
 
-    @uno.command(name="refresh", description="Manually resend the full table for the game in this channel")
+    @uno.command(name="refresh", description="Repost the table and join panel at the bottom of the channel")
     async def refresh_cmd(self, interaction: discord.Interaction):
         session = self.sessions.get(interaction.channel_id)
-        if not session or not session.engine:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+        if not session or session.closed:
+            await interaction.response.send_message("No table open here.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        await self.post_table(session, interaction.channel)
+        async with session.lock:
+            # Always the join / bet panel too (mid-round it lets new players
+            # take a seat for the next round) — same as poker's /poker table
+            # putting the whole table back at the bottom.
+            await self.post_panel(session, interaction.channel)
+            if session.state == "playing" and session.engine:
+                await self.post_table(session, interaction.channel)
         await interaction.followup.send("Table refreshed.", ephemeral=True)
 
     @uno.command(name="table", description="Show turn order — who's up next, top to bottom")
@@ -2735,129 +3022,209 @@ class UnoGame(commands.Cog):
             return
         await self.handle_toggle_arm_uno(interaction, session)
 
-    @uno.command(name="end", description="End/cancel the game or lobby in this channel (event staff only)")
+    @uno.command(name="end", description="Close the table in this channel and refund everyone (event staff only)")
     async def end(self, interaction: discord.Interaction):
         session = self.sessions.get(interaction.channel_id)
         if not session:
-            await interaction.response.send_message("No active game or lobby here.", ephemeral=True)
+            await interaction.response.send_message("No table open here.", ephemeral=True)
             return
         if not await is_event_staff(interaction):
             await interaction.response.send_message("Only event staff can end this.", ephemeral=True)
             return
-        session.cancel_timer()
-        self.sessions.pop(interaction.channel_id, None)
-        # Old table/hand messages' buttons hold a direct reference to this
-        # session object, not a fresh lookup — popping it out of
-        # self.sessions above is what _is_live()/_guard() now check, but
-        # stopping the Views too makes it visible immediately (buttons
-        # show as dead) instead of only failing silently on next click.
-        self._stop_session_views(session)
-        await asyncio.to_thread(self._delete_save, interaction.channel_id)
-        await interaction.response.send_message("Game ended.")
+        async with session.lock:
+            await interaction.response.defer()
+            await self.close_table(session, "Table closed by staff — everything on the table was refunded:")
+        await interaction.followup.send("Table closed.", ephemeral=True)
 
-    @uno.command(name="kick", description="Remove a player from the lobby or game (event staff only)")
+    @uno.command(name="kick", description="Remove a player from the table (event staff only)")
     @app_commands.describe(user="The user to remove")
     async def kick(self, interaction: discord.Interaction, user: discord.User):
         session = self.sessions.get(interaction.channel_id)
         if not session:
-            await interaction.response.send_message("No active game or lobby here.", ephemeral=True)
+            await interaction.response.send_message("No table open here.", ephemeral=True)
             return
         if not await is_event_staff(interaction):
             await interaction.response.send_message("Only event staff can kick players.", ephemeral=True)
             return
 
         target_id = user.id
-
-        if not session.started:
-            # Lobby phase
-            async with session.lock:
-                if target_id in session.lobby_players:
-                    name = session.lobby_players.pop(target_id)
-                    bet = session.lobby_bets.pop(target_id, None)
-                    if bet is not None:
-                        await db.return_chips(target_id, bet)
-                        await db.clear_chips_in_play(target_id)
-                    await interaction.response.send_message(f"Removed **{name}** from the lobby.", ephemeral=False)
-                    if session.lobby_message:
-                        await session.lobby_message.edit(embed=LobbyView.build_embed(session))
-                else:
-                    await interaction.response.send_message("That user isn't in the lobby.", ephemeral=True)
-            return
-
-        # Active game phase
-        engine = session.engine
-        if not engine or engine.player_by_id(target_id) is None:
-            await interaction.response.send_message("That user isn't an active player.", ephemeral=True)
-            return
-
         async with session.lock:
-            player = engine.player_by_id(target_id)
-            if player is None:
-                await interaction.response.send_message("That user isn't an active player.", ephemeral=True)
+            seat = session.seats.get(target_id)
+            if not seat:
+                await interaction.response.send_message("That user isn't seated at this table.", ephemeral=True)
                 return
-            name = player.name
-            engine.remove_player(target_id, reason="kicked")
-            # Not setting session.last_action — the send_message right below
-            # is already the public announcement, and refresh_table (called
-            # a few lines down) used to repost a whole new table whose
-            # headline said the exact same thing a second time.
-            await interaction.response.send_message(f"Removed **{name}** from the game.", ephemeral=False)
+            name = seat.name
+            if session.state == "playing" and seat.in_round:
+                engine = session.engine
+                if not await self._drop_from_round(session, target_id, reason="kicked"):
+                    await interaction.response.send_message("That user isn't an active player.", ephemeral=True)
+                    return
+                # Not setting session.last_action — the send_message below
+                # is already the public announcement.
+                await interaction.response.send_message(f"Removed **{name}** from the game — their bet is forfeited.")
+                if engine.finished:
+                    await self.announce_and_cleanup(session)
+                else:
+                    # Always restart the timer here, not just "if was_current" —
+                    # remove_player's turn-advancement can change who's current in
+                    # ways a simple pre-check can't detect (e.g. kicking the
+                    # target of a pending Wild Draw Four while the WD4 player was
+                    # still nominally "current"). Restarting unconditionally is
+                    # cheap and always correct.
+                    self.restart_timer(session)
+                    await self.refresh_table(session)
+                return
+            amount = await db.table_cash_out(target_id, name)
+            del session.seats[target_id]
+            await interaction.response.send_message(
+                f"Removed **{name}** from the table — **{amount}** {config.UNO_CHIP_EMOJI} returned to their wallet.")
+            await self._log_seat(session, target_id, name, "kick", amount, "removed between rounds — returned to wallet")
+            await self._after_seat_change(session, interaction.channel)
 
-            if engine.finished:
-                await self.announce_and_cleanup(session)
-            else:
-                # Always restart the timer here, not just "if was_current" —
-                # remove_player's turn-advancement can change who's current in
-                # ways this simple pre-check can't detect (e.g. kicking the
-                # target of a pending Wild Draw Four while the WD4 player was
-                # still nominally "current"). Restarting unconditionally is
-                # cheap and always correct.
-                self.restart_timer(session)
-                await self.refresh_table(session)
-
-    @uno.command(name="leave", description="Leave the game or lobby in this channel")
+    @uno.command(name="leave", description="Leave the table after the current round ends")
     async def leave_cmd(self, interaction: discord.Interaction):
+        await self.handle_leave(interaction)
+
+    @uno.command(name="quit", description="Leave the table right now — forfeits your bet if a round is in progress")
+    async def quit_cmd(self, interaction: discord.Interaction):
         session = self.sessions.get(interaction.channel_id)
-        if not session:
-            await interaction.response.send_message("No active game or lobby here.", ephemeral=True)
+        uid = interaction.user.id
+        if not session or uid not in session.seats:
+            await interaction.response.send_message("You're not seated at a table here.", ephemeral=True)
             return
-
-        target_id = interaction.user.id
-
-        if not session.started:
-            async with session.lock:
-                if target_id in session.lobby_players:
-                    session.lobby_players.pop(target_id)
-                    bet = session.lobby_bets.pop(target_id, None)
-                    if bet is not None:
-                        await db.return_chips(target_id, bet)
-                        await db.clear_chips_in_play(target_id)
-                    await interaction.response.send_message("You left the lobby.", ephemeral=True)
-                    if session.lobby_message:
-                        await session.lobby_message.edit(embed=LobbyView.build_embed(session))
+        async with session.lock:
+            seat = session.seats.get(uid)
+            if not seat:
+                await interaction.response.send_message("You're not seated at a table here.", ephemeral=True)
+                return
+            if session.state == "playing" and seat.in_round:
+                if seat.quit:
+                    await interaction.response.send_message("You're already out of this round.", ephemeral=True)
+                    return
+                engine = session.engine
+                if not await self._drop_from_round(session, uid, reason="quit"):
+                    await interaction.response.send_message("This round has already ended.", ephemeral=True)
+                    return
+                await interaction.response.send_message(
+                    f"{_mention(uid)} quit the table — their bet is forfeited.",
+                    allowed_mentions=discord.AllowedMentions.none())
+                if engine.finished:
+                    await self.announce_and_cleanup(session)
                 else:
-                    await interaction.response.send_message("You're not in this lobby.", ephemeral=True)
-            return
+                    self.restart_timer(session)
+                    await self.refresh_table(session)
+                return
+            # Nothing is at risk between rounds, so quitting is just leaving.
+            amount = await db.table_cash_out(uid, seat.name)
+            del session.seats[uid]
+            await self._log_seat(session, uid, seat.name, "quit", amount, "between rounds — returned to wallet")
+            await interaction.response.send_message(
+                f"You left the table — **{amount}** {config.UNO_CHIP_EMOJI} returned to your wallet.", ephemeral=True)
+            await self._after_seat_change(session, interaction.channel)
 
-        engine = session.engine
-        if not engine or engine.player_by_id(target_id) is None:
-            await interaction.response.send_message("You're not an active player in this game.", ephemeral=True)
+    @uno.command(name="tip", description="Tip the dealer")
+    @app_commands.describe(amount="How many chips to tip? (e.g. 50, 1k)")
+    async def tip_cmd(self, interaction: discord.Interaction, amount: str):
+        await interaction.response.defer(ephemeral=False)
+        tip = _parse_chips(amount)
+        if tip is None or tip <= 0:
+            await interaction.followup.send("❌ Enter a valid amount greater than 0.", ephemeral=True)
+            return
+        session = self.sessions.get(interaction.channel_id)
+        if not session or session.closed:
+            await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        if uid == session.dealer_id:
+            await interaction.followup.send("❌ You can't tip yourself.", ephemeral=True)
             return
 
         async with session.lock:
-            if engine.player_by_id(target_id) is None:
-                await interaction.response.send_message("You're not an active player in this game.", ephemeral=True)
-                return
-            engine.remove_player(target_id, reason="left")
-            # Same reasoning as /uno kick — don't duplicate the message below
-            # as the next table headline too.
-            await interaction.response.send_message(f"{_mention(target_id)} left the game.", ephemeral=False)
+            seat = session.seats.get(uid)
+            wallet_bal = await db.get_balance(uid)
+            # Wallet first, then (between rounds only) the bet on the table —
+            # same order poker uses.
+            from_table = tip - min(tip, wallet_bal)
+            pulled = False
+            if from_table > 0:
+                if not seat:
+                    await interaction.followup.send(f"❌ Not enough chips. Wallet: **{wallet_bal}**.", ephemeral=True)
+                    return
+                if session.state == "playing" and seat.in_round:
+                    await interaction.followup.send(
+                        "❌ You can't tip chips from the table while a round is in progress. Wait for it to finish.",
+                        ephemeral=True)
+                    return
+                if seat.bet - from_table < session.min_bet:
+                    await interaction.followup.send(
+                        f"❌ Not enough chips — tipping that much from the table would drop your bet below the "
+                        f"**{session.min_bet}** minimum. Wallet: **{wallet_bal}**, table: **{seat.bet}**.",
+                        ephemeral=True)
+                    return
+                ok, _old = await db.table_set_amount(uid, interaction.user.display_name, seat.bet - from_table)
+                if not ok:
+                    await interaction.followup.send("❌ Failed to move chips off the table.", ephemeral=True)
+                    return
+                seat.bet -= from_table
+                pulled = True
 
-            if engine.finished:
-                await self.announce_and_cleanup(session)
-            else:
-                self.restart_timer(session)
-                await self.refresh_table(session)
+            if not await db.deduct_chips(uid, tip):
+                if pulled:  # put the chips back on the table
+                    await db.table_set_amount(uid, interaction.user.display_name, seat.bet + from_table)
+                    seat.bet += from_table
+                await interaction.followup.send("❌ Failed to deduct chips.", ephemeral=True)
+                return
+
+            dealer_name = session.dealer_name
+            await db.add_chips(uid, interaction.user.display_name, session.dealer_id, dealer_name, tip,
+                               f"Tip from {interaction.user.display_name}", table_id=session.table_id)
+            await db.record_tip(uid, interaction.user.display_name, tip)
+            await db.log_currency_event(uid, "Tip", -tip, f"Tipped {dealer_name}", session.table_id, session.round_num)
+            await db.log_currency_event(session.dealer_id, "Tip", tip, f"Tip from {interaction.user.display_name}",
+                                        session.table_id, session.round_num)
+            if pulled:
+                self._save_session(session)
+                await self._log_seat(session, uid, interaction.user.display_name, "change_bet", seat.bet,
+                                     f"tip pulled {from_table} from the table")
+                await self.refresh_panel(session, create=False)
+
+        await interaction.followup.send(
+            f"💸 **{interaction.user.display_name}** tipped **{tip}** {config.UNO_CHIP_EMOJI} to **{dealer_name}**!")
+
+    @uno.command(name="tipleaders", description="Top generous players by total chips tipped")
+    async def tipleaders(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        rows = await db.get_tip_leaderboard(10)
+        if not rows:
+            await interaction.followup.send("No tips recorded yet! Be the first to tip the dealer!", ephemeral=True)
+            return
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = ["```", f"{'':4}{'Player':<16} {'Tipped':>7}", "─" * 34]
+        for i, r in enumerate(rows, start=1):
+            you = " ◀" if r["user_id"] == interaction.user.id else ""
+            lines.append(f"{medals.get(i, f'{i}. '):<4}{r['username'][:16]:<16} {r['total_tipped']:>7,}{you}")
+        lines.append("```")
+        embed = discord.Embed(title="💸 Top Tippers Leaderboard", description="\n".join(lines), color=0xF1C40F)
+        await interaction.followup.send(embed=embed)
+
+    @unomgr.command(name="setdealer", description="[Manager] Change the dealer (who receives tips) for this table")
+    @app_commands.describe(user="The new dealer")
+    async def set_dealer(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_uno_manager(interaction):
+            await interaction.followup.send("❌ UNO Managers only.", ephemeral=True)
+            return
+        session = self.sessions.get(interaction.channel_id)
+        if not session or session.closed:
+            await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
+            return
+        old_dealer = session.dealer_id
+        session.dealer_id = user.id
+        session.dealer_name = user.name
+        await self._log_table(session, "dealer", interaction.user.id, f"{old_dealer} -> {user.id}")
+        self._save_session(session)
+        await self.refresh_panel(session, create=False)
+        await interaction.followup.send(f"🔄 **{user.mention}** has taken over as the dealer! All new tips will go to them.")
 
     @unomgr.command(name="addchips", description="[Manager] Add chips to a player's UNO wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")
@@ -2992,25 +3359,83 @@ class UnoGame(commands.Cog):
             f"✅ Deducted **{amount}** {config.UNO_CHIP_EMOJI} from **{user.mention}**'s pending cashouts.",
             allowed_mentions=discord.AllowedMentions(users=True))
 
-    @unoset.command(name="managerrole", description="[Admin] Set the UNO Manager role")
-    @app_commands.describe(role="Role that gets UNO manager access (addchips, ban, cashouts, etc.)")
-    async def set_manager_role(self, interaction: discord.Interaction, role: discord.Role):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True)
+    @unoset.command(name="settings", description="[Manager] View or change UNO settings — only the options you fill in change")
+    @app_commands.describe(
+        min_bet="Minimum bet per round",
+        max_bet="Maximum bet per round (0 = no limit)",
+        turn_timer="Seconds each player gets per turn (30-600)",
+        bet_window="Seconds between rounds to join / change bet (10-120)",
+        resend_after="Chat messages before the table/panel is reposted at the bottom (1-50)",
+        max_players="Seats per table (2-20)",
+        decks="Number of decks (1-6)",
+        log_channel="Channel for round-by-round summaries",
+        manager_role="Role that gets UNO manager access (admin only)",
+    )
+    async def settings_cmd(
+        self, interaction: discord.Interaction,
+        min_bet: app_commands.Range[int, 1, 1_000_000] | None = None,
+        max_bet: app_commands.Range[int, 0, 100_000_000] | None = None,
+        turn_timer: app_commands.Range[int, MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT] | None = None,
+        bet_window: app_commands.Range[int, 10, 120] | None = None,
+        resend_after: app_commands.Range[int, 1, 50] | None = None,
+        max_players: app_commands.Range[int, MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT] | None = None,
+        decks: app_commands.Range[int, MIN_DECKS, MAX_DECKS] | None = None,
+        log_channel: discord.TextChannel | None = None,
+        manager_role: discord.Role | None = None,
+    ):
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("❌ UNO Managers only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=False)
-        await db.set_settings(interaction.guild_id, manager_role_id=role.id)
-        await interaction.followup.send(f"✅ UNO Manager role: **{role.name}**")
 
-    @unoset.command(name="logchannel", description="[Admin] Set where UNO round summaries get posted")
-    @app_commands.describe(channel="Channel for round-by-round summaries (also always saved to the DB regardless)")
-    async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True)
+        current = await db.get_settings(interaction.guild_id)
+        changes: dict = {}
+        applied: list[str] = []
+
+        def want(key, value, label, fmt=str):
+            if value is not None and value != current.get(key):
+                changes[key] = value
+                applied.append(f"{label} → **{fmt(value)}**")
+
+        want("min_bet", min_bet, "Min bet")
+        want("max_bet", max_bet, "Max bet", lambda v: str(v) if v else "no limit")
+        want("turn_timeout", turn_timer, "Turn timer", lambda v: f"{v}s")
+        want("bet_window", bet_window, "Bet window", lambda v: f"{v}s")
+        want("resend_after_msgs", resend_after, "Resend after", lambda v: f"{v} messages")
+        want("max_players", max_players, "Max players")
+        want("num_decks", decks, "Decks")
+        if log_channel is not None:
+            want("log_channel_id", log_channel.id, "Log channel", lambda v: f"<#{v}>")
+        if manager_role is not None:
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.followup.send("❌ Only a server Administrator can change the manager role.", ephemeral=True)
+                return
+            want("manager_role_id", manager_role.id, "Manager role", lambda v: f"<@&{v}>")
+
+        merged = {**current, **changes}
+        problem = None
+        if merged["max_bet"] and merged["min_bet"] > merged["max_bet"]:
+            problem = f"Min bet ({merged['min_bet']}) can't be higher than max bet ({merged['max_bet']})."
+        elif merged["max_players"] * 7 + 1 > merged["num_decks"] * 108:
+            problem = (f"{merged['max_players']} players need more than {merged['num_decks']} deck(s) can deal "
+                       f"— raise the decks or lower max players.")
+        if problem:
+            await interaction.followup.send(f"❌ {problem} Nothing was changed.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=False)
-        await db.set_settings(interaction.guild_id, log_channel_id=channel.id)
-        await interaction.followup.send(f"✅ UNO round log channel: {channel.mention}")
+
+        if changes:
+            await db.set_settings(interaction.guild_id, **changes)
+            current = await db.get_settings(interaction.guild_id)
+            # Live tables pick the new values up immediately (a turn already
+            # running keeps its current timer; the next one uses the new length)
+            for s in list(self.sessions.values()):
+                if s.guild_id == interaction.guild_id and not s.closed:
+                    s.apply_settings(current)
+                    await self._log_table(s, "settings", interaction.user.id, json.dumps(changes))
+                    if s.state in ("lobby", "window", "waiting"):
+                        await self.refresh_panel(s, create=False)
+        text = ("✅ **Applied:** " + ", ".join(applied)) if applied else None
+        await interaction.followup.send(content=text, embed=build_settings_embed(current))
 
     # ── Admin/dev economy commands ──────────────────────────────────────────
 
@@ -3408,7 +3833,7 @@ class UnoGame(commands.Cog):
             return
 
         lines = "\n".join(f"• **{r['username']}**: {r['amount']}{config.UNO_CHIP_EMOJI}" for r in detail[:20])
-        active_channels = ", ".join(f"<#{cid}>" for cid, s in self.sessions.items() if s.started) or "none"
+        active_channels = ", ".join(f"<#{cid}>" for cid in self.sessions) or "none"
         view = UnoRecoverChipsView(interaction.user.id)
         await interaction.response.send_message(
             f"⚠️ This refunds and clears **every** locked UNO bet below, all at once — there's no way to "
@@ -3434,8 +3859,8 @@ class UnoGame(commands.Cog):
 
         session = self.sessions.get(interaction.channel_id)
         table_str = ""
-        if session and session.started and session.engine and target.id in session.engine.bets:
-            table_str = f"\n**At table:** {session.engine.bets[target.id]} {config.UNO_CHIP_EMOJI}"
+        if session and target.id in session.seats:
+            table_str = f"\n**At table:** {session.seats[target.id].bet} {config.UNO_CHIP_EMOJI}"
         pending_str = f"\n**Pending Cashout:** 🔒 {pending} {config.UNO_CHIP_EMOJI}" if pending > 0 else ""
 
         label = f"**{target.display_name}'s UNO Wallet**" if user else "**Your UNO Wallet**"
@@ -3604,49 +4029,6 @@ class UnoGame(commands.Cog):
         view = UnoCurrencyLogView(caller=interaction.user, target=target, logs=logs, minimum=minimum)
         await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
-    @uno.command(
-        name="timeout",
-        description="Change the turn timeout for the current UNO game (event staff only)",
-    )
-    @app_commands.describe(seconds="Turn timeout in seconds (30–600)")
-    async def timeout_cmd(self, interaction: discord.Interaction, seconds: int):
-        session = self.sessions.get(interaction.channel_id)
-
-        if not session or not session.engine:
-            await interaction.response.send_message(
-                "No active game here.", ephemeral=True
-            )
-            return
-
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message(
-                "Only event staff can change the turn timeout.", ephemeral=True
-            )
-            return
-
-        if not MIN_TURN_TIMEOUT <= seconds <= MAX_TURN_TIMEOUT:
-            await interaction.response.send_message(
-                f"Turn timeout must be between {MIN_TURN_TIMEOUT} and {MAX_TURN_TIMEOUT} seconds.",
-                ephemeral=True,
-            )
-            return
-
-        async with session.lock:
-            if not self._is_live(session):
-                await interaction.response.send_message(
-                    "This game has ended.", ephemeral=True
-                )
-                return
-
-            old_timeout = session.turn_timeout
-            session.turn_timeout = seconds
-
-        await interaction.response.send_message(
-            f"✅ Turn timeout changed from **{old_timeout}s** to **{seconds}s**. "
-            f"It will apply starting with the next turn.",
-            ephemeral=True,
-        )
-
     @uno.command(name="rules", description="View the UNO rules and bot-specific rules.")
     async def rules_cmd(self, interaction: discord.Interaction):
         container = Container(
@@ -3720,6 +4102,23 @@ class UnoGame(commands.Cog):
             )
         )
 
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
+                f"### {config.UNO_CHIP_EMOJI} Betting & Rounds\n"
+                "The first player to empty their hand "
+                "wins the round and collects from each opponent up to **their own bet**. Anything "
+                "you bet above the winner's bet stays yours. Your winnings or losses are applied to the "
+                "bet on the table and the table goes straight into the next round.\n\n"
+                "Between rounds you get a short window to **Change bet** or join. Do nothing and whatever "
+                "you have left carries over as your next bet, if you below the minimum and you're removed "
+                "\n\n"
+                "**Leave** takes effect after the current round. **/uno quit** leaves immediately and "
+                "forfeits your bet for the round."
+            )
+        )
+
         view = discord.ui.LayoutView()
         view.add_item(container)
 
@@ -3735,54 +4134,49 @@ class UnoGame(commands.Cog):
         if message.author.bot:
             return
         session = self.sessions.get(message.channel.id)
-        if not session or not session.engine:
+        if not session or session.closed:
             return
         session.msg_count += 1
-        if session.msg_count >= TABLE_REFRESH_EVERY_MESSAGES:
-            await self.post_table(session, message.channel)
+        if session.msg_count >= session.resend_after:
+            async with session.lock:
+                if session.closed:
+                    return
+                # Repost whichever message people are actually using right
+                # now so it doesn't get buried: the live table mid-round,
+                # the join / bet panel otherwise.
+                if session.state == "playing" and session.engine and not session.engine.finished:
+                    await self.post_table(session, message.channel)
+                elif session.state in ("lobby", "window", "waiting"):
+                    await self.post_panel(session, message.channel)
 
     async def _remove_member_everywhere(self, guild_id: int, user_id: int, reason: str):
         for session in list(self.sessions.values()):
-            if session.guild_id != guild_id:
+            if session.guild_id != guild_id or user_id not in session.seats:
                 continue
-
-            if not session.started:
-                # lobby phase — just drop them from the joined list (host slot
-                # stays put; a departed/banned host still just loses moderator
-                # powers implicitly since they're gone, nothing else to do)
-                async with session.lock:
-                    if user_id in session.lobby_players:
-                        del session.lobby_players[user_id]
-                        bet = session.lobby_bets.pop(user_id, None)
-                        if bet is not None:
-                            await db.return_chips(user_id, bet)
-                            await db.clear_chips_in_play(user_id)
-                        if session.lobby_message:
-                            try:
-                                await session.lobby_message.edit(embed=LobbyView.build_embed(session))
-                            except discord.NotFound:
-                                pass
-                continue
-
-            if not session.engine or session.engine.player_by_id(user_id) is None:
-                continue
-
             async with session.lock:
-                if session.engine.player_by_id(user_id) is None:
+                seat = session.seats.get(user_id)
+                if not seat or session.closed:
                     continue
-                session.engine.remove_player(user_id, reason="left_guild")
-
                 channel = self.bot.get_channel(session.channel_id)
+                if session.state == "playing" and seat.in_round:
+                    engine = session.engine
+                    if await self._drop_from_round(session, user_id, reason="left_guild"):
+                        if channel:
+                            await channel.send(f"👋 A player {reason} and was removed from the game — their bet is forfeited.")
+                        if engine.finished:
+                            await self.announce_and_cleanup(session)
+                        else:
+                            # Always restart, not just "if was_current" — see the
+                            # matching comment in the /uno kick handler for why.
+                            self.restart_timer(session)
+                            await self.refresh_table(session)
+                    continue
+                amount = await db.table_cash_out(user_id, seat.name)
+                await self._log_seat(session, user_id, seat.name, "left_guild", amount,
+                                     "between rounds — returned to wallet")
+                del session.seats[user_id]
                 if channel:
-                    await channel.send(f"👋 A player {reason} and was removed from the game.")
-
-                if session.engine.finished:
-                    await self.announce_and_cleanup(session)
-                else:
-                    # Always restart, not just "if was_current" — see the
-                    # matching comment in the /uno kick handler for why.
-                    self.restart_timer(session)
-                    await self.refresh_table(session)
+                    await self._after_seat_change(session, channel)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -3819,4 +4213,11 @@ class UnoGame(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
+    # Refuse to load with an absurd tax rate. It's applied as
+    # ceil(profit * rate), so a percent typed where a fraction belongs
+    # (5 instead of 0.05) would tax every win at 500% — fail loudly at
+    # startup instead of silently eating payouts.
+    rate = config.UNO_WINNERS_TAX_RATE
+    if not isinstance(rate, (int, float)) or not 0 <= rate <= 0.5:
+        raise ValueError(f"config.UNO_WINNERS_TAX_RATE must be a fraction between 0 and 0.5 (0.05 = 5%), got {rate!r}")
     await bot.add_cog(UnoGame(bot))

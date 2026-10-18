@@ -739,7 +739,7 @@ async def reload(ctx, cog_name: str = None):
     def resolve_target(name_lower, name_raw):
         """Returns (helpers, cogs) for a single target token."""
         if name_lower == "poker":
-            return (["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation"],
+            return (["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "poker.leaderboard_image"],
                      ["poker.poker"])
         elif name_lower == "eventlog":
             return (["config", "eventlog.eventlog_database"], ["eventlog.eventlog"])
@@ -770,7 +770,7 @@ async def reload(ctx, cog_name: str = None):
                 return ([name_raw], [])
 
     if cog_name is None:
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db"] + [h for h in UNO_HELPERS if h != "config"]
+        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db", "poker.leaderboard_image"] + [h for h in UNO_HELPERS if h != "config"]
         cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "uno.uno_cog", "highlight"]
     else:
         # Comma-separated list of targets — aliases, dotted helper modules, or cogs, any mix.

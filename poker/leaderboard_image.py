@@ -469,8 +469,8 @@ def generate_leaderboard_image(
             else "—"
         )
 
-        played = r.get("hands_played") or r.get("rounds_played", 0)
-        won = r.get("hands_won") or r.get("rounds_won", 0)
+        played = caller_row.get("hands_played") or caller_row.get("rounds_played", 0)
+        won = caller_row.get("hands_won") or caller_row.get("rounds_won", 0)
 
         if played:
             win_percentage = (won / played * 100)

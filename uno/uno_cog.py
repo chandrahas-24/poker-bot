@@ -848,7 +848,7 @@ def _seat_lines(session: "GameSession") -> str:
             flags.append("leaving")
         if session.state in ("window", "waiting") and seat.bet < session.min_bet:
             flags.append("⚠️")
-        extra = f" _({', '.join(flags)})_" if flags else ""
+        extra = f" {', '.join(flags)}" if flags else ""
         lines.append(f"<@{pid}> — **{seat.bet}** {config.UNO_CHIP_EMOJI}{extra}")
     return "\n".join(lines) or "_nobody yet_"
 
@@ -862,9 +862,8 @@ def build_panel_embed(session: "GameSession") -> discord.Embed:
         desc = "Place a bet to take a seat. The host or staff presses **Start** once everyone's in."
     elif session.state == "window":
         title = f"<:uno:1536135137232953451> UNO — Round {n + 1} next"
-        desc = (f"Round {n + 1} starts <t:{int(session.window_ends_at)}:R>. Join with a bet, or change yours — "
-                f"whatever you have left on the table carries over as your next bet "
-                f"(minimum {session.min_bet}, or you'll be removed).")
+        desc = (f"Round {n + 1} starts <t:{int(session.window_ends_at)}:R>. Join or change your bet."
+                f"whatever you have left on the table carries over as your next bet ")
     elif session.state == "waiting":
         title = "<:uno:1536135137232953451> UNO — waiting for players"
         desc = (f"The next round starts "
@@ -875,10 +874,8 @@ def build_panel_embed(session: "GameSession") -> discord.Embed:
 
     e = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
     e.add_field(name="<:uno_host:1536135395933159556> Dealer", value=f"<@{session.dealer_id}>", inline=True)
-    e.add_field(name="👥 Players", value=f"{len(session.seats)}/{session.max_players}", inline=True)
     e.add_field(name="<:uno_deck:1536135257789829120> Decks", value=str(session.num_decks), inline=True)
-    limits = f"{session.min_bet}" + (f" – {session.max_bet}" if session.max_bet else "+")
-    e.add_field(name=f"Bet — {limits}", value=_seat_lines(session), inline=False)
+    e.add_field(name=f"Bets {len(session.seats)}/{session.max_players}", value=_seat_lines(session), inline=False)
     e.set_footer(text=f"Table {session.table_id}")
     e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
     return e

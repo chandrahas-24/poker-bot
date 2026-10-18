@@ -1241,6 +1241,9 @@ async def reset_database(admin_id: int, admin_name: str):
 
     async with _cache_lock:
         _settings_cache.clear()
+
+
+async def get_players_at_risk() -> list[dict]:
     """O(1) query for players exactly 1 day away from a wipe."""
     db = await _get_db()
     async with db.execute("""

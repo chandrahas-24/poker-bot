@@ -29,8 +29,22 @@ def _load_card_image(name: str, card_height: int) -> Image.Image:
 
 
 def _resize_to_height(img: Image.Image, card_height: int) -> Image.Image:
+    if img.height == card_height:
+        return img  # already prepared (see prepare_card_image) — skip the per-render resize
     ratio = card_height / img.height
     return img.resize((int(img.width * ratio), card_height))
+
+
+def prepare_card_image(img: Image.Image, card_height: int = CARD_HEIGHT) -> Image.Image:
+    """One-time load-side prep for the in-memory cache: RGBA, already at the
+    render height. Keeps each cached card at its final on-screen size (far
+    less RAM than full-resolution art) and means compose_hand_image never
+    has to resize anything."""
+    img = img.convert("RGBA")
+    if img.height == card_height:
+        return img
+    ratio = card_height / img.height
+    return img.resize((max(1, int(img.width * ratio)), card_height), Image.LANCZOS)
 
 
 def _row_width(n_cards: int, card_width: int, overlap: int) -> int:

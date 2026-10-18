@@ -92,7 +92,7 @@ from PIL import Image
 
 from . import uno_engine as ue
 from . import cards as card_assets
-from .hand_render import compose_hand_image
+from .hand_render import compose_hand_image, prepare_card_image
 from . import database as db
 from .unodemo import (
     sort_hand,
@@ -161,6 +161,9 @@ async def is_uno_manager(interaction: discord.Interaction) -> bool:
             return True
     return interaction.user.guild_permissions.administrator
 
+_BG_TASKS: set = set()
+
+
 def safe_task(coro, name: str | None = None) -> asyncio.Task:
     """
     Wraps a fire-and-forget coroutine so an unexpected exception gets
@@ -176,7 +179,10 @@ def safe_task(coro, name: str | None = None) -> asyncio.Task:
             raise
         except Exception:
             log.exception("Background task %r crashed", name or coro)
-    return asyncio.create_task(_wrapper(), name=name)
+    task = asyncio.create_task(_wrapper(), name=name)
+    _BG_TASKS.add(task)  # strong ref: the loop only keeps weak ones, so a fire-and-forget task could be GC'd mid-flight
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
 
 
 async def report_component_error(interaction: discord.Interaction, error: Exception, item, source: str):
@@ -872,7 +878,7 @@ def build_panel_embed(session: "GameSession") -> discord.Embed:
     e.add_field(name="👥 Players", value=f"{len(session.seats)}/{session.max_players}", inline=True)
     e.add_field(name="<:uno_deck:1536135257789829120> Decks", value=str(session.num_decks), inline=True)
     limits = f"{session.min_bet}" + (f" – {session.max_bet}" if session.max_bet else "+")
-    e.add_field(name=f"Bet — {limits} {config.UNO_CHIP_EMOJI}", value=_seat_lines(session), inline=False)
+    e.add_field(name=f"Bet — {limits}", value=_seat_lines(session), inline=False)
     e.set_footer(text=f"Table {session.table_id}")
     e.set_thumbnail(url='https://media.discordapp.net/attachments/1525465986541555813/1536293002975117362/wdmbzh1.jpg?ex=6a7adfda&is=6a798e5a&hm=4bbf5ffcf806948fecbd377781edfc95f3c5c06a78cd859895930d4f7057226b&=&format=webp')
     return e
@@ -1346,15 +1352,9 @@ class HandPlayView(discord.ui.LayoutView):
         container.add_item(TextDisplay(f"Your hand — {len(hand)} card{'s' if len(hand) != 1 else ''}. Tap one to play it."))
 
         try:
-            img = compose_hand_image(hand, self.cog._card_image_cache)
-            buf = io.BytesIO()
-            # PNG encoding is synchronous CPU work — offload it so it
-            # doesn't block the event loop (and every other channel's
-            # interactions) while it runs.
-            await asyncio.to_thread(img.save, buf, format="PNG")
-            buf.seek(0)
+            png = await self.cog.hand_png(hand)
             filename = "hand.png"
-            self.file = discord.File(buf, filename=filename)
+            self.file = discord.File(io.BytesIO(png), filename=filename)
             container.add_item(MediaGallery(discord.MediaGalleryItem(f"attachment://{filename}")))
         except (FileNotFoundError, ValueError):
             pass  # missing card art for something in hand — buttons still work fine without the image
@@ -1691,6 +1691,9 @@ class UnoGame(commands.Cog):
         # ./_uno_thumb_cache/ files were exactly this: a full disk write
         # on every single hand/table render, for every player, forever).
         self._card_image_cache: dict[str, Image.Image] = {}
+        # sorted-hand tuple -> finished PNG bytes (LRU). Players re-open the same
+        # hand repeatedly while waiting; a hit skips composing AND encoding.
+        self._hand_png_cache: "collections.OrderedDict[tuple, bytes]" = collections.OrderedDict()
         self._load_card_image_cache()
         self._thumb_bytes_cache: dict[str, bytes] = {}  # card_name -> pre-encoded padded PNG bytes
 
@@ -1807,8 +1810,30 @@ class UnoGame(commands.Cog):
     async def _before_flush_turn_log(self):
         await self.bot.wait_until_ready()
 
+    def _render_hand_png(self, hand: list[str]) -> bytes:
+        img = compose_hand_image(hand, self._card_image_cache)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", compress_level=3)  # faster encode, slightly larger file
+        return buf.getvalue()
+
+    async def hand_png(self, hand: list[str]) -> bytes:
+        """Hand image as PNG bytes, LRU-cached. Compose + encode run together in
+        ONE worker-thread call. Raises FileNotFoundError / ValueError like
+        compose_hand_image."""
+        key = tuple(hand)
+        data = self._hand_png_cache.get(key)
+        if data is not None:
+            self._hand_png_cache.move_to_end(key)
+            return data
+        data = await asyncio.to_thread(self._render_hand_png, hand)
+        self._hand_png_cache[key] = data
+        while len(self._hand_png_cache) > 48:
+            self._hand_png_cache.popitem(last=False)
+        return data
+
     def _load_card_image_cache(self):
         if not os.path.isdir(card_assets.CARDS_DIR):
+            print(f"⚠️ UNO cards folder not found: {card_assets.CARDS_DIR}")
             return
         for fname in os.listdir(card_assets.CARDS_DIR):
             if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -1816,10 +1841,13 @@ class UnoGame(commands.Cog):
             name = os.path.splitext(fname)[0]
             try:
                 path = os.path.join(card_assets.CARDS_DIR, fname)
-                self._card_image_cache[name] = Image.open(path).convert("RGBA")
+                with Image.open(path) as im:
+                    # stored at render height (300px) — less RAM, and no per-render resizing
+                    self._card_image_cache[name] = prepare_card_image(im)
             except Exception:
                 log.exception("Failed to load card image %s", fname)
         log.info("Cached %d card image(s) in memory", len(self._card_image_cache))
+        print(f"✅ Cached {len(self._card_image_cache)} UNO cards in memory")
 
     uno = app_commands.Group(name="uno", description="UNO game commands", guild_ids=[config.GUILD_ID])
     unomgr = app_commands.Group(name="unomgr", description="UNO manager commands (economy)", guild_ids=[config.GUILD_ID])
@@ -2080,21 +2108,33 @@ class UnoGame(commands.Cog):
 
     async def _log_seat(self, session: GameSession, uid: int, name: str, event: str,
                         amount: int | None = None, detail: str | None = None):
-        """round_num = round in progress, or the last finished one between rounds. Never breaks gameplay."""
-        try:
-            await db.log_seat_event(session.table_id, session.round_num,
-                                    session.engine.round_uuid if session.engine else None,
-                                    uid, name, event, amount, detail)
-        except Exception:
-            log.exception("seat_log write failed (%s, table %s)", event, session.table_id)
+        """round_num = round in progress, or the last finished one between rounds.
+        Audit only — values are captured now and the DB write runs in the
+        background so gameplay never waits on it. Never breaks gameplay."""
+        args = (session.table_id, session.round_num,
+                session.engine.round_uuid if session.engine else None,
+                uid, name, event, amount, detail)
+
+        async def _write():
+            try:
+                await db.log_seat_event(*args)
+            except Exception:
+                log.exception("seat_log write failed (%s, table %s)", event, args[0])
+
+        safe_task(_write(), name="uno-seat-log")
 
     async def _log_table(self, session: GameSession, event: str, actor_id: int | None = None,
                          detail: str | None = None):
-        try:
-            await db.log_table_event(session.guild_id, session.channel_id, session.table_id, event,
-                                     session.round_num, actor_id, detail)
-        except Exception:
-            log.exception("table_log write failed (%s, table %s)", event, session.table_id)
+        args = (session.guild_id, session.channel_id, session.table_id, event,
+                session.round_num, actor_id, detail)
+
+        async def _write():
+            try:
+                await db.log_table_event(*args)
+            except Exception:
+                log.exception("table_log write failed (%s, table %s)", event, args[2])
+
+        safe_task(_write(), name="uno-table-log")
 
     async def _retire_panel(self, session: GameSession):
         old, session.lobby_message = session.lobby_message, None
@@ -2744,14 +2784,7 @@ class UnoGame(commands.Cog):
             kwargs["view"] = view
 
         try:
-            img = compose_hand_image(hand, self._card_image_cache)
-            buf = io.BytesIO()
-            # PNG encoding is synchronous CPU work — offload it off the
-            # event loop rather than blocking every other channel's
-            # interactions while this one hand gets encoded.
-            await asyncio.to_thread(img.save, buf, format="PNG")
-            buf.seek(0)
-            kwargs["file"] = discord.File(buf, filename="hand.png")
+            kwargs["file"] = discord.File(io.BytesIO(await self.hand_png(hand)), filename="hand.png")
         except FileNotFoundError:
             pass  # missing card art for something in hand — text list still works fine
         except ValueError:
@@ -4041,7 +4074,23 @@ class UnoGame(commands.Cog):
         )
 
         file = discord.File(image_bytes, filename="uno_leaderboard.png")
-        await interaction.followup.send(file=file)
+
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(
+                    "attachment://uno_leaderboard.png"
+                )
+            ),
+            accent_color=0xF1C40F,
+        )
+
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+
+        await interaction.followup.send(
+            file=file,
+            view=view,
+        )
 
     @uno.command(name="request_cashout", description="Lock UNO chips for withdrawal and notify staff")
     @app_commands.describe(amount="Chips to cash out (e.g. 500, 2k)", note="Optional notes")

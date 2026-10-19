@@ -944,32 +944,6 @@ async def delete_player_stats(user_id: int) -> bool:
     return True
 
 
-async def reset_database(admin_id: int, admin_name: str):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute("DELETE FROM wallets")
-        await db.execute("DELETE FROM stats")
-        await db.execute("DELETE FROM hand_log")
-        await db.execute("DELETE FROM chip_log")
-        await db.execute("DELETE FROM chips_in_play")
-        await db.execute("DELETE FROM poker_bans")
-        await db.execute("DELETE FROM house_revenue")  # <-- FIXED: Clears the revenue tracker
-        await db.execute("DELETE FROM player_cosmetics")
-        await db.execute("DELETE FROM currency_log")
-        await db.execute("DELETE FROM custom_cosmetics")
-        await db.execute("DELETE FROM jackpot")
-        await db.execute("INSERT INTO jackpot (id, amount) VALUES (1, 0)")
-        await db.execute("""
-            INSERT INTO audit_log (ts, action, user_id, user_name, detail)
-            VALUES (?, 'DATABASE_RESET', ?, ?, 'Full database reset performed')
-        """, (ts, admin_id, admin_name))
-        await db.commit()
-
-    # Clear settings cache after reset
-    clear_settings_cache()
-
-
 # --- VAULT & CASHOUT FUNCTIONS ---
 
 async def get_wallet(user_id: int) -> tuple[int, int]:

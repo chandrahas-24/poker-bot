@@ -5802,47 +5802,6 @@ class GameView(discord.ui.View):
             ephemeral=True
         )
 
-# ── Confirm DB reset ──────────────────────────────────────────────────────────
-
-class ConfirmResetView1(discord.ui.View):
-    def __init__(self, admin_id: int):
-        super().__init__(timeout=30)
-        self.admin_id = admin_id
-
-    @discord.ui.button(label="Yes, I'm sure", style=discord.ButtonStyle.red)
-    async def step1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message("❌ Not your button.", ephemeral=True); return
-        view = ConfirmResetView2(self.admin_id)
-        await interaction.response.edit_message(
-            content="⚠️ **Final confirmation.** This CANNOT be undone.", view=view)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled.", view=None)
-
-class ConfirmResetView2(discord.ui.View):
-    def __init__(self, admin_id: int):
-        super().__init__(timeout=30)
-        self.admin_id = admin_id
-
-    @discord.ui.button(label="WIPE EVERYTHING", style=discord.ButtonStyle.red)
-    async def step2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message("❌ Not your button.", ephemeral=True);
-            return
-
-        # 1. DEFER FIRST
-        await interaction.response.defer()
-
-        # 2. DO THE WIPE
-        await db.reset_database(interaction.user.id, interaction.user.display_name)
-        tables.clear()
-
-        # 3. USE FOLLOWUP FOR EDITS
-        await interaction.edit_original_response(
-            content=f"✅ Database wiped by **{interaction.user.display_name}**.", view=None)
-
 # ── Cosmetics UI ─────────────────────────────────────────────────────────────
 
 def _build_cosmetics_embed_and_view(user_id: int, cosmetics: dict, page: str = "titles"):
@@ -6166,52 +6125,6 @@ class FoldConfirmView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="❌ Fold cancelled.", view=None)
         self.stop()
-
-# ── Autocomplete helpers for /poker equiptitle and /poker equipwinmsg ─────────
-
-async def _autocomplete_title(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    """Only shows titles the user has already unlocked."""
-    cosmetics = await db.get_cosmetics(interaction.user.id)
-    owned = set(cosmetics["unlocked_titles"])
-    choices = [app_commands.Choice(name="— Remove title —", value="none")]
-    for tid in owned:
-        info = db.TITLES.get(tid)
-        if info and current.lower() in info["display"].lower():
-            choices.append(app_commands.Choice(name=info["display"], value=tid))
-    return choices[:25]
-
-
-async def _autocomplete_winmsg(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    """Only shows win messages the user has already unlocked."""
-    cosmetics = await db.get_cosmetics(interaction.user.id)
-    owned = set(cosmetics["unlocked_win_msgs"])
-    choices = [app_commands.Choice(name="— Remove win message —", value="none")]
-    for mid in owned:
-        info = db.WIN_MESSAGES.get(mid)
-        if info and current.lower() in info["display"].lower():
-            choices.append(app_commands.Choice(name=info["display"], value=mid))
-    return choices[:25]
-
-
-async def _autocomplete_skin(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    """Only shows card skins the user has already unlocked."""
-    cosmetics = await db.get_cosmetics(interaction.user.id)
-    owned = set(cosmetics.get("unlocked_skins", []))
-    choices = [app_commands.Choice(name="— Remove card skin —", value="none")]
-    for sid in owned:
-        info = db.SKINS.get(sid)
-        if info and current.lower() in info["display"].lower():
-            choices.append(app_commands.Choice(name=info["display"], value=sid))
-    return choices[:25]
 
 
 async def _autocomplete_grant_cosmetic(
@@ -7396,15 +7309,6 @@ class PokerCog(commands.Cog):
         await db.set_settings(interaction.guild_id, manager_role_id=role.id)
         await interaction.followup.send(f"✅ Poker Manager role: **{role.name}**")
 
-    @poker.command(name="resetdb", description="[Admin] Wipe all poker data from the database")
-    async def reset_db(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Server Administrator only.", ephemeral=True); return
-        view = ConfirmResetView1(interaction.user.id)
-        await interaction.response.send_message(
-            "⚠️ **This will permanently delete all wallets, stats, logs and settings.**\nAre you sure?",
-            view=view, ephemeral=True)
-
     @poker.command(name="afk", description="Toggle AFK: auto 'Fold Any' every turn (removed from the table after 10 min)")
     async def afk(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -8147,71 +8051,6 @@ class PokerCog(commands.Cog):
         await self.titles_cmd.callback(self, interaction)
 
 
-    @poker.command(name="equiptitle", description="Equip one of your unlocked titles")
-    @app_commands.describe(title_id="Your unlocked title — pick from the list")
-    @app_commands.autocomplete(title_id=_autocomplete_title)
-    async def equiptitle(self, interaction: discord.Interaction, title_id: str):
-        await interaction.response.defer(ephemeral=True)
-        if title_id == "none":
-            await db.set_active_title(interaction.user.id, None)
-            await interaction.followup.send("✅ Title removed.", ephemeral=True)
-            return
-        if title_id not in db.TITLES:
-            await interaction.followup.send("❌ Unknown title. Use `/poker titles` to see your options.", ephemeral=True)
-            return
-        ok = await db.set_active_title(interaction.user.id, title_id)
-        if not ok:
-            info = db.TITLES[title_id]
-            await interaction.followup.send(
-                f"❌ You haven't unlocked **{info['display']}** yet.\n*{info['description']}*", ephemeral=True)
-            return
-        await interaction.followup.send(f"✅ Title set to **{db.TITLES[title_id]['display']}**!", ephemeral=True)
-
-    @poker.command(name="equipwinmsg", description="Equip one of your unlocked win messages")
-    @app_commands.describe(msg_id="Your unlocked win message — pick from the list")
-    @app_commands.autocomplete(msg_id=_autocomplete_winmsg)
-    async def equipwinmsg(self, interaction: discord.Interaction, msg_id: str):
-        await interaction.response.defer(ephemeral=True)
-        if msg_id == "none":
-            await db.set_active_win_msg(interaction.user.id, None)
-            await interaction.followup.send("✅ Win message removed.", ephemeral=True)
-            return
-        if msg_id not in db.WIN_MESSAGES:
-            await interaction.followup.send("❌ Unknown win message. Use `/poker titles` to see your options.", ephemeral=True)
-            return
-        ok = await db.set_active_win_msg(interaction.user.id, msg_id)
-        if not ok:
-            info = db.WIN_MESSAGES[msg_id]
-            desc = info['description'] if info['rarity'] != 'legendary' else "???"
-            await interaction.followup.send(
-                f"❌ You haven't unlocked **{info['display']}** yet.\n*{desc}*", ephemeral=True)
-            return
-        await interaction.followup.send(f"✅ Win message set to **{db.WIN_MESSAGES[msg_id]['display']}**!", ephemeral=True)
-
-    @poker.command(name="equipskin", description="Equip one of your unlocked card skins")
-    @app_commands.describe(skin_id="Your unlocked card skin — pick from the list")
-    @app_commands.autocomplete(skin_id=_autocomplete_skin)
-    async def equipskin(self, interaction: discord.Interaction, skin_id: str):
-        await interaction.response.defer(ephemeral=True)
-        if skin_id == "none":
-            await db.set_active_skin(interaction.user.id, None)
-            await interaction.followup.send("✅ Card skin removed.", ephemeral=True)
-            return
-
-        if skin_id not in db.SKINS:
-            await interaction.followup.send("❌ Unknown card skin. Use `/poker titles` to see your options.",
-                                            ephemeral=True)
-            return
-
-        ok = await db.set_active_skin(interaction.user.id, skin_id)
-        if not ok:
-            info = db.SKINS[skin_id]
-            desc = info.get('description', '')
-            await interaction.followup.send(
-                f"❌ You haven't unlocked **{info['display']}** yet.\n*{desc}*", ephemeral=True)
-            return
-        await interaction.followup.send(f"✅ Card skin set to **{db.SKINS[skin_id]['display']}**!", ephemeral=True)
-
     @pokeradmin.command(name="grant_cosmetic", description="[Admin] Grant a title, win message, or card skin to any player")
     @app_commands.describe(user="The player to receive the cosmetic", kind="Type of cosmetic",
                            cosmetic_id="Search for the cosmetic")
@@ -8237,10 +8076,9 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"❌ Unknown ID `{cid}`.\nValid: {valid}", ephemeral=True); return
         newly = await db.unlock_cosmetic(user.id, k, cid)
         display = catalog[cid]["display"]
-        cmd = {"title": "equiptitle", "winmsg": "equipwinmsg", "skin": "equipskin"}[k]
         if newly:
             await interaction.followup.send(
-                f"✅ Granted **{display}** to {user.mention}.\nThey can equip it with `/poker {cmd}`", ephemeral=True)
+                f"✅ Granted **{display}** to {user.mention}.\nThey can equip it with `/poker cosmetics`", ephemeral=True)
         else:
             await interaction.followup.send(f"ℹ️ {user.mention} already owns **{display}**.", ephemeral=True)
 

@@ -67,6 +67,7 @@ class PokerPlayer:
     shiny_ids:     list = field(default_factory=list)  # ids of shiny cards held this hand
     uno_color:     str | None = None  # Chaos: Uno Reverse — "red"/"blue"/"green"/"yellow" if dealt one this hand
     premove:       dict | None = None
+    premove_sticky: bool = False  # True -> premove survives hand/street resets and firing (see set_sticky_premove)
     vpip: bool = False
     # chaos card skin's batman card art rolled once per hand & kept across players hand, reset every hand
     skin_batman_rolled: bool = False
@@ -89,13 +90,15 @@ class PokerPlayer:
         self.skin_batman_rolled = False
         self.skin_batman_card = None
         self.uno_color   = None
-        self.premove     = None
+        if not self.premove_sticky:
+            self.premove = None
         self.vpip        = False
 
     def reset_for_street(self):
         self.bet   = 0
         self.acted = False
-        self.premove = None
+        if not self.premove_sticky:
+            self.premove = None
 
 @dataclass
 class SidePot:
@@ -1029,10 +1032,11 @@ class PokerGame:
         """
         Attempts to fire a queued premove for the given player.
         Returns True if an action was taken, False if conditions weren't met.
-        Clears the premove regardless.
+        Clears the premove regardless, unless it's sticky.
         """
         moves = p.premove if isinstance(p.premove, list) else ([p.premove] if p.premove else [])
-        p.premove = None  # always clear, one-shot only
+        if not getattr(p, "premove_sticky", False):
+            p.premove = None  # one-shot, unless sticky
 
         for move in moves:
             if move is None:
@@ -1052,6 +1056,9 @@ class PokerGame:
             elif action == "fold_any":
                 if call_amt == 0:
                     success, msg = self.check_or_call(p.user_id)
+                    if not success:
+                        # Free check refused (Chaos: All In! bans checking preflop) -> fold instead
+                        success, msg = self.fold(p.user_id)
                 else:
                     success, msg = self.fold(p.user_id)
             elif action == "fold_if_gt":
@@ -1093,6 +1100,23 @@ class PokerGame:
                 return True, "\n".join(dec_parts)
 
         return False, ""
+
+    def set_sticky_premove(self, user_id: int, chain: list | None) -> bool:
+        """
+        Internal toggle for sticky premoves. A sticky premove is never cleared by
+        reset_for_hand / reset_for_street / firing; only this method (chain=None) removes it.
+        Works for seated players and pending joiners.
+        """
+        p = self.get_player(user_id) or next((x for x in self.pending_joins if x.user_id == user_id), None)
+        if not p:
+            return False
+        if chain:
+            p.premove = [dict(m) for m in chain]
+            p.premove_sticky = True
+        else:
+            p.premove_sticky = False
+            p.premove = None
+        return True
 
     def _betting_closed(self) -> bool:
         """

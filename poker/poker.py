@@ -40,6 +40,7 @@ LARGE_POT_THRESHOLD   = config.LARGE_POT_THRESHOLD
 LARGE_POT_EXTRA_TIME  = config.LARGE_POT_EXTRA_TIME
 DAILY_AFK_LIMIT        = config.DAILY_AFK_LIMIT
 CONSECUTIVE_AFK_LIMIT  = config.CONSECUTIVE_AFK_LIMIT
+AFK_MODE_SECONDS       = getattr(config, "AFK_MODE_SECONDS", 600)  # /poker afk auto-kick window
 TABLE_RESEND_MSGS       = config.TABLE_RESEND_MSGS
 
 # 2/7 offsuit bluff bonus + "67" title
@@ -516,6 +517,79 @@ async def _handle_old_timeout(t: TableState, channel, user_id: int, p):
     await channel.send(f"⏰ **{name}** timed out and was auto-folded. They will be removed after this hand.")
     await _handle_post_action(channel.guild, channel, t)
 
+def _afk_tasks(t: TableState) -> dict:
+    """uid -> /poker afk expiry task. Created lazily so TableStates that survive a reload still work."""
+    if not hasattr(t, "afk_tasks"):
+        t.afk_tasks = {}
+    return t.afk_tasks
+
+async def _fire_sticky_premove(guild, channel, t: TableState) -> bool:
+    """If whoever is to act has a sticky premove, fire it now. Premoves normally only fire from
+    _advance() for the NEXT player, so the first actor of a new street/hand (and anyone who turns
+    AFK on during their own turn) needs this. Returns True if an action was taken (in which case
+    _handle_post_action has already run)."""
+    g = t.game
+    if g.street in (Street.WAITING, Street.SHOWDOWN) or g._hand_result:
+        return False
+    cp = g.current_player()
+    if not cp or not getattr(cp, "premove_sticky", False) or not cp.premove:
+        return False
+    fired, msg = g._try_fire_premove(cp)
+    if not fired:
+        return False
+    _lock_in_hand_result(t)
+    if any(m in msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+        slog_clear(t)
+    for part in msg.split("\n"):
+        if part.strip():
+            slog(t, part)
+    await _handle_post_action(guild, channel, t)
+    return True
+
+async def _afk_mode_expire(t: TableState, channel, user_id: int):
+    """/poker afk wasn't re-run within AFK_MODE_SECONDS -> kick."""
+    try:
+        await asyncio.sleep(AFK_MODE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    _afk_tasks(t).pop(user_id, None)
+    g = t.game
+    p = g.get_player(user_id) or next((x for x in g.pending_joins if x.user_id == user_id), None)
+    if t.closing or not p or not getattr(p, "premove_sticky", False):
+        return  # left, already removed, or AFK was turned off
+    name = p.display_name
+    g.set_sticky_premove(user_id, None)
+    if user_id in g.pending_leaves:
+        return
+
+    chips_back, msg = g.remove_player(user_id)
+    if "will leave" in msg:
+        # Mid-hand: same as an AFK-timeout kick — out of the hand now, removed at hand end.
+        if user_id not in g.kicked_users:
+            g.kicked_users.append(user_id)
+        t.leave_cooldown_pending.add(user_id)
+        await channel.send(f"💤 **{name}** was AFK for {AFK_MODE_SECONDS // 60} minutes and will be removed after this hand.")
+        if not p.folded:
+            ok, fold_msg = g.force_fold(user_id)
+            if ok:
+                _lock_in_hand_result(t)
+                if any(m in fold_msg for m in ["🌊", "↩️", "🏁", "Showdown"]):
+                    slog_clear(t)
+                for part in fold_msg.split("\n"):
+                    if part.strip():
+                        slog(t, part)
+                await _handle_post_action(channel.guild, channel, t)
+                return
+        await refresh(channel, t)
+    else:
+        # Between hands / not yet dealt in: cash out now (mirrors leave_table_execute)
+        if chips_back > 0:
+            await db.return_chips(user_id, chips_back)
+        await db.clear_chips_in_play(user_id)
+        apply_global_lock(user_id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
+        await channel.send(f"💤 **{name}** was AFK for {AFK_MODE_SECONDS // 60} minutes and was removed from the table. Chips returned to wallet.")
+        await refresh(channel, t)
+
 async def _turn_timer(t: TableState, channel, user_id: int):
     settings = await db.get_settings(channel.guild.id)
     timeout = settings.get("turn_timeout", TURN_TIMEOUT_DEFAULT)
@@ -842,6 +916,7 @@ async def _auto_next_hand(t: TableState, channel):
 
     t.msg_count = 0
     await refresh(channel, t, new_hand=True, cosmetics_cache=t.cosmetics_cache)
+    await _fire_sticky_premove(channel.guild, channel, t)  # AFK player acting first
 
 async def _silent_strip_view(msg: discord.Message):
     try:
@@ -1723,6 +1798,10 @@ async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
                 if part.strip():
                     slog(t, part)
         await _handle_post_action(guild, channel, t)
+        return
+
+    # A sticky (AFK) premove for whoever acts first on this street
+    if await _fire_sticky_premove(guild, channel, t):
         return
 
     if ran_auction:
@@ -5710,6 +5789,9 @@ class GameView(discord.ui.View):
         if not p:
             await interaction.response.send_message("❌ You're not at the table.", ephemeral=True);
             return
+        if getattr(p, "premove_sticky", False):
+            await interaction.response.send_message("❌ You're AFK — run `/poker afk` to come back.", ephemeral=True)
+            return
         if self.t.game.is_turn(interaction.user.id):
             await interaction.response.send_message("❌ It's your turn — just act normally.", ephemeral=True);
             return
@@ -6463,6 +6545,7 @@ class PokerCog(commands.Cog):
         t.msg_count = 0
         await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'start')
         await refresh(interaction.channel, t, new_hand=True)
+        await _fire_sticky_premove(interaction.guild, interaction.channel, t)  # AFK player acting first
         await interaction.followup.send("✅ Hand started!", ephemeral=True)
 
     @poker.command(name="table", description="Re-post the game panel")
@@ -7321,6 +7404,43 @@ class PokerCog(commands.Cog):
         await interaction.response.send_message(
             "⚠️ **This will permanently delete all wallets, stats, logs and settings.**\nAre you sure?",
             view=view, ephemeral=True)
+
+    @poker.command(name="afk", description="Toggle AFK: auto 'Fold Any' every turn (removed from the table after 10 min)")
+    async def afk(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        t = get_table((interaction.guild_id, interaction.channel_id))
+        if not t:
+            await interaction.followup.send("❌ No table here.", ephemeral=True)
+            return
+        if getattr(t, "is_tournament", False):
+            await interaction.followup.send("❌ AFK mode isn't available at tournament tables.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        g = t.game
+        p = g.get_player(uid) or next((x for x in g.pending_joins if x.user_id == uid), None)
+        if not p:
+            await interaction.followup.send("❌ You're not at the table.", ephemeral=True)
+            return
+
+        tasks = _afk_tasks(t)
+        old = tasks.pop(uid, None)
+        if old:
+            old.cancel()
+
+        if getattr(p, "premove_sticky", False):
+            g.set_sticky_premove(uid, None)
+            await interaction.followup.send("AFK off welcome back.", ephemeral=True)
+            return
+
+        g.set_sticky_premove(uid, [{"action": "fold_any"}])
+        expiry = int(time.time()) + AFK_MODE_SECONDS
+        task = asyncio.create_task(_afk_mode_expire(t, interaction.channel, uid))
+        task.add_done_callback(_task_catcher)
+        tasks[uid] = task
+        await interaction.followup.send(
+            f"💤 **AFK on** you'll auto fold until you run `/poker afk` again. "
+            f"You'll be removed from the table <t:{expiry}:R> unless you do.", ephemeral=True)
+        await _fire_sticky_premove(interaction.guild, interaction.channel, t)  # if it's your turn right now
 
     @poker.command(name="rebuy", description="Add more chips to your table stack from your wallet")
     @app_commands.describe(amount="How many chips to add (e.g. 500, 2k)")
@@ -8487,6 +8607,9 @@ class PokerCog(commands.Cog):
 
         if not is_active_turn:
             # --- QUEUE THE PREMOVE ---
+            if getattr(p, "premove_sticky", False):
+                await interaction.response.send_message("❌ You're AFK — run `/poker afk` to come back.", ephemeral=True)
+                return
             if chosen_action == "allin":
                 await interaction.response.send_message(
                     "❌ You cannot queue an 'All-In' as a premove. You must wait for your turn!", ephemeral=True)
@@ -8900,6 +9023,13 @@ class PremoveView(discord.ui.View):
         super().__init__(timeout=120)
         self.t = t
         self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        p = self.t.game.get_player(self.user_id)
+        if p and getattr(p, "premove_sticky", False):
+            await interaction.response.send_message("❌ You're AFK — run `/poker afk` to come back.", ephemeral=True)
+            return False
+        return True
 
     def _append(self, move: dict) -> bool:
         p = self.t.game.get_player(self.user_id)

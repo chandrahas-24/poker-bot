@@ -470,6 +470,8 @@ class GameState:
         raw_bets = d.get("bets") or {}
         self.bets = {int(k): v for k, v in raw_bets.items()}
         self.left_early = set(int(pid) for pid in d.get("left_early", []))
+        self.table_id = d.get("table_id")
+        self.round_num = d.get("round_num", 0)
         self.round_uuid = d.get("round_uuid") or str(uuid.uuid4())  # fallback covers saves written before this field existed
         self._turn_counter = d.get("turn_counter", 0)
         self.turn_events = []  # buffer is ephemeral, never persisted — see the comment on __init__'s definition
@@ -668,12 +670,20 @@ class GameState:
             self.current_index %= len(self.players)
 
         if owed_color_left:
-            # the departing player owed a color choice — resolve it with a
-            # random color (same as a Wild color timeout) so the discard
-            # pile's top card and current_color stay in agreement.
+            # The departing player owed a color choice for a Wild / Wild
+            # Draw 4. Treat it as if they were simply skipped: the wild is
+            # taken back off the top of the discard pile (into the draw
+            # pile, so card count stays intact), so the previous card is on
+            # top again. current_color was never changed by the pending
+            # wild, so it already matches that card. No color pick, no
+            # challenge, no draw.
+            card = self.pending_wild_card
+            if card and len(self.discard_pile) > 1 and self.discard_pile[-1] == card:
+                self.discard_pile.pop()
+                self.draw_pile.append(card)
+                random.shuffle(self.draw_pile)
             self.pending_wild = False
             self.pending_wild_card = None
-            self.current_color = random.choice(COLORS)
 
         self._check_win()
 
@@ -903,7 +913,10 @@ class GameState:
             # pre-arm from before no longer applies.
             player.armed_uno = False
         self.record_action(player_id)
-        self.draw2_chain_count = 0  # voluntarily drawing instead of playing a Draw_2 breaks the chain
+        # NOTE: the Draw_2 chain is deliberately NOT reset here — a drawn +2
+        # that gets played right away must continue the chain. The chain
+        # breaks in pass_turn() (drew and kept/passed) or when another card
+        # type is played.
         self.last_summary = f"{player.name} drew a card."
 
         still_playable = self.is_legal(player, card)
@@ -917,6 +930,7 @@ class GameState:
             raise NotYourTurn(f"It is not player {player_id}'s turn")
         if self.pending_wd4_challenge:
             raise IllegalCard("Waiting on the targeted player to accept or challenge the Wild Draw Four")
+        self.draw2_chain_count = 0  # drew and passed instead of continuing the Draw_2 chain
         self.current_index = self._offset(1)
         self._log_event("pass", player_id, player.name, hand_size_after=len(player.hand))
 
@@ -1089,9 +1103,9 @@ class GameState:
     # opponent up to the winner's OWN bet — anything an opponent put up
     # beyond that was never actually at risk and simply stays theirs
     # (it carries over as their leftover on the table). Players who
-    # quit/were removed mid-round (left_early) are treated like any other
-    # opponent: they lose min(their bet, winner's bet), same as if they'd
-    # played it out and lost.
+    # quit/were removed mid-round (left_early) are the exception: they
+    # forfeit their ENTIRE bet to the winner, even the part above the
+    # winner's own bet (free chips in the pot).
 
     @staticmethod
     def _ceil_tax(gain: int, rate) -> int:
@@ -1106,7 +1120,8 @@ class GameState:
         """Pure money math for a finished round — no DB, no side effects.
         Returns {pid: {bet, change, tax, net, new_bet, winner, left}}:
           change  = pre-tax delta (winner +sum of what they collect,
-                    everyone else -min(their bet, winner's bet))
+                    everyone else -min(their bet, winner's bet), except
+                    left_early players who lose their whole bet)
           tax     = winners tax on the winner's profit only
           net     = change - tax (what actually hits their table amount)
           new_bet = bet + net, i.e. what's left on the table for them
@@ -1116,7 +1131,13 @@ class GameState:
         w_bet = self.bets.get(w, 0) if w is not None else 0
         collected = 0
         for pid, bet in self.bets.items():
-            loss = min(bet, w_bet) if (w is not None and pid != w) else 0
+            if w is not None and pid != w:
+                # Quit / kicked / banned / AFK-removed players forfeit their
+                # ENTIRE bet to the winner, even above the winner's own bet.
+                # Everyone else only risks min(their bet, winner's bet).
+                loss = bet if pid in self.left_early else min(bet, w_bet)
+            else:
+                loss = 0
             collected += loss
             out[pid] = {"bet": bet, "change": -loss, "tax": 0, "net": -loss,
                         "new_bet": bet - loss, "winner": False, "left": pid in self.left_early}

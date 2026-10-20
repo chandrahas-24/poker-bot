@@ -976,6 +976,38 @@ async def table_cash_out(user_id: int, username: str = "Unknown Player") -> int:
         return amount
 
 
+async def forfeit_to_house(entries: list[tuple[int, str, int]], table_id: str | None = None,
+                           round_num: int | None = None, round_uuid: str | None = None,
+                           description: str = "UNO forfeit") -> int:
+    """Voided-round forfeits (table closed mid-round / everyone left): each
+    departed player's locked table amount is removed from chips_in_play and
+    booked to house_revenue (source='forfeit') — NOT refunded. One
+    transaction. entries: [(user_id, username, amount)]. Returns the total
+    forfeited."""
+    entries = [(uid, name, amt) for uid, name, amt in entries if amt > 0]
+    if not entries:
+        return 0
+    db = await _get_db()
+    ts = datetime.utcnow().isoformat()
+    total = 0
+    async with _write_lock:
+        try:
+            for uid, _name, amt in entries:
+                await db.execute("DELETE FROM chips_in_play WHERE user_id=?", (uid,))
+                await db.execute("""
+                    INSERT INTO currency_log (user_id, event_type, amount, description, ts, table_id, round_num, round_uuid)
+                    VALUES (?, 'Forfeit', ?, ?, ?, ?, ?, ?)
+                """, (uid, -amt, description, ts, table_id, round_num, round_uuid))
+                await db.execute("INSERT INTO house_revenue (ts, amount, source, table_id, round_num, round_uuid) "
+                                 "VALUES (?, ?, 'forfeit', ?, ?, ?)", (ts, amt, table_id, round_num, round_uuid))
+                total += amt
+            await db.commit()
+            return total
+        except Exception:
+            await db.rollback()
+            raise
+
+
 async def round_exists(round_uuid: str) -> bool:
     """True if this round's settlement has already been applied."""
     db = await _get_db()

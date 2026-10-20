@@ -408,12 +408,13 @@ class Seat:
 
     def to_dict(self):
         return {"name": self.name, "bet": self.bet, "in_round": self.in_round,
-                "leave_queued": self.leave_queued, "quit": self.quit, "missed_turns": self.missed_turns}
+                "leave_queued": self.leave_queued, "quit": self.quit, "missed_turns": self.missed_turns,
+                "exit_reason": self.exit_reason}
 
     @classmethod
     def from_dict(cls, d):
         return cls(d["name"], int(d["bet"]), d.get("in_round", False), d.get("leave_queued", False),
-                   d.get("quit", False), d.get("missed_turns", 0))
+                   d.get("quit", False), d.get("missed_turns", 0), d.get("exit_reason"))
 
 
 class GameSession:
@@ -442,6 +443,12 @@ class GameSession:
         # Host does NOT auto-join — a pid only ever appears in `seats` once
         # it has put a bet on the table.
         self.seats: dict[int, Seat] = {}
+        # Players who quit / were kicked / banned / AFK-removed MID-ROUND.
+        # They no longer hold a seat (the slot is free immediately), but
+        # their bet stays locked in chips_in_play until the round settles —
+        # it is forfeited whole to the winner (or to the house if the round
+        # is voided / the table is closed). Never refunded.
+        self.departed: dict[int, Seat] = {}
         self.engine: ue.GameState | None = None
         self.table_message: discord.Message | None = None
         self.lobby_message: discord.Message | None = None  # the join/bet panel
@@ -542,6 +549,7 @@ class GameSession:
             "round_num": self.round_num,
             "state": self.state,
             "seats": {str(pid): seat.to_dict() for pid, seat in self.seats.items()},
+            "departed": {str(pid): seat.to_dict() for pid, seat in self.departed.items()},
             "engine": self.engine.to_dict() if self.engine else None,
             "msg_count": self.msg_count,
             "last_action": self.last_action,
@@ -577,6 +585,13 @@ class GameSession:
                                            quit=pid in self.engine.left_early)
             self.state = "playing"
             self.round_num = 1
+        # Forfeited seats (see __init__). Saves written before this existed kept
+        # quit players in `seats` until settlement — migrate them over.
+        self.departed = {int(k): Seat.from_dict(v) for k, v in d.get("departed", {}).items()}
+        if self.engine:
+            for pid in list(self.seats):
+                if pid in self.engine.left_early:
+                    self.departed[pid] = self.seats.pop(pid)
         self.closed = False
         self.table_message = None
         self.lobby_message = None
@@ -937,6 +952,9 @@ class BetModal(discord.ui.Modal):
                 if seat:
                     await deny("You're already seated — use **Change bet** instead.")
                     return
+                if uid in s.departed:
+                    await deny("⏳ Your forfeited bet is still being settled — you can rejoin once this round ends.")
+                    return
                 if await db.is_banned(interaction.guild_id, uid):
                     await deny("🚫 You're banned from UNO in this server.")
                     return
@@ -1067,19 +1085,6 @@ class TablePanelView(discord.ui.View):
                 return
             await interaction.response.defer()
             await self.cog.begin_round(s, interaction.channel)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can cancel the lobby.", ephemeral=True)
-            return
-        s = self.session
-        async with s.lock:
-            if s.closed or s.state != "lobby":
-                await interaction.response.send_message("This game has already started.", ephemeral=True)
-                return
-            await interaction.response.defer()
-            await self.cog.close_table(s, "Lobby cancelled — all bets were refunded.")
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         await report_component_error(interaction, error, item, "TablePanelView")
@@ -1513,6 +1518,13 @@ class TableView(discord.ui.LayoutView):
         player = engine.player_by_id(interaction.user.id)
         if not player:
             await interaction.response.send_message("You're not in this game.", ephemeral=True)
+            return
+
+        if engine.pending_wild and engine.current_player().player_id == interaction.user.id:
+            # Owes a color choice but the ephemeral picker is gone (e.g. the
+            # bot was resumed from a save) — hand it back.
+            await interaction.response.send_message(
+                "Choose a color for your Wild:", view=ColorButtonsView(self.cog, session, interaction), ephemeral=True)
             return
 
         if len(player.hand) > MAX_BUTTONS_TOTAL:
@@ -2286,6 +2298,27 @@ class UnoGame(commands.Cog):
             amount = await db.table_cash_out(pid, seat.name)
             await self._log_seat(session, pid, seat.name, "closed", amount, "table closed — bets returned to wallet")
             refunds.append(f"<@{pid}> — **{amount}** {config.UNO_CHIP_EMOJI}")
+        forfeit_lines = []
+        if session.departed:
+            round_uuid = session.engine.round_uuid if session.engine else None
+            entries = []
+            for pid, seat in list(session.departed.items()):
+                entries.append((pid, seat.name, await db.get_table_amount(pid)))
+            try:
+                await db.forfeit_to_house(entries, session.table_id, session.round_num, round_uuid,
+                                          "UNO table closed — forfeited to house")
+            except Exception:
+                log.exception("Failed to book forfeits to house while closing channel %s", session.channel_id)
+            forfeits = []
+            for pid, name, amt in entries:
+                if amt <= 0:
+                    continue
+                reason = session.departed[pid].exit_reason or "removed"
+                await self._log_seat(session, pid, name, "forfeit_house", amt, "table closed — forfeited to house")
+                forfeit_lines.append(f"<@{pid}> — **{amt}** {config.UNO_CHIP_EMOJI} (forfeited)")
+                forfeits.append((pid, name, amt, reason))
+            session.departed.clear()
+            await self._log_forfeits(session, forfeits, "the house (table closed)", session.round_num)
         await self._log_table(session, "close", detail=(message or "")[:200])
         session.seats.clear()
         if self.sessions.get(session.channel_id) is session:
@@ -2299,6 +2332,8 @@ class UnoGame(commands.Cog):
         channel = self.bot.get_channel(session.channel_id)
         if channel and message:
             text = message + ("\n" + "\n".join(refunds) if refunds else "")
+            if forfeit_lines:
+                text += "\n**Forfeited to the house (left mid-round):**\n" + "\n".join(forfeit_lines)
             try:
                 await channel.send(text, allowed_mentions=discord.AllowedMentions(users=True))
             except discord.HTTPException:
@@ -2351,20 +2386,33 @@ class UnoGame(commands.Cog):
             await self._after_seat_change(session, interaction.channel)
 
     async def _drop_from_round(self, session: GameSession, pid: int, reason: str) -> bool:
-        """Removes a player from the round in progress (quit / kicked / left
-        the server). Their seat stays until the round settles — their bet
-        is forfeited like any other loss — then settlement cashes it out.
-        Returns False if they weren't an active player. Caller holds the lock."""
+        """Removes a player from the round in progress (quit / kicked / banned /
+        left the server). Their seat is freed right away and their whole bet
+        is forfeited at settlement. Returns False if they weren't an active
+        player. Caller holds the lock."""
         engine = session.engine
         seat = session.seats.get(pid)
         if not (engine and seat and seat.in_round and not engine.finished and engine.player_by_id(pid)):
             return False
         engine.remove_player(pid, reason=reason)
+        await self._mark_departed(session, pid, reason)
+        return True
+
+    async def _mark_departed(self, session: GameSession, pid: int, reason: str):
+        """Frees a player's seat immediately after they were removed from the
+        round in progress (engine.remove_player already ran). Their bet stays
+        locked in chips_in_play until settlement, which forfeits it to the
+        winner (or the house) — see _settle_round / close_table. Caller holds
+        the lock."""
+        seat = session.seats.pop(pid, None)
+        if not seat:
+            return
         seat.quit = True
         seat.exit_reason = reason
+        session.departed[pid] = seat
         await self._log_seat(session, pid, seat.name, {"kicked": "kick"}.get(reason, reason), seat.bet,
-                             "bet forfeited, seat cashed out when the round settles")
-        return True
+                             "bet forfeited, seat freed immediately")
+        await self.refresh_panel(session, create=False)
 
     async def announce_and_cleanup(self, session: GameSession):
         """Called once a round has ended: settles the money, posts the
@@ -2415,6 +2463,26 @@ class UnoGame(commands.Cog):
             return
         await self.open_window(session, channel)
 
+    async def _log_forfeits(self, session: GameSession, forfeits: list[tuple[int, str, int, str]],
+                            dest: str, round_n: int):
+        """Posts forfeited bets (quit / kick / ban / AFK, or chips left on a
+        closed table) to the configured log channel. Best-effort."""
+        if not forfeits:
+            return
+        try:
+            settings = await db.get_settings(session.guild_id)
+            log_channel_id = settings.get("log_channel_id")
+            log_channel = self.bot.get_channel(int(log_channel_id)) if log_channel_id else None
+            if not log_channel:
+                return
+            total = sum(amt for _, _, amt, _ in forfeits)
+            rows = "\n".join(f"  {name} ({pid}): Forfeited: {amt}  Reason: {reason}"
+                             for pid, name, amt, reason in forfeits)
+            header = f"Forfeit | Round #{round_n} | ({session.table_id}) | Total: {total} -> {dest}"
+            await log_channel.send(f"```\n{header}\n{rows}\n```")
+        except Exception:
+            log.exception("Failed to post forfeit log for channel %s", session.channel_id)
+
     async def _settle_round(self, session: GameSession, channel, engine: ue.GameState) -> discord.Embed:
         """Applies the finished round (one DB transaction, idempotent on
         round_uuid), updates the seats from the result, cashes out anyone
@@ -2449,6 +2517,25 @@ class UnoGame(commands.Cog):
         except Exception:
             log.exception("Failed to flush turn log for channel %s", session.channel_id)
 
+        # Players who quit / were kicked / banned / AFK-removed mid-round are in
+        # session.departed, not session.seats: their whole bet was forfeited
+        # (to the winner via compute_settlement — apply_round_settlement then
+        # deletes their chips_in_play row — or to the house if nobody won).
+        departed = dict(session.departed)
+        forfeits: list[tuple[int, str, int, str]] = []  # (pid, name, amount, reason)
+        if winner is None and departed:
+            house_entries = []
+            for pid, seat in departed.items():
+                amt = await db.get_table_amount(pid)  # 0 on a replayed settlement
+                house_entries.append((pid, seat.name, amt))
+            await db.forfeit_to_house(house_entries, session.table_id, n, engine.round_uuid,
+                                      f"UNO round #{n} voided — forfeited to house")
+            forfeits = [(pid, name, amt, departed[pid].exit_reason or "removed") for pid, name, amt in house_entries]
+        else:
+            for pid, seat in departed.items():
+                r = results.get(pid)
+                forfeits.append((pid, seat.name, r["bet"] if r else seat.bet, seat.exit_reason or "removed"))
+
         leaving: set[int] = set()
         for pid in engine.bets:
             seat = session.seats.get(pid)
@@ -2458,19 +2545,14 @@ class UnoGame(commands.Cog):
             seat.bet = await db.get_table_amount(pid)
             player = engine.player_by_id(pid)
             seat.missed_turns = player.missed_turns if player else 0
-            if seat.quit or seat.leave_queued or pid in engine.left_early:
+            if seat.leave_queued:  # queued Leave: treated as a normal player all round, cashed out now
                 leaving.add(pid)
         for pid in leaving:
             seat = session.seats.pop(pid, None)
             if seat:
                 returned = await db.table_cash_out(pid, seat.name)
-                if seat.exit_reason:  # quit / kicked / left_guild
-                    why = seat.exit_reason
-                elif pid in engine.left_early:  # removed by the AFK timer
-                    why = "afk_kick"
-                else:  # queued Leave
-                    why = "leave"
-                await self._log_seat(session, pid, seat.name, "cashed_out", returned, why)
+                await self._log_seat(session, pid, seat.name, "cashed_out", returned, "leave")
+        session.departed.clear()
         self._save_session(session)
 
         settings = await db.get_settings(session.guild_id)
@@ -2488,16 +2570,24 @@ class UnoGame(commands.Cog):
                     await log_channel.send(f"```\n{header}\n{rows}\n```")
                 except discord.HTTPException:
                     pass
+        if forfeits:
+            dest = (f"winner {engine.all_names.get(winner, winner)}" if winner is not None else "the house (round voided)")
+            await self._log_forfeits(session, forfeits, dest, n)
 
         if winner is None:
             return discord.Embed(title=f"Round {n} voided",
-                                 description="Everyone left — no bets changed hands.", color=discord.Color.light_grey())
+                                 description=("Everyone left — all bets were forfeited to the house." if forfeits
+                                              else "Everyone left — no bets changed hands."),
+                                 color=discord.Color.light_grey())
         embed = discord.Embed(title=f"<:uno_trophy:1536135332863676548> Round {n} complete", color=discord.Color.gold())
         ordered = sorted(results.items(), key=lambda kv: (not kv[1]["winner"], -kv[1]["net"]))
         lines = []
         for pid, r in ordered:
             medal = f"{PLACEMENT_EMOJI.get(0, '')} " if r["winner"] else ""
             sign = "+" if r["net"] >= 0 else ""
+            if pid in departed:
+                lines.append(f"{_mention(pid)} **{sign}{r['net']}** {config.UNO_CHIP_EMOJI} → forfeited (left mid-round)")
+                continue
             where = "returned to wallet" if pid in leaving else "on the table"
             lines.append(f"{medal}{_mention(pid)} **{sign}{r['net']}** {config.UNO_CHIP_EMOJI} → "
                          f"**{r['new_bet']}** {where}")
@@ -2880,9 +2970,21 @@ class UnoGame(commands.Cog):
                     target_id = engine.pending_wd4_challenge["target_id"]
                     engine.accept_wild_draw4(target_id)
                     session.last_action = {"type": "wd4_timeout_accept", "actor_id": target_id}
+                elif engine.pending_wild:
+                    # The current player owes a color for a Wild / Wild Draw 4
+                    # (e.g. after a /uno resume lost the ephemeral picker, or
+                    # the turn timer fired first). Auto-pick one instead of
+                    # record_timeout(), which would advance the turn while
+                    # pending_wild stays set and soft-lock the game.
+                    wild_pid = engine.current_player().player_id
+                    wild_color = random.choice(ue.COLORS)
+                    wild_effects = engine.choose_color(wild_pid, wild_color)
+                    session.last_action = {"type": "color", "actor_id": wild_pid,
+                                           "color": wild_color, "effects": wild_effects}
                 else:
                     result = engine.record_timeout()
                     if result["kicked"]:
+                        await self._mark_departed(session, result["player_id"], "afk_kick")
                         session.last_action = {"type": "timeout_kick", "actor_id": result["player_id"]}
                     else:
                         session.last_action = {"type": "timeout_draw", "actor_id": result["player_id"]}
@@ -3393,6 +3495,9 @@ class UnoGame(commands.Cog):
         await interaction.response.send_message(
             f"🚫 Banned **{user.mention}** from UNO." + (f"\n> {reason}" if reason else ""),
             allowed_mentions=discord.AllowedMentions(users=True))
+        # A ban also removes them from any table they're seated at (mid-round: bet forfeited).
+        await self._remove_member_everywhere(interaction.guild_id, user.id, "was banned from UNO",
+                                             engine_reason="banned")
 
     @unomgr.command(name="unban", description="[Manager] Unban a user from UNO")
     @app_commands.describe(user="Player to unban")
@@ -4265,7 +4370,8 @@ class UnoGame(commands.Cog):
                 elif session.state in ("lobby", "window", "waiting"):
                     await self.post_panel(session, message.channel)
 
-    async def _remove_member_everywhere(self, guild_id: int, user_id: int, reason: str):
+    async def _remove_member_everywhere(self, guild_id: int, user_id: int, reason: str,
+                                        engine_reason: str = "left_guild"):
         for session in list(self.sessions.values()):
             if session.guild_id != guild_id or user_id not in session.seats:
                 continue
@@ -4276,7 +4382,7 @@ class UnoGame(commands.Cog):
                 channel = self.bot.get_channel(session.channel_id)
                 if session.state == "playing" and seat.in_round:
                     engine = session.engine
-                    if await self._drop_from_round(session, user_id, reason="left_guild"):
+                    if await self._drop_from_round(session, user_id, reason=engine_reason):
                         if channel:
                             await channel.send(f"👋 A player {reason} and was removed from the game — their bet is forfeited.")
                         if engine.finished:
@@ -4288,7 +4394,7 @@ class UnoGame(commands.Cog):
                             await self.refresh_table(session)
                     continue
                 amount = await db.table_cash_out(user_id, seat.name)
-                await self._log_seat(session, user_id, seat.name, "left_guild", amount,
+                await self._log_seat(session, user_id, seat.name, engine_reason, amount,
                                      "between rounds — returned to wallet")
                 del session.seats[user_id]
                 if channel:
@@ -4300,7 +4406,7 @@ class UnoGame(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
-        await self._remove_member_everywhere(guild.id, user.id, "was banned")
+        await self._remove_member_everywhere(guild.id, user.id, "was banned", engine_reason="banned")
 
 
     # ---------------- global slash-command error handler ----------------

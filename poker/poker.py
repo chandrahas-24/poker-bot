@@ -916,6 +916,11 @@ async def _auto_next_hand(t: TableState, channel):
 
     t.msg_count = 0
     await refresh(channel, t, new_hand=True, cosmetics_cache=t.cosmetics_cache)
+    # We ARE t.auto_task. Resolving a hand cancels/replaces t.auto_task (_lock_in_hand_result, scheduling the
+    # next hand), which would cancel this very task mid-resolution (e.g. heads-up: the AFK first actor folds
+    # and ends the hand instantly). Detach first.
+    if t.auto_task is asyncio.current_task():
+        t.auto_task = None
     await _fire_sticky_premove(channel.guild, channel, t)  # AFK player acting first
 
 async def _silent_strip_view(msg: discord.Message):

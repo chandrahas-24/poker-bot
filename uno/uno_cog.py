@@ -1189,8 +1189,8 @@ class ColorButtonsView(discord.ui.View):
                                          "color": color, "effects": effects}
             self.stop()
             await interaction.response.edit_message(content=f"Color set to **{color}**.", view=None)
+            self.cog.restart_timer(self.session)  # before the render so the table shows the NEW turn deadline
             await self.cog.refresh_table(self.session)
-            self.cog.restart_timer(self.session)
             if engine.finished:
                 await self.cog.announce_and_cleanup(self.session)
 
@@ -1235,8 +1235,8 @@ class ColorButtonsView(discord.ui.View):
                     )
                 except discord.HTTPException:
                     pass
+            self.cog.restart_timer(self.session)  # before the render so the table shows the NEW turn deadline
             await self.cog.refresh_table(self.session)
-            self.cog.restart_timer(self.session)
             if engine.finished:
                 await self.cog.announce_and_cleanup(self.session)
 
@@ -1974,8 +1974,8 @@ class UnoGame(commands.Cog):
                     await self.announce_and_cleanup(session)
                 elif engine:
                     session.state = "playing"
+                    self.restart_timer(session)  # before the render so the table shows a fresh deadline
                     await self.post_table(session, interaction.channel)
-                    self.restart_timer(session)
                 elif session.state == "lobby":
                     await self.post_panel(session, interaction.channel)
                 else:
@@ -2275,8 +2275,8 @@ class UnoGame(commands.Cog):
         session.callout_balance = {}
         session._last_turn_player_id = None
         await self._retire_panel(session)
+        self.restart_timer(session)  # before the render: otherwise the table shows the previous round's stale turn_started_at
         await self.post_table(session, channel)  # also checkpoints the table
-        self.restart_timer(session)
 
     async def close_table(self, session: GameSession, message: str | None):
         """Tears a table down and gives every seat everything it has on the

@@ -205,6 +205,34 @@ async def report_component_error(interaction: discord.Interaction, error: Except
         pass
 
 
+# How long ephemeral notices that people DO need to read (errors, "you drew X")
+# stay up before deleting themselves — so nobody has to dismiss them by hand,
+# which is what kept landing clicks on the Callout button underneath.
+ERR_TTL = 6
+
+
+async def silent_ack(interaction: discord.Interaction):
+    """Acknowledge an interaction leaving NOTHING on screen — for actions
+    whose result is already visible on the public table message, so a private
+    "You played X" reply would only be something to dismiss.
+
+    - Button on an ephemeral message (hand picker, draw follow-up, color
+      picker): ack and delete that message, since it's spent.
+    - Button on the public table message: just ack — never delete it.
+    - Slash command / modal submit: defer then delete the placeholder."""
+    try:
+        if interaction.type is discord.InteractionType.component:
+            await interaction.response.defer()
+            msg = interaction.message
+            if msg is not None and msg.flags.ephemeral:
+                await interaction.delete_original_response()
+        else:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.delete_original_response()
+    except discord.HTTPException:
+        pass
+
+
 # MAX_BUTTONS_TOTAL is imported from unodemo (both are Discord's 5x5 = 25 button ceiling)
 
 COLOR_TO_DISCORD = {
@@ -1017,7 +1045,6 @@ class TablePanelView(discord.ui.View):
             # Start / Cancel only exist before round 1 — after that rounds
             # start themselves and staff use /uno close.
             self.remove_item(self.start)
-            self.remove_item(self.cancel)
         cog._track_view(self)
 
     async def on_timeout(self):
@@ -1111,6 +1138,7 @@ class DrawFollowupView(discord.ui.View):
         self.session = session
         self.card = card
         self.player_id = player_id
+        self.origin: discord.Interaction | None = None  # the interaction whose reply this view is (set by handle_draw_card)
         cog._track_view(self)
 
     async def _keep_and_pass(self, player_id: int):
@@ -1142,14 +1170,19 @@ class DrawFollowupView(discord.ui.View):
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         engine = self.session.engine
         if not engine or engine.finished or engine.current_player().player_id != interaction.user.id:
-            await interaction.response.send_message("⚠️ Too late for that.", ephemeral=True)
+            await interaction.response.send_message("⚠️ Too late for that.", ephemeral=True, delete_after=ERR_TTL)
             return
         self.stop()
-        await interaction.response.edit_message(content=f"You drew **{self.card}** and kept it.", view=None)
+        await silent_ack(interaction)  # deletes this follow-up; the table message shows the turn moved on
         await self._keep_and_pass(interaction.user.id)
 
     async def on_timeout(self):
         await self._keep_and_pass(self.player_id)
+        if self.origin is not None:  # take the unanswered follow-up down
+            try:
+                await self.origin.delete_original_response()
+            except discord.HTTPException:
+                pass
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         await report_component_error(interaction, error, item, "DrawFollowupView")
@@ -1174,7 +1207,18 @@ class ColorButtonsView(discord.ui.View):
         # ephemeral messages don't give us a discord.Message to edit later,
         # but the interaction token stays valid long enough for this.
         self.interaction = interaction
+        self.message = None  # set when the picker was sent as a followup (see handle_play_card)
         cog._track_view(self)
+
+    async def _remove_picker(self):
+        """Deletes the ephemeral picker (it's spent or expired)."""
+        try:
+            if self.message is not None:
+                await self.message.delete()
+            elif self.interaction is not None:
+                await self.interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
 
     async def _choose(self, interaction: discord.Interaction, color: str):
         async with self.session.lock:
@@ -1182,13 +1226,13 @@ class ColorButtonsView(discord.ui.View):
             try:
                 effects = engine.choose_color(interaction.user.id, color)
             except ue.UnoError as e:
-                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             self.session.last_action = {"type": "color", "actor_id": interaction.user.id,
                                          "color": color, "effects": effects}
             self.stop()
-            await interaction.response.edit_message(content=f"Color set to **{color}**.", view=None)
+            await silent_ack(interaction)  # deletes the picker; the table message shows the new color
             self.cog.restart_timer(self.session)  # before the render so the table shows the NEW turn deadline
             await self.cog.refresh_table(self.session)
             if engine.finished:
@@ -1211,6 +1255,7 @@ class ColorButtonsView(discord.ui.View):
         await self._choose(interaction, "Blue")
 
     async def on_timeout(self):
+        await self._remove_picker()  # expired picker shouldn't linger either way
         async with self.session.lock:
             engine = self.session.engine
             if not engine or engine.finished or not engine.pending_wild:
@@ -1226,15 +1271,6 @@ class ColorButtonsView(discord.ui.View):
             self.session.last_action = {"type": "color", "actor_id": player_id,
                                          "color": color, "effects": effects}
             self.stop()
-            for child in self.children:
-                child.disabled = True
-            if self.interaction is not None:
-                try:
-                    await self.interaction.edit_original_response(
-                        content=f"<a:bay_alarm:1536288829248512030> No color chosen in time — randomly set to **{color}**.", view=None,
-                    )
-                except discord.HTTPException:
-                    pass
             self.cog.restart_timer(self.session)  # before the render so the table shows the NEW turn deadline
             await self.cog.refresh_table(self.session)
             if engine.finished:
@@ -1512,12 +1548,12 @@ class TableView(discord.ui.LayoutView):
     async def _play(self, interaction: discord.Interaction):
         session = self._guard()
         if not session:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
         engine = session.engine
         player = engine.player_by_id(interaction.user.id)
         if not player:
-            await interaction.response.send_message("You're not in this game.", ephemeral=True)
+            await interaction.response.send_message("You're not in this game.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         if engine.pending_wild and engine.current_player().player_id == interaction.user.id:
@@ -1582,14 +1618,14 @@ class TableView(discord.ui.LayoutView):
     async def _hand(self, interaction: discord.Interaction):
         session = self._guard()
         if not session:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
         await self.cog.send_hand_view(interaction, session, interaction.user.id)
 
     async def _draw(self, interaction: discord.Interaction):
         session = self._guard()
         if not session:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
         await self.cog.handle_draw_card(interaction, session)
 
@@ -1630,12 +1666,12 @@ class TableView(discord.ui.LayoutView):
             description="\n".join(lines) or "_no active players_",
             color=discord.Color.blurple(),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True, delete_after=15)
 
     async def _callout(self, interaction: discord.Interaction):
         session = self._guard()
         if not session:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
         engine = session.engine
 
@@ -1646,7 +1682,7 @@ class TableView(discord.ui.LayoutView):
                 if not pc or interaction.user.id != pc["target_id"]:
                     await interaction.response.send_message(
                         f"⚠️ Waiting on {_mention(pc['target_id']) if pc else 'someone'} to accept or challenge the Wild Draw Four.",
-                        ephemeral=True,
+                        ephemeral=True, delete_after=ERR_TTL,
                     )
                     return
                 result = engine.challenge_wild_draw4(interaction.user.id)
@@ -2605,35 +2641,35 @@ class UnoGame(commands.Cog):
         four behave identically. drew_first just changes the wording to
         make clear this was a drew-then-played turn, not a plain play."""
         if not self._is_live(session):
-            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         engine = session.engine
         if not engine:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         async with session.lock:
             if not self._is_live(session) or session.engine is not engine or engine.finished:
-                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
                 return
             if engine.current_player().player_id != interaction.user.id:
-                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             pd = self._pending_draw_for(session, interaction.user.id)
             if pd and card != pd["card"]:
                 await interaction.response.send_message(
-                    f"⚠️ You drew **{pd['card']}** — you can only play that card or keep it.", ephemeral=True)
+                    f"⚠️ You drew **{pd['card']}** — you can only play that card or keep it.", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             try:
                 effects = engine.play_card(interaction.user.id, card)
             except ue.IllegalCard as e:
-                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True, delete_after=ERR_TTL)
                 return
             except ue.NotYourTurn:
-                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             if pd:
@@ -2656,15 +2692,25 @@ class UnoGame(commands.Cog):
                 session.cancel_timer()
                 view = ColorButtonsView(self, session, interaction)
                 msg = "You drew and played a Wild — choose a color:" if drew_first else "Choose a color for your Wild:"
-                await interaction.response.send_message(msg, view=view, ephemeral=True)
+                src = interaction.message if interaction.type is discord.InteractionType.component else None
+                if src is not None and src.flags.ephemeral:
+                    # Replace the spent hand / follow-up message with the picker
+                    # instead of stacking a second ephemeral on top of it.
+                    try:
+                        await interaction.response.defer()
+                        await interaction.delete_original_response()
+                        view.message = await interaction.followup.send(msg, view=view, ephemeral=True, wait=True)
+                    except discord.HTTPException:
+                        self.restart_timer(session)  # no picker to wait on — let the timer auto-pick
+                else:
+                    await interaction.response.send_message(msg, view=view, ephemeral=True)
                 if fired_uno:
                     await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
                 return
 
             session.last_action = {"type": "play", "actor_id": interaction.user.id, "card": card,
                                     "effects": effects, "drew_first": drew_first}
-            confirm = f"You drew and played **{card}**!" if drew_first else f"You played **{card}**."
-            await interaction.response.send_message(confirm, ephemeral=True)
+            await silent_ack(interaction)  # the table message already shows the play
             self.restart_timer(session)
             await self.refresh_table(session)
             if fired_uno:
@@ -2677,40 +2723,40 @@ class UnoGame(commands.Cog):
         legally be played, offers a Play-this-card/No follow-up instead of
         always ending the turn outright."""
         if not self._is_live(session):
-            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         engine = session.engine
         if not engine:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         async with session.lock:
             if not self._is_live(session) or session.engine is not engine or engine.finished:
-                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
                 return
             if engine.pending_wd4_challenge:
                 pc = engine.pending_wd4_challenge
                 if interaction.user.id != pc["target_id"]:
                     await interaction.response.send_message(
                         f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
-                        ephemeral=True,
+                        ephemeral=True, delete_after=ERR_TTL,
                     )
                     return
                 engine.accept_wild_draw4(interaction.user.id)
                 session.last_action = {"type": "wd4_accept", "actor_id": interaction.user.id}
-                await interaction.response.send_message("You accepted the Wild Draw Four and drew 4 cards.", ephemeral=True)
+                await silent_ack(interaction)  # the table message already says they accepted
                 self.restart_timer(session)
                 await self.refresh_table(session)
                 return
 
             if engine.current_player().player_id != interaction.user.id:
-                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True)
+                await interaction.response.send_message("⚠️ It's not your turn.", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             if self._pending_draw_for(session, interaction.user.id):
                 await interaction.response.send_message(
-                    "⚠️ Decide on the card you just drew first — play it or keep it.", ephemeral=True)
+                    "⚠️ Decide on the card you just drew first — play it or keep it.", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             result = engine.draw_card(interaction.user.id)
@@ -2724,11 +2770,13 @@ class UnoGame(commands.Cog):
                 session.cancel_timer()
                 view = DrawFollowupView(self, session, drawn, interaction.user.id)
                 await interaction.response.send_message(f"You drew **{drawn}**. Play it?", view=view, ephemeral=True)
+                view.origin = interaction
                 return  # turn stays open until they pick Play/No — no refresh/restart yet
 
             engine.pass_turn(interaction.user.id)
             session.last_action = {"type": "draw", "actor_id": interaction.user.id}
-            await interaction.response.send_message(f"You drew **{drawn}**.", ephemeral=True)
+            # Kept (not silent): which card you drew isn't shown anywhere else.
+            await interaction.response.send_message(f"You drew **{drawn}**.", ephemeral=True, delete_after=ERR_TTL)
             self.restart_timer(session)
             await self.refresh_table(session)
 
@@ -2746,32 +2794,32 @@ class UnoGame(commands.Cog):
         messages.
         """
         if not self._is_live(session):
-            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         engine = session.engine
         if not engine:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
         if engine.player_by_id(interaction.user.id) is None:
-            await interaction.response.send_message("Only active players can call someone out.", ephemeral=True)
+            await interaction.response.send_message("Only active players can call someone out.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         async with session.lock:
             if not self._is_live(session) or session.engine is not engine or engine.finished:
-                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
                 return
             balance = session.callout_balance.get(interaction.user.id, 1)
             if balance <= 0:
                 await interaction.response.send_message(
-                    "⚠️ You're out of callout attempts until your turn comes back around.", ephemeral=True
+                    "⚠️ You're out of callout attempts until your turn comes back around.", ephemeral=True, delete_after=ERR_TTL
                 )
                 return
 
             try:
                 result = engine.challenge_uno_auto(interaction.user.id)
             except ue.UnoError as e:
-                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             if result["penalty_to_accuser"]:
@@ -2807,39 +2855,39 @@ class UnoGame(commands.Cog):
             announcement right now.
         """
         if not self._is_live(session):
-            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         engine = session.engine
         if not engine:
-            await interaction.response.send_message("No active game here.", ephemeral=True)
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
 
         async with session.lock:
             if not self._is_live(session) or session.engine is not engine or engine.finished:
-                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
                 return
             player = engine.player_by_id(interaction.user.id)
             if not player or len(player.hand) not in (1, 2):
-                await interaction.response.send_message("⚠️ You don't have 1 or 2 cards left.", ephemeral=True)
+                await interaction.response.send_message("⚠️ You don't have 1 or 2 cards left.", ephemeral=True, delete_after=ERR_TTL)
                 return
 
             if len(player.hand) == 1:
                 if player.said_uno:
-                    await interaction.response.send_message("You've already called UNO.", ephemeral=True)
+                    await interaction.response.send_message("You've already called UNO.", ephemeral=True, delete_after=ERR_TTL)
                     return
                 engine.call_uno(interaction.user.id)
-                await interaction.response.send_message("You called UNO!", ephemeral=True)
+                await silent_ack(interaction)  # the public "UNO!" below is the confirmation
                 await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
                 return
 
             player.armed_uno = not player.armed_uno
             if player.armed_uno:
                 await interaction.response.send_message(
-                    "✅ Armed — you'll auto-call UNO when you play down to 1 card.", ephemeral=True
+                    "✅ Armed — you'll auto-call UNO when you play down to 1 card.", ephemeral=True, delete_after=ERR_TTL
                 )
             else:
-                await interaction.response.send_message("❌ Un-armed.", ephemeral=True)
+                await interaction.response.send_message("❌ Un-armed.", ephemeral=True, delete_after=ERR_TTL)
 
     async def send_hand_view(self, interaction: discord.Interaction, session: GameSession, player_id: int):
         """View-only hand: stitched card images plus a plain text list as

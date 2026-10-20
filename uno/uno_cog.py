@@ -2705,7 +2705,7 @@ class UnoGame(commands.Cog):
                 else:
                     await interaction.response.send_message(msg, view=view, ephemeral=True)
                 if fired_uno:
-                    await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
+                    await self._send_to_game_channel(session, f"# {_mention(interaction.user.id)}: UNO!")
                 return
 
             session.last_action = {"type": "play", "actor_id": interaction.user.id, "card": card,
@@ -2714,7 +2714,7 @@ class UnoGame(commands.Cog):
             self.restart_timer(session)
             await self.refresh_table(session)
             if fired_uno:
-                await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
+                await self._send_to_game_channel(session, f"# {_mention(interaction.user.id)}: UNO!")
             if engine.finished:
                 await self.announce_and_cleanup(session)
 
@@ -2878,7 +2878,7 @@ class UnoGame(commands.Cog):
                     return
                 engine.call_uno(interaction.user.id)
                 await silent_ack(interaction)  # the public "UNO!" below is the confirmation
-                await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
+                await self._send_to_game_channel(session, f"# {_mention(interaction.user.id)}: UNO!")
                 return
 
             player.armed_uno = not player.armed_uno
@@ -3191,7 +3191,7 @@ class UnoGame(commands.Cog):
                 self.restart_timer(session)
                 await self.refresh_table(session)
                 if fired_uno:
-                    await self._send_to_game_channel(session, f"{_mention(interaction.user.id)}: UNO!")
+                    await self._send_to_game_channel(session, f"# {_mention(interaction.user.id)}: UNO!")
                 if engine.finished:
                     await self.announce_and_cleanup(session)
             return

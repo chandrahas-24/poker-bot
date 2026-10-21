@@ -4381,7 +4381,7 @@ class UnoGame(commands.Cog):
                 "you bet above the winner's bet stays yours. Your winnings or losses are applied to the "
                 "bet on the table and the table goes straight into the next round.\n\n"
                 "Between rounds you get a short window to **Change bet** or join. Do nothing and whatever "
-                "you have left carries over as your next bet, if you below the minimum and you're removed "
+                "you have left carries over as your next bet, if you're below the minimum you're removed "
                 "\n\n"
                 "**Leave** takes effect after the current round. **/uno quit** leaves immediately and "
                 "forfeits your bet for the round."

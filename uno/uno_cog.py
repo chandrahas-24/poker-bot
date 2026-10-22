@@ -2292,7 +2292,8 @@ class UnoGame(commands.Cog):
         self.restart_timer(session)  # before the render: otherwise the table shows the previous round's stale turn_started_at
         await self.post_table(session, channel)  # also checkpoints the table
 
-    async def close_table(self, session: GameSession, message: str | None):
+    async def close_table(self, session: GameSession, message: str | None,
+                          interaction: discord.Interaction | None = None):
         """Tears a table down and gives every seat everything it has on the
         table back (lobby cancelled/expired, /uno close, idle close...).
         Mid-round that voids the round — bets only change when a round is
@@ -2349,7 +2350,9 @@ class UnoGame(commands.Cog):
             if forfeit_lines:
                 text += "\n**Forfeited to the house (left mid-round):**\n" + "\n".join(forfeit_lines)
             try:
-                await channel.send(text, allowed_mentions=discord.AllowedMentions(users=True))
+                # /uno close passes its interaction so this is the command's reply
+                send = interaction.followup.send if interaction else channel.send
+                await send(text, allowed_mentions=discord.AllowedMentions(users=True))
             except discord.HTTPException:
                 pass
 
@@ -3254,25 +3257,14 @@ class UnoGame(commands.Cog):
             # Nothing is at risk outside a live round (or when the round is
             # stuck unsettled), and `force` is the explicit emergency exit.
             if force or not round_live:
-                await interaction.response.defer(ephemeral=True)
-                await self.close_table(session, "Table closed by staff — everything on the table was refunded:")
-                await interaction.followup.send("Table closed.", ephemeral=True)
+                await interaction.response.defer()
+                await self.close_table(session, "🚪 Table closed, all chips returned:", interaction)
                 return
             session.close_queued = not session.close_queued
             self._save_session(session)
             queued = session.close_queued
             await interaction.response.send_message(
-                "🔒 Table will close when the current round ends — everyone's chips go back to their wallets. "
-                "Run `/uno close` again to cancel." if queued else
-                "🔓 Close cancelled — the table will keep running.", ephemeral=True)
-        channel = interaction.channel
-        if channel:
-            try:
-                await channel.send(
-                    "🔒 **This table will close after the current round.**" if queued
-                    else "🔓 **Table close cancelled — play continues.**")
-            except discord.HTTPException:
-                pass
+                "✅Table will close after this round." if queued else "Table close cancelled.")
 
     @unomgr.command(name="kick", description="Remove a player from the table")
     @app_commands.describe(user="The user to remove")

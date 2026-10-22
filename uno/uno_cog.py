@@ -23,7 +23,7 @@ Features implemented here:
     deals. Leftover chips carry over as the next bet; under the minimum
     -> removed from the table. Leave queues until the round ends,
     /uno quit leaves instantly and forfeits the bet. Moderator powers
-    (kick/end/start) belong to event staff (see is_event_staff) — and the
+    (kick/end/start) belong to the manager role (see is_uno_manager) — and the
     host can Start their own round 1.
   - All tunables (min/max bet, turn timer, bet window, resend threshold,
     max players, decks, log channel, manager role) live in the guild's
@@ -63,7 +63,7 @@ Features implemented here:
     prevents repeat-farming the same target (a successful challenge takes
     their hand off exactly 1 card, so a second challenge against them
     fails until they're legitimately back down to 1 card).
-  - /uno kick <user> — event staff can remove a player from a table.
+  - /uno kick <user> — managers can remove a player from a table.
 """
 
 import asyncio
@@ -125,34 +125,12 @@ def _parse_chips(value: str) -> int | None:
 # named by channel id. See UnoGame._save_session / resume_cmd.
 SAVE_DIR = Path(__file__).parent / "uno_saves"
 
-STAFF_ROLE_IDS = [1010238899320270999,833456633689669681]
-
-async def is_event_staff(interaction: discord.Interaction) -> bool:
-    """Checks if the user is a Dev, Admin, or has a specific staff role."""
-
-    if isinstance(interaction.user, discord.Member):
-        # 1. Admin Bypass
-        if interaction.user.guild_permissions.administrator:
-            return True
-
-        # 2. Check for specific roles
-        for role_id in STAFF_ROLE_IDS:
-            if interaction.user.get_role(role_id) is not None:
-                return True
-
-    # 3. Dev Bypass
+async def is_uno_manager(interaction: discord.Interaction) -> bool:
+    """Gates /unomgr (economy) commands plus Start/resume/close/kick — a
+    per-guild configurable role (set via /unoset managerrole),
+    Administrator, or a dev in config.DEV_USER_IDS."""
     if interaction.user.id in getattr(config, 'DEV_USER_IDS', []):
         return True
-
-    return False
-
-
-async def is_uno_manager(interaction: discord.Interaction) -> bool:
-    """Gates /unomgr (economy) commands — a per-guild configurable role
-    (set via /unoset managerrole) or Administrator. Same shape as poker's
-    is_manager, kept deliberately separate from is_event_staff: game-
-    moderation (kick/cancel/timeout) and economy management (addchips,
-    ban, cashouts) are different responsibilities in poker too."""
     settings = await db.get_settings(interaction.guild_id)
     role_id = settings.get("manager_role_id")
     if role_id:
@@ -1100,8 +1078,8 @@ class TablePanelView(discord.ui.View):
     @discord.ui.button(label="Start", style=discord.ButtonStyle.primary, row=1)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = self.session
-        if not (interaction.user.id == s.host_id or await is_event_staff(interaction)):
-            await interaction.response.send_message("Only the host or event staff can start the game.", ephemeral=True)
+        if not (interaction.user.id == s.host_id or await is_uno_manager(interaction)):
+            await interaction.response.send_message("Only the host or a manager can start the game.", ephemeral=True)
             return
         async with s.lock:
             if s.closed or s.state != "lobby":
@@ -1971,8 +1949,8 @@ class UnoGame(commands.Cog):
                 "(bad/edited JSON, wrong field, etc.), fix it, and try again.", ephemeral=True)
             return
 
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can resume this save.", ephemeral=True)
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("Only managers can resume this save.", ephemeral=True)
             return
 
         engine = session.engine
@@ -3257,15 +3235,15 @@ class UnoGame(commands.Cog):
             return
         await self.handle_toggle_arm_uno(interaction, session)
 
-    @uno.command(name="close", description="Close the table after the current round ends (event staff only)")
+    @uno.command(name="close", description="Close the table after the current round ends")
     @app_commands.describe(force="Close RIGHT NOW, voiding the round in progress and refunding every bet")
     async def close_cmd(self, interaction: discord.Interaction, force: bool = False):
         session = self.sessions.get(interaction.channel_id)
         if not session or session.closed:
             await interaction.response.send_message("No table open here.", ephemeral=True)
             return
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can close the table.", ephemeral=True)
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("Only managers can close the table.", ephemeral=True)
             return
         async with session.lock:
             if session.closed or self.sessions.get(interaction.channel_id) is not session:
@@ -3296,15 +3274,15 @@ class UnoGame(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    @uno.command(name="kick", description="Remove a player from the table (event staff only)")
+    @unomgr.command(name="kick", description="Remove a player from the table")
     @app_commands.describe(user="The user to remove")
     async def kick(self, interaction: discord.Interaction, user: discord.User):
         session = self.sessions.get(interaction.channel_id)
         if not session:
             await interaction.response.send_message("No table open here.", ephemeral=True)
             return
-        if not await is_event_staff(interaction):
-            await interaction.response.send_message("Only event staff can kick players.", ephemeral=True)
+        if not await is_uno_manager(interaction):
+            await interaction.response.send_message("Only managers can kick players.", ephemeral=True)
             return
 
         target_id = user.id

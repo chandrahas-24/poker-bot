@@ -15,6 +15,7 @@ CONFIG_FILE = "highlight_config.json"
 
 DEFAULT_CONFIG = {
     "cooldown_seconds": 10,
+    "cross_channel_cooldown_seconds": 2,
     "active_context_seconds": 60,
     "allowed_users": [],
     "role_ids": [836210264873369630],
@@ -52,7 +53,9 @@ def save_config(config_data):
 
 
 HIGHLIGHT_CONFIG = load_config()
-COOLDOWN_SECONDS = HIGHLIGHT_CONFIG["cooldown_seconds"]
+COOLDOWN_SECONDS = HIGHLIGHT_CONFIG["cooldown_seconds"]  # same channel as previous hit
+CROSS_CHANNEL_COOLDOWN_SECONDS = HIGHLIGHT_CONFIG["cross_channel_cooldown_seconds"]  # different channel
+COOLDOWN_PRUNE_INTERVAL = 300
 ACTIVE_CONTEXT_SECONDS = HIGHLIGHT_CONFIG["active_context_seconds"]
 hl_allowed = {int(user_id): True for user_id in HIGHLIGHT_CONFIG["allowed_users"]}
 HIGHLIGHT_ROLE_IDS = HIGHLIGHT_CONFIG["role_ids"]
@@ -84,7 +87,8 @@ class HighlightCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.highlights = self.load_data()
-        self.cooldowns = {}
+        self.cooldowns = {}  # {(user_id, word): (timestamp, channel_id)}
+        self._last_prune = 0.0
         self.regex_cache = {}
         self.last_active = {}  # Tracks {(user_id, channel_id): timestamp} for highlight users ONLY
         self.channel_history = {}  # {channel_id: deque[(message_id, formatted_line)]}
@@ -319,7 +323,8 @@ class HighlightCog(commands.Cog):
         role="Role for addrole/removerole"
     )
     @app_commands.choices(setting=[
-        app_commands.Choice(name="Cooldown Seconds", value="cooldown"),
+        app_commands.Choice(name="Cooldown Seconds (same channel)", value="cooldown"),
+        app_commands.Choice(name="Cross-Channel Cooldown Seconds", value="cross_cooldown"),
         app_commands.Choice(name="Active Context Seconds", value="active_context"),
         app_commands.Choice(name="Alert Delay Seconds", value="alert_delay"),
         app_commands.Choice(name="Max Context Words", value="max_context_words"),
@@ -347,7 +352,16 @@ class HighlightCog(commands.Cog):
             HIGHLIGHT_CONFIG["cooldown_seconds"] = value
             globals()["COOLDOWN_SECONDS"] = value
             save_config(HIGHLIGHT_CONFIG)
-            await interaction.response.send_message(f"✅ Cooldown set to `{value}s`.", ephemeral=True)
+            await interaction.response.send_message(f"✅ Same-channel cooldown set to `{value}s`.", ephemeral=True)
+
+        elif setting == "cross_cooldown":
+            if value is None or value < 0:
+                await interaction.response.send_message("❌ Provide a non-negative numeric value.", ephemeral=True)
+                return
+            HIGHLIGHT_CONFIG["cross_channel_cooldown_seconds"] = value
+            globals()["CROSS_CHANNEL_COOLDOWN_SECONDS"] = value
+            save_config(HIGHLIGHT_CONFIG)
+            await interaction.response.send_message(f"✅ Cross-channel cooldown set to `{value}s`.", ephemeral=True)
 
         elif setting == "active_context":
             if value is None or value < 0:
@@ -582,6 +596,7 @@ class HighlightCog(commands.Cog):
 
         current_time = time.time()
         author_id_str = str(message.author.id)
+        self._prune_cooldowns(current_time)
 
         if author_id_str in self.highlights:
             self.last_active[(author_id_str, message.channel.id)] = current_time
@@ -631,24 +646,56 @@ class HighlightCog(commands.Cog):
                 if self.regex_cache[w_pattern].search(content_lower):
                     matches.add(w_pattern)
 
+            if not matches:
+                continue
+
+            # Same channel as the previous hit -> full cooldown; otherwise the short one.
+            ready = []
+            prev_cooldowns = {}
             for word in matches:
-                cooldown_key = (user_id_str, word)
-                last_sent = self.cooldowns.get(cooldown_key, 0)
+                key = (user_id_str, word)
+                if self._cooldown_ready(key, message.channel.id, current_time):
+                    ready.append(word)
+                    prev_cooldowns[word] = self.cooldowns.get(key)
 
-                if current_time - last_sent > COOLDOWN_SECONDS:
-                    # Only deliver highlights for channels the recipient can see.
-                    member = message.guild.get_member(int(user_id_str)) if message.guild else None
-                    if member is None and message.guild:
-                        try:
-                            member = await message.guild.fetch_member(int(user_id_str))
-                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                            member = None
+            if not ready:
+                continue
 
-                    if member is None or not message.channel.permissions_for(member).view_channel:
-                        continue
+            stamp = (current_time, message.channel.id)
+            for word in ready:
+                self.cooldowns[(user_id_str, word)] = stamp
 
-                    self.cooldowns[cooldown_key] = current_time
-                    self.bot.loop.create_task(self.send_alert(user_id_str, word, message))
+            # One alert per user per message, listing every matched word.
+            self.bot.loop.create_task(
+                self.send_alert(user_id_str, sorted(ready), message, prev_cooldowns, stamp)
+            )
+
+    def _cooldown_ready(self, key, channel_id: int, now: float) -> bool:
+        entry = self.cooldowns.get(key)
+        if entry is None:
+            return True
+        last_time, last_channel = entry
+        required = COOLDOWN_SECONDS if last_channel == channel_id else CROSS_CHANNEL_COOLDOWN_SECONDS
+        return now - last_time > required
+
+    def _prune_cooldowns(self, now: float):
+        if now - self._last_prune < COOLDOWN_PRUNE_INTERVAL:
+            return
+        self._last_prune = now
+        max_age = max(COOLDOWN_SECONDS, CROSS_CHANNEL_COOLDOWN_SECONDS)
+        stale = [k for k, (t, _) in self.cooldowns.items() if now - t > max_age]
+        for k in stale:
+            del self.cooldowns[k]
+
+    def _restore_cooldown(self, user_id_str: str, word: str, prev, stamp):
+        """Undo a cooldown stamp for a hit the AI rejected (unless a newer hit has since replaced it)."""
+        key = (user_id_str, word)
+        if self.cooldowns.get(key) != stamp:
+            return
+        if prev is None:
+            del self.cooldowns[key]
+        else:
+            self.cooldowns[key] = prev
 
     # ── AI Verification & DM Dispatch ─────────────────────────────────────
 
@@ -831,7 +878,17 @@ class HighlightCog(commands.Cog):
                 out.append(line)
         return "\n".join(out)
 
-    async def send_alert(self, user_id_str: str, word: str, message: discord.Message):
+    @staticmethod
+    def _pattern_source(user_prefs: dict, word: str) -> str:
+        if word in user_prefs.get("wildcard", []):
+            body = re.escape(word).replace(r'\*', r'\w*').replace(r'\?', r'\w')
+            return r'\b' + body + r'\b'
+        if word in user_prefs.get("strict", []):
+            return r'\b' + re.escape(word) + r'\b'
+        return re.escape(word)
+
+    async def send_alert(self, user_id_str: str, words: list, message: discord.Message,
+                         prev_cooldowns: dict, stamp: tuple):
         try:
             user = await self.bot.fetch_user(int(user_id_str))
             if not user:
@@ -840,35 +897,45 @@ class HighlightCog(commands.Cog):
             user_prefs = self.highlights.get(user_id_str, {})
             context_words = user_prefs.get("context_words", set())
 
-            pattern = None
-            if word in user_prefs.get("wildcard", []):
-                regex_body = re.escape(word).replace(r'\*', r'\w*').replace(r'\?', r'\w')
-                pattern = re.compile(r'(?i)\b' + regex_body + r'\b')
-            elif word in user_prefs.get("strict", []):
-                pattern = re.compile(r'(?i)\b' + re.escape(word) + r'\b')
-            else:
-                pattern = re.compile(r'(?i)' + re.escape(word))
-
-            is_context_word = any(
-                word.lower() == context_word.lower()
-                or word.lower() == f"*{context_word.lower()}*"
-                for context_word in context_words
-            )
-
             # Context up to and including the trigger message (nothing after it).
             pre_lines = self._slice_context(message.channel.id, message.id, VERIFY_BEFORE, 0) or []
 
-            if is_context_word:
-                is_valid_target = await self.verify_context_with_gemini(
-                    word, self._highlight_lines(pre_lines, pattern)
+            valid_words = []
+            for word in words:
+                is_context_word = any(
+                    word.lower() == context_word.lower()
+                    or word.lower() == f"*{context_word.lower()}*"
+                    for context_word in context_words
                 )
-                if not is_valid_target:
-                    return
+
+                if is_context_word:
+                    word_pattern = re.compile(self._pattern_source(user_prefs, word), re.IGNORECASE)
+                    is_valid_target = await self.verify_context_with_gemini(
+                        word, self._highlight_lines(pre_lines, word_pattern)
+                    )
+                    if not is_valid_target:
+                        # Rejected hits must not burn the cooldown.
+                        self._restore_cooldown(user_id_str, word, prev_cooldowns.get(word), stamp)
+                        continue
+
+                valid_words.append(word)
+
+            if not valid_words:
+                return
+
+            # Longest first so overlapping alternatives prefer the longer match.
+            sources = [self._pattern_source(user_prefs, w) for w in sorted(valid_words, key=len, reverse=True)]
+            pattern = re.compile("|".join(sources), re.IGNORECASE)
+
+            if len(valid_words) == 1:
+                title = f"Highlight word \"{valid_words[0]}\""
+            else:
+                title = "Highlight words " + ", ".join(f"\"{w}\"" for w in valid_words)
 
             # Initial DM: instant, trigger message is the last line.
             initial_lines = pre_lines[-(CONTEXT_BEFORE + 1):]
             embed = discord.Embed(
-                title=f"Highlight word \"{word}\"",
+                title=title,
                 description=self._highlight_lines(initial_lines, pattern),
                 color=discord.Color.gold(),
                 timestamp=message.created_at

@@ -5070,7 +5070,7 @@ async def _run_community_auction(channel, t: TableState):
 
 # Gamble the Gamble
 
-GAMBLE_WINDOW_SECONDS = 35
+GAMBLE_WINDOW_SECONDS = 20
 
 _GAMBLE_RANK_ALIASES = {
     "A": "A", "ACE": "A",

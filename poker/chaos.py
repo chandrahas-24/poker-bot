@@ -345,6 +345,7 @@ EVENTS: list[ChaosEvent] = [
         emoji="🗣️",
         implemented=True,
         description="First 2 people who say:\n> <@412651268142792704> is my favorite egirl",
+        weight=1.2,
         params={
             "phrase": "<@412651268142792704> is my favorite egirl",
             "winners_needed": 2,
@@ -426,7 +427,7 @@ EVENTS: list[ChaosEvent] = [
 
 EVENTS_BY_ID: dict[str, ChaosEvent] = {e.id: e for e in EVENTS}
 
-RANDOM_EVENT_CHANCE = 0.07  # independent chance, PER TRIGGER POINT (see below)
+RANDOM_EVENT_CHANCE = 0.10  # independent chance, PER TRIGGER POINT (see below)
 
 def should_random_event_fire(rng: random.Random | None = None) -> bool:
     # call once per trigger point

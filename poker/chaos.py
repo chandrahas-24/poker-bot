@@ -166,7 +166,7 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🎰",
         description="Call, raise, or fold preflop, then straight to showdown.",
         weight=0.7,
-        implemented=True,
+        implemented=False,
     ),
     ChaosModifier(
         id="rising_tide",

@@ -427,7 +427,7 @@ EVENTS: list[ChaosEvent] = [
 
 EVENTS_BY_ID: dict[str, ChaosEvent] = {e.id: e for e in EVENTS}
 
-RANDOM_EVENT_CHANCE = 0.15  # independent chance, PER TRIGGER POINT (see below)
+RANDOM_EVENT_CHANCE = 0.20  # independent chance, PER TRIGGER POINT (see below)
 
 def should_random_event_fire(rng: random.Random | None = None) -> bool:
     # call once per trigger point

@@ -194,8 +194,8 @@ MODIFIERS: list[ChaosModifier] = [
         emoji="🎲",
         description="Before cards are dealt, bet up to **2000 chips** on a rank and suit "
                      "for a side-payout.",
-        weight=0.4,
-        implemented=False,
+        weight=0.8,
+        implemented=True,
         params={"max_bet": 2000, "exact_mult": 10, "split_mult": 3, "rank_mult": 2, "suit_mult": 0.5},
     ),
     ChaosModifier(

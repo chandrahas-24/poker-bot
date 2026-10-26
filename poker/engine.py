@@ -797,10 +797,15 @@ class PokerGame:
         return self.rit_state == "pending_vote"
 
     def current_player(self) -> Optional[PokerPlayer]:
+        if self.rit_state in ("pending_vote", "resolved"):
+            return None
+
         if self.street in (Street.WAITING, Street.SHOWDOWN):
             return None
+
         if self.all_in_run_out:
             return None
+
         cp = self.players[self.current_idx]
         if cp.folded or cp.all_in:
             self.current_idx = self._next_active_idx(self.current_idx)

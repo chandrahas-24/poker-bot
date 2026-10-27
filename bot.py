@@ -702,7 +702,8 @@ async def restart(ctx):
     await ctx.send("**Initiating Deployment...**")
 
     try:
-        pull_output = subprocess.check_output(["git", "pull"]).decode("utf-8")
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        pull_output = subprocess.check_output(["git", "pull"], cwd=repo_dir).decode("utf-8")
         await ctx.send(f"**Git Pull Success:**\n```\n{pull_output}\n```")
         await ctx.send("**Restarting bot service...**")
         os._exit(0)
@@ -734,12 +735,12 @@ async def reload(ctx, cog_name: str = None):
 
     helpers_to_reload = []
     cogs_to_reload = []
-    UNO_HELPERS = ["config", "uno.cards", "uno.hand_render", "uno.uno_engine", "uno.database", "uno.unodemo"]
+    UNO_HELPERS = ["config", "poker.net_chips_graph", "uno.cards", "uno.hand_render", "uno.uno_engine", "uno.stats_db", "uno.database", "uno.unodemo"]
 
     def resolve_target(name_lower, name_raw):
         """Returns (helpers, cogs) for a single target token."""
         if name_lower == "poker":
-            return (["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "poker.leaderboard_image"],
+            return (["config", "poker.net_history_db", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "poker.leaderboard_image", "poker.net_chips_graph"],
                      ["poker.poker"])
         elif name_lower == "eventlog":
             return (["config", "eventlog.eventlog_database"], ["eventlog.eventlog"])
@@ -770,7 +771,8 @@ async def reload(ctx, cog_name: str = None):
                 return ([name_raw], [])
 
     if cog_name is None:
-        helpers_to_reload = ["config", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db", "poker.leaderboard_image"] + [h for h in UNO_HELPERS if h != "config"]
+        helpers_to_reload = ["config", "poker.net_history_db", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db", "poker.leaderboard_image", "poker.net_chips_graph"]
+        helpers_to_reload += [h for h in UNO_HELPERS if h not in helpers_to_reload]
         cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "uno.uno_cog", "highlight"]
     else:
         # Comma-separated list of targets — aliases, dotted helper modules, or cogs, any mix.

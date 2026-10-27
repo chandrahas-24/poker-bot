@@ -31,7 +31,8 @@ RED = "#E74C3C"
 MIN_BREAK_S = 30 * 60        # collapse threshold never goes below 30 min ...
 MAX_BREAK_S = 6 * 3600       # ... or above 6 h
 MAX_LABELED_BREAKS = 8       # duration labels on every break up to this many
-MAX_LINE_BREAKS = 12         # dashed lines up to this many; faint session bands beyond
+MAX_LINE_BREAKS = 12         # dashed lines up to this many; beyond that only the faint gap shading
+MAX_GAP_SHARE = 0.15         # collapsed gaps may take at most this share of the x-axis in total
 
 
 _BREAK_STEPS = (1800, 3600, 7200, 10800, 14400, 21600)   # 30m 1h 2h 3h 4h 6h
@@ -77,10 +78,14 @@ def generate_net_chips_graph(display_name: str, history: list[dict]) -> BytesIO:
     values = [row["net_chips"] for row in history]
     span = max(ts[-1] - ts[0], 1)
     thr = _break_threshold(span)
-    # A collapsed gap becomes a narrow slice: at most thr/4, and never more than
-    # ~2.5% of the active (non-collapsed) time so short sessions aren't swamped.
-    active = sum(d for d in (b - a for a, b in zip(ts, ts[1:])) if d <= thr)
-    brk_w = max(1.0, min(thr / 4, active * 0.025))
+    # A collapsed gap becomes a narrow slice: at most thr/4, at most ~2.5% of the
+    # active (non-collapsed) time, and all slices together at most ~15% of the axis,
+    # so a player with hundreds of sessions isn't drawn mostly as idle slivers.
+    dts = [b - a for a, b in zip(ts, ts[1:])]
+    active = sum(d for d in dts if d <= thr)
+    n_gaps = sum(1 for d in dts if d > thr)
+    total_cap = active * MAX_GAP_SHARE / (1 - MAX_GAP_SHARE)
+    brk_w = max(1.0, min(thr / 4, active * 0.025, total_cap / max(n_gaps, 1)))
 
     # Compressed x coordinates + the list of collapsed gaps
     xs = [0.0]
@@ -99,11 +104,10 @@ def generate_net_chips_graph(display_name: str, history: list[dict]) -> BytesIO:
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
 
-    # Session bands (many breaks) — drawn first so they sit behind the line
-    if len(breaks) > MAX_LINE_BREAKS:
-        edges = [xs[0]] + [e for b in breaks for e in (b[0], b[1])] + [xs[-1]]
-        for k in range(0, len(edges) - 1, 4):          # sessions are edges[0:2]... every other one
-            ax.axvspan(edges[k], edges[k + 1], color=MUTED, alpha=0.07, linewidth=0)
+    # Faint shading on every collapsed gap (idle = pale, in both modes); drawn
+    # first so it sits behind the line.
+    for (x0, x1, _) in breaks:
+        ax.axvspan(x0, x1, color=MUTED, alpha=0.16, linewidth=0)
 
     ax.plot(xs, values, color=line_color, linewidth=2.2)
     ax.fill_between(xs, values, 0, color=line_color, alpha=0.12)

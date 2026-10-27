@@ -4,6 +4,8 @@ import os
 from datetime import datetime, timedelta
 import config
 import traceback
+import logging
+from . import net_history_db
 # 1. FORCE the bot to look inside the Railway Volume
 # Replace '/app/data/poker.db' with whatever your Mount Path + filename is
 DB_PATH = config.DB_PATH
@@ -413,6 +415,10 @@ async def init_db():
         await init_inactivity_tracking(db)
         await load_custom_cosmetics()  # Load custom cosmetics from database
         await _ensure_top_net(locked=True)
+        try:
+            await net_history_db.init()  # opens the net-history db; first run seeds it from the CSV
+        except Exception:
+            logging.getLogger("poker").exception("net history init failed")
 
 
 # ── Guild settings ────────────────────────────────────────────────────────────
@@ -651,6 +657,16 @@ async def record_hand_full(
             1 if vpip else 0,
         ))
         await db.commit()
+
+    # Net-chips history point (separate db, best-effort — never affects the hand)
+    if net_chips != 0:
+        try:
+            async with db.execute("SELECT chips_won - chips_lost FROM stats WHERE user_id=?", (user_id,)) as c:
+                _row = await c.fetchone()
+            if _row:
+                await net_history_db.record(user_id, _row[0], net_chips)
+        except Exception:
+            logging.getLogger("poker").exception("net history write failed for %s", user_id)
 
     # Activity tracking (outside write_lock — has its own lock internally)
     if abs(net_chips) > 0 or chips_wagered > 0:
@@ -941,7 +957,20 @@ async def delete_player_stats(user_id: int) -> bool:
     async with _write_lock:
         await db.execute("DELETE FROM stats WHERE user_id=?", (user_id,))
         await db.commit()
+    await sync_net_snapshot(user_id)
     return True
+
+
+async def sync_net_snapshot(user_id: int):
+    """Record a user's current stats net as a history point — for changes
+    outside a hand (/poker setstat, removing stats)."""
+    try:
+        db = await _get_db()
+        async with db.execute("SELECT chips_won - chips_lost FROM stats WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+        await net_history_db.record_absolute(user_id, row[0] if row else 0)
+    except Exception:
+        logging.getLogger("poker").exception("net history sync failed for %s", user_id)
 
 
 # --- VAULT & CASHOUT FUNCTIONS ---

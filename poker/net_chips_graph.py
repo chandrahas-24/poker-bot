@@ -1,24 +1,11 @@
 """
-Data + rendering for the /poker stats "Graph" button.
+Rendering for the /poker and /uno stats "Graph" buttons.
 
-get_history() reads net_chips history from a manually-maintained CSV
-(config.NET_CHIPS_HISTORY_CSV_PATH) — this bot never writes to that file
-itself; you update it out-of-band (see extract_backups_to_csv.py /
-backfill_net_chips_history.py).
+History itself now lives in poker/net_history_db.py (poker) and
+uno/stats_db.py (UNO); this module only draws it with matplotlib.
 
-CSV format (header required):
-    timestamp,user_id,net_chips
-    1789187406,259968817290018816,-610
-    ...
-
-- timestamp: unix epoch seconds
-- net_chips: the *absolute* cumulative value at that timestamp, not a delta
-
-generate_net_chips_graph() renders that data with matplotlib.
-
-Both functions are synchronous (plain `csv` module, no pandas — kept
-light) and CPU/IO-bound. Call them via asyncio.to_thread from the cog so
-they can't block the event loop.
+generate_net_chips_graph() is synchronous and CPU-bound — call it via
+asyncio.to_thread from the cog so it can't block the event loop.
 """
 import csv
 import os

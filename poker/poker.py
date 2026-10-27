@@ -28,7 +28,8 @@ import dateparser
 
 from .leaderboard_image import generate_leaderboard_image
 from .jackpot_image import generate_jackpot_image
-from .net_chips_graph import get_history as get_net_chips_history, generate_net_chips_graph, get_csv_last_updated
+from .net_chips_graph import generate_net_chips_graph
+from . import net_history_db
 
 evaluator  = Evaluator()
 USE_IMAGES = card_images.cards_available()
@@ -8379,6 +8380,8 @@ class PokerCog(commands.Cog):
             # 3. Update the database
             await conn.execute(f"UPDATE stats SET {column_name} = ? WHERE user_id = ?", (value, user.id))
             await conn.commit()
+            if column_name in ("chips_won", "chips_lost"):
+                await db.sync_net_snapshot(user.id)
 
             await interaction.response.send_message(
                 f"✅ Successfully updated **{stat.name}** to `{value:,}` for **{user.display_name}**!")
@@ -8674,9 +8677,7 @@ class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
         start_ts = int(start_dt.timestamp()) if start_dt else None
         end_ts = int(end_dt.timestamp()) if end_dt else int(datetime.now(_tz.utc).timestamp())
 
-        history = await asyncio.to_thread(
-            get_net_chips_history, self.target_user.id, start_ts, end_ts
-        )
+        history = await net_history_db.get_history(self.target_user.id, start_ts, end_ts)
 
         if len(history) < 2:
             if len(history) == 1:
@@ -8709,12 +8710,6 @@ class NetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
                 discord.MediaGalleryItem("attachment://net_chips_graph.png")
             ),
         )
-
-        last_updated_ts = get_csv_last_updated()
-        if last_updated_ts:
-            container.add_item(
-                discord.ui.TextDisplay(f"-# Data last updated <t:{last_updated_ts}:R>")
-            )
 
         view = discord.ui.LayoutView()
         view.add_item(container)

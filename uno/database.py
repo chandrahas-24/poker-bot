@@ -14,7 +14,9 @@ import aiosqlite
 import asyncio
 import math
 from datetime import datetime, timedelta
+import logging
 import config
+from . import stats_db
 
 DB_PATH = config.UNO_DB_PATH
 
@@ -772,7 +774,8 @@ async def get_player_stats(user_id: int) -> dict | None:
         SELECT s.username, s.rounds_played, s.rounds_won, s.chips_won, s.chips_lost,
                (s.chips_won - s.chips_lost) AS net_chips,
                COALESCE(w.balance, 0) AS wallet,
-               COALESCE(s.times_wiped, 0) AS times_wiped
+               COALESCE(s.times_wiped, 0) AS times_wiped,
+               COALESCE(s.total_tipped, 0) AS total_tipped
         FROM stats s LEFT JOIN wallets w ON s.user_id = w.user_id
         WHERE s.user_id = ?
     """, (user_id,)) as c:
@@ -788,7 +791,9 @@ async def delete_player_stats(user_id: int) -> bool:
             row = await c.fetchone()
             deleted = bool(row and row[0] > 0)
         await db.commit()
-        return deleted
+    if deleted:
+        await sync_net_snapshot(user_id)
+    return deleted
 
 
 # ── Revenue / economy dashboards ────────────────────────────────────────────
@@ -1023,6 +1028,45 @@ async def get_table_amount(user_id: int) -> int:
 
 
 async def apply_round_settlement(round_uuid: str, guild_id: int, channel_id: int, table_id: str,
+                                  round_num: int, num_decks: int, winner_id: int | None,
+                                winner_name: str | None, players: list[dict], channel_label: str,
+                                 dealer_id: int | None = None, dealer_name: str | None = None,
+                                 tax_rate: float | None = None) -> int | None:
+    """Settlement transaction (see _apply_round_settlement_tx), then one
+    net-chips history point per player in the separate stats db. The history
+    write is best-effort: it can never fail or roll back the settlement."""
+    round_id = await _apply_round_settlement_tx(
+        round_uuid, guild_id, channel_id, table_id, round_num, num_decks, winner_id,
+        winner_name, players, channel_label, dealer_id=dealer_id, dealer_name=dealer_name,
+        tax_rate=tax_rate)
+    if round_id is not None:
+        try:
+            db = await _get_db()
+            async with db.execute("""
+                SELECT p.user_id, (s.chips_won - s.chips_lost), p.net
+                FROM round_log_players p JOIN stats s ON s.user_id = p.user_id
+                WHERE p.round_uuid = ?
+            """, (round_uuid,)) as c:
+                rows = [(r[0], r[1], r[2]) for r in await c.fetchall()]
+            await stats_db.record_round(rows, round_uuid)
+        except Exception:
+            logging.getLogger("uno").exception("net history snapshot failed for round %s", round_uuid)
+    return round_id
+
+
+async def sync_net_snapshot(user_id: int):
+    """Record a user's current stats net as a history point — for changes
+    that happen outside a round (/unoadmin setstat, removing stats)."""
+    try:
+        db = await _get_db()
+        async with db.execute("SELECT chips_won - chips_lost FROM stats WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+        await stats_db.record_absolute(user_id, row[0] if row else 0)
+    except Exception:
+        logging.getLogger("uno").exception("net history sync failed for %s", user_id)
+
+
+async def _apply_round_settlement_tx(round_uuid: str, guild_id: int, channel_id: int, table_id: str,
                                   round_num: int, num_decks: int, winner_id: int | None,
                                 winner_name: str | None, players: list[dict], channel_label: str,
                                  dealer_id: int | None = None, dealer_name: str | None = None,
@@ -1273,6 +1317,10 @@ async def reset_database(admin_id: int, admin_name: str):
 
     async with _cache_lock:
         _settings_cache.clear()
+    try:
+        await stats_db.clear_all()
+    except Exception:
+        logging.getLogger("uno").exception("net history clear failed")
 
 
 async def get_players_at_risk() -> list[dict]:

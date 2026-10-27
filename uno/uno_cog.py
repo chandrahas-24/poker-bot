@@ -76,6 +76,8 @@ import time
 import random
 import collections
 import weakref
+import traceback
+import dateparser
 import zipfile
 import uuid
 import discord
@@ -94,6 +96,7 @@ from . import uno_engine as ue
 from . import cards as card_assets
 from .hand_render import compose_hand_image, prepare_card_image
 from . import database as db
+from . import stats_db
 from .unodemo import (
     sort_hand,
     display_label,
@@ -104,6 +107,7 @@ from .unodemo import (
 )
 
 from poker.leaderboard_image import generate_leaderboard_image
+from poker.net_chips_graph import generate_net_chips_graph
 
 log = logging.getLogger("uno")
 
@@ -119,6 +123,105 @@ def _parse_chips(value: str) -> int | None:
         return int(n)
     except (InvalidOperation, ValueError, TypeError, OverflowError):
         return None
+
+class UnoNetChipsGraphModal(discord.ui.Modal, title="Graph Net Chips"):
+    start_input = discord.ui.TextInput(
+        label="Start (optional)",
+        placeholder="e.g. 2024-01-01, 'last week', 'yesterday' — blank = earliest",
+        required=False, max_length=50,
+    )
+    end_input = discord.ui.TextInput(
+        label="End (optional)",
+        placeholder="e.g. today, '3 days ago' — blank = now",
+        required=False, max_length=50,
+    )
+
+    def __init__(self, target_user: discord.User | discord.Member, display_name: str, hidden: bool):
+        super().__init__()
+        self.target_user = target_user
+        self.display_name = display_name
+        self.hidden = hidden
+
+    @staticmethod
+    def _parse(text: str):
+        return dateparser.parse(
+            text.strip(),
+            settings={  # type: ignore
+                "TIMEZONE": "UTC",
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "PREFER_DATES_FROM": "past",
+                "RELATIVE_BASE": datetime.now(_tz.utc).replace(tzinfo=None),
+            },
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=self.hidden)
+
+        start_dt = end_dt = None
+        if self.start_input.value.strip():
+            start_dt = self._parse(self.start_input.value)
+            if start_dt is None:
+                await interaction.followup.send(
+                    f"❌ Couldn't understand start date: `{self.start_input.value}`", ephemeral=True)
+                return
+            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if self.end_input.value.strip():
+            end_dt = self._parse(self.end_input.value)
+            if end_dt is None:
+                await interaction.followup.send(
+                    f"❌ Couldn't understand end date: `{self.end_input.value}`", ephemeral=True)
+                return
+            end_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - timedelta(seconds=1)
+        if start_dt and end_dt and start_dt > end_dt:
+            await interaction.followup.send("❌ Start date is after end date.", ephemeral=True)
+            return
+
+        start_ts = int(start_dt.timestamp()) if start_dt else None
+        end_ts = int(end_dt.timestamp()) if end_dt else int(datetime.now(_tz.utc).timestamp())
+
+        history = await stats_db.get_history(self.target_user.id, start_ts, end_ts)
+
+        if len(history) < 2:
+            if len(history) == 1:
+                v = history[0]["net_chips"]
+                await interaction.followup.send(
+                    f"Only one data point in that range — net chips was "
+                    f"**{'+' if v >= 0 else ''}{v:,}** then. Not enough to graph a trend.", ephemeral=True)
+            else:
+                await interaction.followup.send("No data in that range yet.", ephemeral=True)
+            return
+
+        try:
+            buf = await asyncio.to_thread(generate_net_chips_graph, self.display_name, history)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send(
+                "❌ Something went wrong rendering the graph. This didn't affect any game data — try again, "
+                "and if it keeps happening let an admin know.", ephemeral=True)
+            return
+
+        file = discord.File(buf, filename="uno_net_chips_graph.png")
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://uno_net_chips_graph.png")),
+        )
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+        await interaction.followup.send(file=file, view=view, ephemeral=self.hidden)
+
+
+class UnoStatsView(discord.ui.View):
+    def __init__(self, user: discord.User | discord.Member, username: str, hidden: bool = False):
+        super().__init__(timeout=120)
+        self.user = user
+        self.username = username
+        self.hidden = hidden
+
+    @discord.ui.button(label="Graph", style=discord.ButtonStyle.green)
+    async def btn_graph(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        await interaction.response.send_modal(UnoNetChipsGraphModal(self.user, self.username, self.hidden))
+
 
 # Where in-progress games get checkpointed so a bot crash/restart mid-game
 # doesn't wipe out everyone's hands. One JSON file per active channel,
@@ -3898,6 +4001,8 @@ class UnoGame(commands.Cog):
             async with db._write_lock:
                 await conn.execute(f"UPDATE stats SET {stat.value} = ? WHERE user_id = ?", (value, user.id))
                 await conn.commit()
+            if stat.value in ("chips_won", "chips_lost"):
+                await db.sync_net_snapshot(user.id)
             await interaction.response.send_message(
                 f"✅ Successfully updated **{stat.name}** to `{value:,}` for **{user.display_name}**!")
         except Exception as e:
@@ -4167,10 +4272,10 @@ class UnoGame(commands.Cog):
         embed.add_field(name="Win %", value=wp, inline=True)
         embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,} {config.UNO_CHIP_EMOJI}", inline=True)
         embed.add_field(name="Wallet Balance", value=f"{row['wallet']:,} {config.UNO_CHIP_EMOJI}", inline=True)
-        if row.get("times_wiped", 0) > 0:
-            embed.add_field(name="Times Wiped", value=str(row["times_wiped"]), inline=True)
+        embed.add_field(name="Total Tipped", value=f"{row.get('total_tipped', 0):,} {config.UNO_CHIP_EMOJI}", inline=True)
 
-        await interaction.followup.send(embed=embed, ephemeral=hidden)
+        await interaction.followup.send(
+            embed=embed, view=UnoStatsView(interaction.user, row["username"], hidden), ephemeral=hidden)
 
     @uno.command(name="leaderboard", description="Top UNO players by net chips")
     async def leaderboard(self, interaction: discord.Interaction):

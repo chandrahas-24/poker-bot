@@ -16,6 +16,7 @@ TUTORIAL_DB_PATH = BASE_DIR / "data" / "tutorial" / "tutorial.db"
 EVENTLOG_DB_PATH = BASE_DIR / "data" / "eventlog" / "eventlog_database.db"
 NET_CHIPS_HISTORY_CSV_PATH = BASE_DIR / "historical_net_chips.csv"
 UNO_DB_PATH = BASE_DIR / "data" / "uno" / "uno.db"
+UNO_STATS_DB_PATH = BASE_DIR / "data" / "uno" / "uno_stats.db"
 TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
 TOURNAMENT_STARTING_CHIPS = 5000
 

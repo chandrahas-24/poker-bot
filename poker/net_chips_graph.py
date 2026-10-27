@@ -32,6 +32,8 @@ MIN_BREAK_S = 30 * 60        # collapse threshold never goes below 30 min ...
 MAX_BREAK_S = 6 * 3600       # ... or above 6 h
 MAX_LABELED_BREAKS = 8       # duration labels on every break up to this many
 MAX_LINE_BREAKS = 12         # dashed lines up to this many; beyond that only the faint gap shading
+MIN_ADAPT_S = 300            # adaptive threshold never goes below 5 min
+ADAPT_SHARE = 0.10           # ...and aims to keep any one kept gap to ~10% of the active time
 MAX_GAP_SHARE = 0.15         # collapsed gaps may take at most this share of the x-axis in total
 
 
@@ -46,6 +48,31 @@ def _break_threshold(span_s: float) -> int:
         if step >= want:
             return step
     return MAX_BREAK_S
+
+
+_ADAPT_STEPS = (300, 600, 900, 1200, 1800) + _BREAK_STEPS[1:]   # 5m 10m 15m 20m 30m 1h 2h 3h 4h 6h
+
+
+def _effective_threshold(ts: list[int]) -> int:
+    """Span-based threshold, tightened when the window has little activity.
+
+    The span rule alone lets a 59-minute idle gap through on a 19-hour window
+    (threshold 1h); if the player only played ~2h in that window, that one flat
+    stretch takes over the chart. So: count the time in gaps the span rule would
+    keep (A), and don't keep gaps longer than ~10% of A (rounded down to a round
+    step, never below 5 min).
+    """
+    span = max(ts[-1] - ts[0], 1)
+    thr = _break_threshold(span)
+    kept = sum(d for d in (b - a for a, b in zip(ts, ts[1:])) if d <= thr)
+    if kept > 0:
+        want = kept * ADAPT_SHARE
+        floor_step = MIN_ADAPT_S
+        for step in _ADAPT_STEPS:
+            if step <= want:
+                floor_step = step
+        thr = min(thr, floor_step)
+    return thr
 
 
 def _fmt_dur(sec: float) -> str:
@@ -77,7 +104,7 @@ def generate_net_chips_graph(display_name: str, history: list[dict]) -> BytesIO:
     ts = [row["ts"] for row in history]
     values = [row["net_chips"] for row in history]
     span = max(ts[-1] - ts[0], 1)
-    thr = _break_threshold(span)
+    thr = _effective_threshold(ts)
     # A collapsed gap becomes a narrow slice: at most thr/4, at most ~2.5% of the
     # active (non-collapsed) time, and all slices together at most ~15% of the axis,
     # so a player with hundreds of sessions isn't drawn mostly as idle slivers.

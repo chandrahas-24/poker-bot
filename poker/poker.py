@@ -7174,6 +7174,9 @@ class PokerCog(commands.Cog):
         elif raw == "high":
             sb, bb, min_b, max_b = 25, 50, 250, 5000
             preset_name = "High Table"
+        elif raw == "higherest":
+            sb, bb, min_b, max_b = 100, 200, 1000, 7500
+            preset_name = "Really High Table?"
         elif is_chaos:
             base = chaos.CHAOS_BASE_SETTINGS
             sb, bb, min_b, max_b = base["small_blind"], base["big_blind"], base["min_wallet"], base["max_wallet"]

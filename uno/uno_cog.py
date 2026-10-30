@@ -3810,7 +3810,7 @@ class UnoGame(commands.Cog):
         await interaction.response.defer(ephemeral=False)
         if not (
                 interaction.user.guild_permissions.administrator
-                or interaction.user.id in self.DEV_USER_IDS
+                or interaction.user.id in config.DEV_USER_IDS
                 or interaction.guild.get_role(1010238899320270999) in interaction.user.roles
         ):
             await interaction.followup.send("❌ Server Administrators only.", ephemeral=True)

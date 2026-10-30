@@ -14,13 +14,13 @@ to the modal.
 Features implemented here:
   - Persistent table (like a poker table). /uno open posts a join panel;
     joining = placing a bet, which is moved from the wallet onto the table
-    (chips_in_play) and stays there. Host/staff press Start for round 1;
-    after that rounds follow each other on their own: a round ends on the
-    first player to empty their hand, the win/loss is applied straight to
-    the bets on the table (the winner collects from each opponent at most
-    their OWN bet, so no side pots), a bet_window-second panel pings
-    everyone seated to change their bet or join, then the next round
-    deals. Leftover chips carry over as the next bet; under the minimum
+    (chips_in_play) and stays there. Host/staff press Start for EVERY round
+    (nothing auto-starts, including after AFK/timeouts): a round ends on
+    the first player to empty their hand, the win/loss is applied straight
+    to the bets on the table (the winner collects from each opponent at
+    most their OWN bet, so no side pots), a panel pings everyone seated to
+    change their bet or join, and the next round deals only when the
+    host/staff press Start. Leftover chips carry over as the next bet; under the minimum
     -> removed from the table. Leave queues until the round ends,
     /uno quit leaves instantly and forfeits the bet. Moderator powers
     (kick/end/start) belong to the manager role (see is_uno_manager) — and the
@@ -532,7 +532,7 @@ class GameSession:
     `engine` is only ever the round currently being played.
 
     state: "lobby"   - before round 1, host/staff presses Start
-           "window"  - between rounds, bet_window seconds to join / change bet
+           "window"  - between rounds, join / change bet until host/staff press Start
            "waiting" - fewer than 2 seats; idle until someone joins
            "playing" - a round is in progress"""
 
@@ -986,12 +986,11 @@ def build_panel_embed(session: "GameSession") -> discord.Embed:
         desc = "Place a bet to take a seat. The host or staff presses **Start** once everyone's in."
     elif session.state == "window":
         title = f"<:uno:1536135137232953451> UNO — Round {n + 1} next"
-        desc = (f"Round {n + 1} starts <t:{int(session.window_ends_at)}:R>. Join or change your bet."
-                f"whatever you have left on the table carries over as your next bet ")
+        desc = (f"Join or change your bet. The host or staff presses **Start** to deal round {n + 1}. "
+                f"Whatever you have left on the table carries over as your next bet.")
     elif session.state == "waiting":
         title = "<:uno:1536135137232953451> UNO — waiting for players"
-        desc = (f"The next round starts "
-                f"{session.bet_window}s after the second seat fills.")
+        desc = "Waiting for a second player. The host or staff presses **Start** once 2+ are seated."
     else:
         title = f"<:uno:1536135137232953451> UNO — Round {n} in progress"
         desc = "Place a bet to take a seat — you'll be dealt in next round."
@@ -1011,7 +1010,6 @@ def build_settings_embed(s: dict) -> discord.Embed:
     e.add_field(name="Min bet", value=f"{s['min_bet']} {config.UNO_CHIP_EMOJI}", inline=True)
     e.add_field(name="Max bet", value=(f"{s['max_bet']} {config.UNO_CHIP_EMOJI}" if s["max_bet"] else "No limit"), inline=True)
     e.add_field(name="Turn timer", value=f"{s['turn_timeout']}s", inline=True)
-    e.add_field(name="Bet window", value=f"{s['bet_window']}s", inline=True)
     e.add_field(name="Resend after", value=f"{s['resend_after_msgs']} messages", inline=True)
     e.add_field(name="Max players", value=str(s["max_players"]), inline=True)
     e.add_field(name="Decks", value=str(s["num_decks"]), inline=True)
@@ -1119,12 +1117,13 @@ class BetModal(discord.ui.Modal):
 
 class TablePanelView(discord.ui.View):
     def __init__(self, cog: "UnoGame", session: "GameSession"):
-        super().__init__(timeout=1800)
+        # Between rounds nothing auto-starts, so the panel must outlive the
+        # usual 30 min or Start would silently die while staff are away.
+        super().__init__(timeout=None if session.state in ("window", "waiting") else 1800)
         self.cog = cog
         self.session = session
-        if session.state != "lobby":
-            # Start / Cancel only exist before round 1 — after that rounds
-            # start themselves and staff use /uno close.
+        if session.state not in ("lobby", "window", "waiting"):
+            # No Start while a round is running.
             self.remove_item(self.start)
         cog._track_view(self)
 
@@ -1185,8 +1184,8 @@ class TablePanelView(discord.ui.View):
             await interaction.response.send_message("Only the host or a manager can start the game.", ephemeral=True)
             return
         async with s.lock:
-            if s.closed or s.state != "lobby":
-                await interaction.response.send_message("This game has already started.", ephemeral=True)
+            if s.closed or s.state not in ("lobby", "window", "waiting"):
+                await interaction.response.send_message("A round is already in progress.", ephemeral=True)
                 return
             if len(s.seats) < 2:
                 await interaction.response.send_message("Need at least 2 players to start.", ephemeral=True)
@@ -2299,8 +2298,8 @@ class UnoGame(commands.Cog):
 
     async def open_window(self, session: GameSession, channel: discord.abc.Messageable):
         """Between rounds: ping everyone seated, post the join / change-bet
-        panel and count down to the next round — or, with fewer than 2
-        seats, wait for players instead."""
+        panel and wait for host/staff to press Start — or, with fewer than
+        2 seats, wait for players instead. No auto-start."""
         session.cancel_timer()
         session.cancel_window()
         await self._reload_settings(session)
@@ -2308,10 +2307,8 @@ class UnoGame(commands.Cog):
             await self._enter_waiting(session, channel)
             return
         session.state = "window"
-        session.window_ends_at = time.time() + session.bet_window
+        session.window_ends_at = 0.0
         await self.post_panel(session, channel, ping=True)
-        session.window_task = safe_task(self._window_timer(session, session.window_generation),
-                                        name=f"uno-window-{session.channel_id}")
         self._save_session(session)
 
     async def _enter_waiting(self, session: GameSession, channel: discord.abc.Messageable):
@@ -2323,17 +2320,6 @@ class UnoGame(commands.Cog):
                                         name=f"uno-idle-{session.channel_id}")
         self._save_session(session)
 
-    async def _window_timer(self, session: GameSession, generation: int):
-        await asyncio.sleep(max(0.0, session.window_ends_at - time.time()))
-        async with session.lock:
-            if session.closed or generation != session.window_generation or session.state != "window":
-                return
-            channel = self.bot.get_channel(session.channel_id)
-            if not channel:
-                await self.close_table(session, None)
-                return
-            await self.begin_round(session, channel)
-
     async def _idle_timer(self, session: GameSession, generation: int):
         await asyncio.sleep(config.UNO_IDLE_CLOSE_SECONDS)
         async with session.lock:
@@ -2342,14 +2328,11 @@ class UnoGame(commands.Cog):
             await self.close_table(session, "Table closed — not enough players for a while. "
                                             "Everyone's chips were returned to their wallets.")
 
-    async def begin_round(self, session: GameSession, channel: discord.abc.Messageable):
-        """Deals the next round to everyone seated with a valid bet."""
-        session.cancel_window()
-        await self._reload_settings(session)
-
-        # Anyone still under the minimum when the window closes (their
-        # leftover didn't cover it and they didn't top up) is removed and
-        # their leftover goes back to their wallet.
+    async def _remove_below_min(self, session: GameSession, channel: discord.abc.Messageable):
+        """Removes every seat under the minimum bet and returns their chips to
+        their wallet. Runs right when a round ends (not when the next round is
+        started), so seats never sit around below the minimum. Caller holds
+        the lock."""
         removed = []
         for pid, seat in list(session.seats.items()):
             if seat.bet < session.min_bet:
@@ -2361,6 +2344,14 @@ class UnoGame(commands.Cog):
         if removed:
             await channel.send("🚪**Removed from the table (below the {} minimum bet):**\n{}".format(
                 session.min_bet, "\n".join(removed)), allowed_mentions=discord.AllowedMentions(users=True))
+
+    async def begin_round(self, session: GameSession, channel: discord.abc.Messageable):
+        """Deals the next round to everyone seated with a valid bet."""
+        session.cancel_window()
+        await self._reload_settings(session)
+
+        # Safety net: normally already done at round end (announce_and_cleanup).
+        await self._remove_below_min(session, channel)
 
         if len(session.seats) < 2:
             await self._enter_waiting(session, channel)
@@ -2578,6 +2569,8 @@ class UnoGame(commands.Cog):
             await self.close_table(session, "🔒 Table closed — the round ended and closing was queued by staff. "
                                             "Everything on the table was returned to wallets:")
             return
+        await self._reload_settings(session)
+        await self._remove_below_min(session, channel)  # instant, not deferred to the next Start
         if not session.seats:
             await self.close_table(session, "Everyone left — table closed.")
             return
@@ -3691,7 +3684,6 @@ class UnoGame(commands.Cog):
         min_bet="Minimum bet per round",
         max_bet="Maximum bet per round (0 = no limit)",
         turn_timer="Seconds each player gets per turn (30-600)",
-        bet_window="Seconds between rounds to join / change bet (10-120)",
         resend_after="Chat messages before the table/panel is reposted at the bottom (1-50)",
         max_players="Seats per table (2-20)",
         decks="Number of decks (1-6)",
@@ -4454,8 +4446,8 @@ class UnoGame(commands.Cog):
                 "The first player to empty their hand "
                 "wins the round and collects from each opponent up to **their own bet**. Anything "
                 "you bet above the winner's bet stays yours. Your winnings or losses are applied to the "
-                "bet on the table and the table goes straight into the next round.\n\n"
-                "Between rounds you get a short window to **Change bet** or join. Do nothing and whatever "
+                "bet on the table. The next round only starts when the host or staff press **Start**.\n\n"
+                "Between rounds you can **Change bet** or join. Whatever "
                 "you have left carries over as your next bet, if you're below the minimum you're removed "
                 "\n\n"
                 "**Leave** takes effect after the current round. **/uno quit** leaves immediately and "

@@ -3808,7 +3808,11 @@ class UnoGame(commands.Cog):
     @app_commands.describe(month="YYYY-MM format (e.g. 2026-07) - defaults to current month")
     async def salt(self, interaction: discord.Interaction, month: str = None):
         await interaction.response.defer(ephemeral=False)
-        if not (interaction.user.guild_permissions.administrator or interaction.user.id in config.DEV_USER_IDS):
+        if not (
+                interaction.user.guild_permissions.administrator
+                or interaction.user.id in self.DEV_USER_IDS
+                or interaction.guild.get_role(1010238899320270999) in interaction.user.roles
+        ):
             await interaction.followup.send("❌ Server Administrators only.", ephemeral=True)
             return
 

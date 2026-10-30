@@ -15,7 +15,7 @@ import sys
 import config
 import subprocess
 
-from .engine import PokerGame, Street, hand_str, card_str, UNO_COLOR_EMOJI, SUIT_EMOJI
+from .engine import PokerGame, Street, hand_str, card_str, masked_hand_str, UNO_COLOR_EMOJI, SUIT_EMOJI
 from . import database as db
 from . import jackpot
 from . import taxation
@@ -177,6 +177,17 @@ class TableState:
         # the time, in which case update_board() renders every board's
         # full live state as normal. See that function's docstring.
         self.rit_reveal_upto: list[int] | None = None
+
+        # Regular all-in run-out: how many community cards are actually on
+        # screen right now (the engine deals the next street BEFORE the
+        # refresh that shows it). None outside a run-out. Read via
+        # revealed_boards() so "My Cards" never ranks unrevealed cards.
+        self.runout_shown: int | None = None
+
+        # Equity post: snapshot taken when an all-in run-out starts, and the
+        # hand number it was already posted for (one post per hand).
+        self.equity_snapshot: dict | None = None
+        self.equity_posted_hand: int = -1
 
         self.rit_vote_in_progress: bool = False
 
@@ -1329,6 +1340,23 @@ def _remap_blind_indices_for_reverse(community: list[int], blind_idx: set[int]) 
     return {mapping[i] for i in blind_idx if i in mapping}
 
 
+def revealed_boards(t: TableState) -> tuple[list[int], list[int], list[list[int]]]:
+    """(board1, board2, rit_extra_boards) truncated to what is on screen NOW.
+    Used by "My Cards" so hand strength never reveals unshown run-out cards."""
+    game = t.game
+    b1, b2 = list(game.community), list(game.community2)
+    extra = [list(b) for b in (game.rit_boards or [])]
+    if game.rit_count > 1 and extra and t.rit_reveal_upto is not None:
+        shown = t.rit_reveal_upto
+        b1 = b1[:shown[0]]
+        extra = [b[:n] for b, n in zip(extra, shown[1:])]
+    elif t.runout_shown is not None:
+        n = t.runout_shown
+        b1, b2 = b1[:n], b2[:n]
+        extra = [b[:n] for b in extra]
+    return b1, b2, extra
+
+
 async def update_board(t: TableState):
     """Generate card strip File object — attached directly to the embed message."""
     game = t.game
@@ -1651,6 +1679,7 @@ async def _run_rit_vote_impl(channel, t: TableState):
     # Send the fresh table at the bottom.
     # The subsequent card reveal logic will now edit this new message.
     await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, new_hand=True, pause_turn=True)
+    await _post_runout_equity(channel, t)
 
     pre_len = len(game.community)  # community length BEFORE any post-vote dealing — see
                                     # _reveal_rit_boards_sequential's docstring for why this matters
@@ -1670,17 +1699,21 @@ async def _run_rit_vote_impl(channel, t: TableState):
         # before that flag is ever set to True, so `while
         # game.runout_pause_pending:` alone would never even enter its
         # body on the first street after a vote).
+        # The street/board line itself (first line of each tail) is NOT logged
+        # here — it would show every card before the image does. The reveal
+        # below rewrites that one line step by step. Only extra lines
+        # (reshuffle/chameleon notes) are kept.
+        extras: list[str] = []
         def _drain_tail(tail):
             if tail:
-                if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
-                    slog_clear(t)
-                for part in tail.split("\n"):
+                for part in tail.split("\n")[1:]:
                     if part.strip():
-                        slog(t, part)
+                        extras.append(part)
+        t.rit_reveal_upto = [pre_len] * (1 + len(game.rit_boards))  # hide before dealing
         _drain_tail(game.continue_runout())
         while game.runout_pause_pending:
             _drain_tail(game.continue_runout())
-        await _reveal_rit_boards_sequential(channel, t, pre_len)
+        await _reveal_rit_boards_sequential(channel, t, pre_len, extras)
     else:
         # Declined (or nothing to vote on) — an ordinary single-board hand
         # from here on, so leave the usual pacing to _handle_post_action's
@@ -1701,7 +1734,7 @@ RIT_REVEAL_DELAY = 1.2  # Run It Multiple's own reveal pacing — smaller than R
                          # streets, once per board) than a normal single-board run-out has.
 
 
-async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int):
+async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int, extras: list[str] | None = None):
     """
     Called once, right after a Run It Multiple vote resolves to more than
     one board — by which point _run_rit_vote has already fully dealt every
@@ -1726,13 +1759,23 @@ async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int):
 
     steps = [n for n in (3, 4, 5) if n > pre_len]  # street boundaries still to reveal
     if not steps:
+        t.rit_reveal_upto = None
         return  # nothing left to reveal (all-in happened on/after the river — caller shouldn't hit this)
 
+    street_label = {3: "🌊 **Flop:**", 4: "↩️ **Turn:**", 5: "🏁 **River:**"}
     t.rit_reveal_upto = [pre_len] * n_boards
     try:
         for board_idx in range(n_boards):
+            blind = game.blinded_community_idx if board_idx == 0 else set()
             for n in steps:
                 t.rit_reveal_upto[board_idx] = n
+                # Single board line, rewritten in place each step (same
+                # shape as the normal run-out's street line).
+                slog_clear(t)
+                slog(t, f"**Board {board_idx + 1}/{n_boards}** {street_label[n]} "
+                        f"{masked_hand_str(all_boards[board_idx][:n], blind)}  |  Pot: {game._pot_display()}")
+                for line in (extras or []):
+                    slog(t, line)
                 await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
                 await asyncio.sleep(RIT_REVEAL_DELAY)
             # board_idx is now fully shown (5 cards) and stays that way on
@@ -1741,9 +1784,91 @@ async def _reveal_rit_boards_sequential(channel, t: TableState, pre_len: int):
         t.rit_reveal_upto = None  # back to normal — update_board() renders full live state again
 
 
+# Chaos modifiers under which equity would be wrong or misleading.
+_EQUITY_SKIP_MODS = {"reshuffle", "chameleon", "uno_reverse", "double_board", "blindness"}
+_EQUITY_SAMPLES = {0: 2000}  # preflop only; flop/turn are enumerated exactly
+
+
+def _snapshot_runout_equity(t: TableState):
+    """Capture hole cards + visible board the moment an all-in run-out (or
+    its Run It Multiple vote) starts. Taken before any run-out card is shown."""
+    game = t.game
+    if t.equity_posted_hand == game.hand_num:
+        return
+    if not (game.rit_vote_pending or game.runout_pause_pending):
+        return
+    if t.equity_snapshot and t.equity_snapshot["hand"] == game.hand_num:
+        return
+    if _EQUITY_SKIP_MODS & set(t.chaos_modifiers):
+        return
+    hands = [(p.display_name, list(p.hole_cards)) for p in game.players_in_hand]
+    if len(hands) < 2 or any(len(h) != 2 for _, h in hands):
+        return
+    # Board as of the all-in: if the engine already dealt the first run-out
+    # street, cut back to the length it had when the run-out began.
+    n = game.runout_start_len
+    board = list(game.community if n is None else game.community[:n])
+    t.equity_snapshot = {"hand": game.hand_num, "board": board, "hands": hands}
+
+
+def _compute_equities(hands: list[list[int]], board: list[int]) -> list[float] | None:
+    """Win share per player (ties split). Flop/turn: exact (<=990 runouts, treys).
+    Preflop: Monte Carlo via pokerkit (1.7M runouts is too many to enumerate)."""
+    if len(board) >= 3:
+        import itertools
+        from treys import Deck as TDeck
+        dead = set(board) | {c for h in hands for c in h}
+        deck = [c for c in TDeck.GetFullDeck() if c not in dead]
+        wins = [0.0] * len(hands)
+        total = 0
+        for runout in itertools.combinations(deck, 5 - len(board)):
+            full = board + list(runout)
+            scores = [evaluator.evaluate(full, h) for h in hands]  # lower = better
+            best = min(scores)
+            winners = [i for i, sc in enumerate(scores) if sc == best]
+            for i in winners:
+                wins[i] += 1 / len(winners)
+            total += 1
+        return [w / total for w in wins]
+    try:
+        from pokerkit import calculate_equities, parse_range, Card as PKCard, Deck, StandardHighHand
+    except ImportError:
+        return None
+    to_s = lambda cs: "".join(Card.int_to_str(c) for c in cs)
+    return calculate_equities(
+        tuple(parse_range(to_s(h)) for h in hands),
+        PKCard.parse(to_s(board)), 2, 5, Deck.STANDARD, (StandardHighHand,),
+        sample_count=_EQUITY_SAMPLES[0],
+    )
+
+
+async def _post_runout_equity(channel, t: TableState):
+    """One approximate-equity message per all-in hand: everyone's hole cards
+    and win chance, as of when the all-in run-out began."""
+    snap = t.equity_snapshot
+    if not snap or snap["hand"] != t.game.hand_num or t.equity_posted_hand == snap["hand"]:
+        return
+    t.equity_posted_hand = snap["hand"]
+    t.equity_snapshot = None
+    try:
+        eq = await asyncio.to_thread(_compute_equities, [h for _, h in snap["hands"]], snap["board"])
+        if not eq:
+            return
+        exact = len(snap["board"]) >= 3  # flop/turn are enumerated exactly; preflop is sampled
+        fmt = (lambda e: f"{e * 100:.1f}%") if exact else (lambda e: f"{e * 100:.0f}%")
+        note = ("-# Exact odds, rounded to 0.1%" if exact
+                else f"-# Estimated from {_EQUITY_SAMPLES[0]:,} simulated run-outs, accurate to about ±3%")
+        lines = [f"**{name}**  {hand_str(h)}  —  {fmt(e)}" for (name, h), e in zip(snap["hands"], eq)]
+        await channel.send("📊 **Equity**\n" + "\n".join(lines) + "\n" + note)
+    except Exception as e:
+        print(f"[Equity] skipped: {e}")
+
+
 async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
     if t.rit_vote_in_progress:
         return
+
+    _snapshot_runout_equity(t)
 
     for trigger_point in t.game.pending_random_event_triggers:
         event_id = chaos.pick_event_id()
@@ -1758,6 +1883,8 @@ async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
     # all in reveals
     while t.game.runout_pause_pending:
         await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+        t.runout_shown = len(t.game.community)  # now on screen
+        await _post_runout_equity(channel, t)   # once per hand, no-op after
 
         # uno reverse fires at turn to avoid all in bugs
         if t.game.uno_reverse_reminder_pending:
@@ -1777,6 +1904,9 @@ async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
         t.game.uno_reverse_reminder_pending = False
         await _announce_uno_reverse_reminder(channel, t)
 
+    if not t.game.awaiting_runout_showdown:
+        t.runout_shown = None
+
     if t.game._hand_result:
         await _process_result(guild, channel, t)
         return
@@ -1795,7 +1925,9 @@ async def _handle_post_action(guild: discord.Guild, channel, t: TableState):
     if t.game.awaiting_runout_showdown:
         if not ran_auction:
             await refresh(channel, t, cosmetics_cache=t.cosmetics_cache, pause_turn=True)
+            t.runout_shown = len(t.game.community)
             await asyncio.sleep(RUNOUT_REVEAL_DELAY)
+        t.runout_shown = None
         tail = t.game.resume_runout_showdown()
         if tail:
             if any(m in tail for m in ("🌊", "↩️", "🏁", "Showdown")):
@@ -2579,6 +2711,66 @@ def _slog_result(t: TableState, result):
                     slog(t, f"🤝 **{label}** ({amt_str}) split → {names} ({each} each)")
 
 
+_EMBED_TOTAL_LIMIT = 5800  # Discord: 6000 chars across ALL embeds in one message
+
+
+def _embed_chars(e: discord.Embed) -> int:
+    n = len(e.title or "") + len(e.description or "")
+    n += len(e.footer.text or "") if e.footer else 0
+    return n + sum(len(f.name) + len(f.value) for f in e.fields)
+
+
+async def _send_results_embed(channel, embed: discord.Embed):
+    """Send the results embed, degrading gracefully when RIT / side pots make
+    it too big: strip spacers -> move board fields to a follow-up message ->
+    truncate the description -> plain-text last resort. Never raises on size."""
+    follow_up = None
+    if _embed_chars(embed) > _EMBED_TOTAL_LIMIT or len(embed.description or "") > 4000:
+        # 1. drop invisible spacers
+        embed.description = (embed.description or "").replace("\n\u200b", "").strip() or None
+        for i, f in enumerate(embed.fields):
+            embed.set_field_at(i, name=f.name, value=f.value.replace("\n\u200b", ""), inline=f.inline)
+    if _embed_chars(embed) > _EMBED_TOTAL_LIMIT:
+        # 2. boards go to their own message (the 6000 cap is per message, not per embed)
+        board_fields = [f for f in embed.fields if f.name.startswith("🃏")]
+        if board_fields:
+            follow_up = [f"**{f.name.replace('🃏 ', '')}:** {f.value}" for f in board_fields]
+            keep = [f for f in embed.fields if not f.name.startswith("🃏")]
+            embed.clear_fields()
+            for f in keep:
+                embed.add_field(name=f.name, value=f.value, inline=f.inline)
+    if _embed_chars(embed) > _EMBED_TOTAL_LIMIT or len(embed.description or "") > 4000:
+        # 3. truncate the description line by line
+        lines = (embed.description or "").split("\n")
+        other = _embed_chars(embed) - len(embed.description or "")
+        budget = min(4000, _EMBED_TOTAL_LIMIT - other - 40)
+        kept, used = [], 0
+        for ln in lines:
+            if used + len(ln) + 1 > budget:
+                break
+            kept.append(ln)
+            used += len(ln) + 1
+        embed.description = "\n".join(kept) + f"\n… (+{len(lines) - len(kept)} more lines)"
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"[Results] embed rejected ({e}); sending plain text")
+        text = f"🏆 **{embed.title}**\n{(embed.description or '')[:1800]}"
+        for f in embed.fields:
+            if len(text) + len(f.name) + len(f.value) + 6 > 1900:
+                break
+            text += f"\n**{f.name}** {f.value}"
+        try:
+            await channel.send(text[:2000])
+        except discord.HTTPException as e2:
+            print(f"[Results] plain-text fallback failed: {e2}")
+    for line in follow_up or []:
+        try:
+            await channel.send(line[:2000])
+        except discord.HTTPException as e:
+            print(f"[Results] board follow-up failed: {e}")
+
+
 async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict = None):
     game = t.game
     ranks = result.winner_ranks or {}
@@ -2752,8 +2944,8 @@ async def _announce_winner(channel, t: TableState, result, cosmetics_cache: dict
             pct_string = f"{rate * 100:g}%"
             embed.set_footer(text=f"✨ Jackpot Friday! Tax is {pct_string} (All of it goes to Jackpot) ✨")
 
-    # 🚀 Send the final embed
-    await channel.send(embed=embed)
+    # 🚀 Send the final embed (shrinks / splits itself if it would exceed Discord's limits)
+    await _send_results_embed(channel, embed)
 
 
 async def _handle_shiny_cards(channel, t: TableState):
@@ -2828,6 +3020,7 @@ async def _process_result(guild, channel, t: TableState):
     result = t.game._hand_result
     if not result:
         return
+    t.runout_shown = None
     cancel_timer(t)
 
     if t.is_tournament:
@@ -5314,7 +5507,8 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
     visible_hole = [c for i, c in enumerate(target.hole_cards) if i not in blind_positions]
     # remove strength, could add smth to calc strengh with only the revealed cards too
     # no card emoji indicators
-    visible_board1 = [c for i, c in enumerate(t.game.community)
+    shown_b1, shown_b2, shown_extra = revealed_boards(t)
+    visible_board1 = [c for i, c in enumerate(shown_b1)
                        if i not in t.game.blinded_community_idx]
     double_board_active = "double_board" in t.game.chaos_modifiers
     rit_active = t.game.rit_count > 1 and bool(t.game.rit_boards)
@@ -5331,7 +5525,7 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
             rank = evaluator.class_to_string(evaluator.get_rank_class(score))
             pct = round((1 - score / 7462) * 100, 1)
             board_lines.append(f"**Board 1:** {rank} (top {100 - pct:.0f}%)")
-        for i, board in enumerate(t.game.rit_boards, start=2):
+        for i, board in enumerate(shown_extra, start=2):
             if len(visible_hole) + len(board) >= 5:
                 score = hand_eval.evaluate_any(evaluator, visible_hole, board)
                 rank = evaluator.class_to_string(evaluator.get_rank_class(score))
@@ -5341,7 +5535,7 @@ async def send_my_cards(t: TableState, interaction: discord.Interaction):
             strength = "\n" + "\n".join(board_lines)
     elif double_board_active:
         # Double board show the ranking against each board separately
-        visible_board2 = [c for i, c in enumerate(t.game.community2)
+        visible_board2 = [c for i, c in enumerate(shown_b2)
                            if i not in t.game.blinded_community2_idx]
         board_lines = []
         for board_num, board in ((1, visible_board1), (2, visible_board2)):

@@ -219,6 +219,7 @@ class PokerGame:
         # trigger point means and when it's queued.
         self.pending_random_event_triggers: list[str] = []
         self.was_runout_hand: bool = False               # True once the board started running out with no more betting stops this hand (early all-in, "All In!", etc.) — poker.py uses this to fire "after_winners" instead of separate per-street triggers
+        self.runout_start_len: int | None = None          # community length when the run-out began (board as of the all-in); poker.py's equity post reads this
         self._runout_first_reveal_queued: bool = False    # internal: has the run-out's one "first_reveal" trigger already been queued this hand
         self.action_history: list = []
         self.tax_rate, _ = taxation.get_tax_config()
@@ -406,6 +407,7 @@ class PokerGame:
         # reset the per-hand bookkeeping here. ──
         self.pending_random_event_triggers = []
         self.was_runout_hand = False
+        self.runout_start_len = None
         self._runout_first_reveal_queued = False
         self._hand_result = None
         self.hand_num += 1
@@ -1327,6 +1329,7 @@ class PokerGame:
         if entering_runout:
             if not self._runout_first_reveal_queued:
                 self.was_runout_hand = True
+                self.runout_start_len = prev_community_len
                 self._runout_first_reveal_queued = True
                 self._maybe_queue_random_event_trigger("first_reveal")
         else:

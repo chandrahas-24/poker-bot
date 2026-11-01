@@ -2,7 +2,7 @@ import aiosqlite
 import asyncio
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 import config
 
 DB_PATH = config.TOURNAMENT_DB_PATH
@@ -51,15 +51,6 @@ async def init_db():
                 ts TEXT NOT NULL
             )
         """)
-        # Add the 2-day cycle tracker
-        await db.execute("""
-                    CREATE TABLE IF NOT EXISTS tourney_state (
-                        id INTEGER PRIMARY KEY CHECK (id=1), 
-                        cycle_day INTEGER DEFAULT 1
-                    )
-                """)
-        await db.execute("INSERT OR IGNORE INTO tourney_state (id, cycle_day) VALUES (1, 1)")
-
         # Staff-editable tournament settings (key/value), e.g. blinds
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tourney_settings (
@@ -73,7 +64,7 @@ async def init_db():
         try:
             await db.execute("ALTER TABLE players ADD COLUMN period_wagered INTEGER DEFAULT 0")
             await db.execute("ALTER TABLE players ADD COLUMN last_activity TEXT")
-            await db.execute("ALTER TABLE players ADD COLUMN target_wager INTEGER DEFAULT 1250")
+            await db.execute("ALTER TABLE players ADD COLUMN target_wager INTEGER")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
@@ -124,7 +115,7 @@ async def register_player(user_id: int, username: str) -> bool:
         return False
     db = await _get_db()
     now = datetime.utcnow().isoformat()
-    target = int(config.TOURNAMENT_STARTING_CHIPS * 0.25)
+    target = int(config.TOURNAMENT_STARTING_CHIPS * config.TOURNAMENT_ACTIVITY_QUOTA)
 
     async with _write_lock:
         await db.execute("""
@@ -349,7 +340,7 @@ async def get_individual_leaderboard(limit: int = 10) -> list[dict]:
     return rows
 
 async def log_period_wagers(wagers: dict):
-    """Adds chips wagered to the 48-hour tracker and stamps last activity."""
+    """Adds chips wagered to the daily tracker and stamps last activity."""
     db = await _get_db()
     now = datetime.utcnow().isoformat()
     async with _write_lock:
@@ -364,80 +355,123 @@ async def log_period_wagers(wagers: dict):
         await db.commit()
 
 
-async def process_daily_tourney_check() -> tuple[int, list[dict], list[dict]]:
-    import datetime
+def _utcnow_naive() -> datetime:
+    return datetime.utcnow()
+
+
+def _in_grace(registered_at: str | None, at: datetime) -> bool:
+    """True if a wipe happening at `at` falls within the grace period after registering."""
+    if not registered_at:
+        return False
+    try:
+        reg = datetime.fromisoformat(registered_at).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return False
+    return at < reg + timedelta(hours=config.TOURNAMENT_GRACE_HOURS)
+
+
+async def _get_totals(db) -> list[dict]:
+    """All players with total chips (wallet + table stack), richest first. Ties keep a stable order."""
+    async with db.execute("""
+        SELECT p.user_id, p.username, p.balance,
+               COALESCE(c.amount, 0) AS chips_in_play,
+               (p.balance + COALESCE(c.amount, 0)) AS total_chips,
+               COALESCE(p.period_wagered, 0) AS wagered,
+               p.target_wager, p.registered_at
+        FROM players p
+        LEFT JOIN chips_in_play c ON p.user_id = c.user_id
+        ORDER BY total_chips DESC, p.user_id ASC
+    """) as c:
+        return [dict(r) for r in await c.fetchall()]
+
+
+def _top_n(rows: list[dict], n: int = 10) -> list[dict]:
+    """Top n by total chips, including EVERYONE tied with the nth place (no user-id tiebreak)."""
+    if len(rows) <= n:
+        return list(rows)
+    cutoff = rows[n - 1]['total_chips']
+    return [r for r in rows if r['total_chips'] >= cutoff]
+
+
+async def get_top_ids() -> set[int]:
     db = await _get_db()
-    warnings, penalties = [], []
-    now_dt = datetime.datetime.utcnow()
+    return {r['user_id'] for r in _top_n(await _get_totals(db))}
+
+
+async def get_players_below_quota(at: datetime) -> list[dict]:
+    """Top-10 players (ties included) who are not in grace at `at` and are under their quota.
+    Used by reminders; `at` should be the time of the next wipe."""
+    db = await _get_db()
+    out = []
+    for r in _top_n(await _get_totals(db)):
+        if _in_grace(r['registered_at'], at):
+            continue
+        target = r['target_wager'] if r['target_wager'] is not None else int(r['total_chips'] * config.TOURNAMENT_ACTIVITY_QUOTA)
+        if r['wagered'] < target:
+            out.append({
+                "user_id": r['user_id'], "username": r['username'],
+                "total_chips": r['total_chips'], "target": target, "wagered": r['wagered'],
+                "shortfall": target - r['wagered'],
+                "penalty": int(r['total_chips'] * config.TOURNAMENT_PENALTY_PCT),
+            })
+    return out
+
+
+async def process_daily_tourney_check(dry_run: bool = False) -> tuple[list[dict], int]:
+    """
+    Daily wipe. Every top-10 player (ties included) outside their grace period who wagered less than
+    their target loses TOURNAMENT_PENALTY_PCT of total chips: wallet first, remainder is returned as
+    `stack_penalty` for the caller to take from the table stack.
+    Then (unless dry_run) the daily tracker resets and targets are recomputed from post-penalty totals.
+    Returns (penalties, number_of_players_checked).
+    """
+    db = await _get_db()
+    now_dt = _utcnow_naive()
+    penalties, checked = [], 0
 
     async with _write_lock:
-        # 🛠️ FIXED: Snapshot the Top 10 INSIDE the write lock to prevent stale data races
-        async with db.execute("""
-            SELECT p.user_id, p.username, (p.balance + COALESCE(c.amount, 0)) as total_chips
-            FROM players p
-            LEFT JOIN chips_in_play c ON p.user_id = c.user_id
-            ORDER BY total_chips DESC LIMIT 10
-        """) as c:
-            top_10 = [dict(r) for r in await c.fetchall()]
+        rows = await _get_totals(db)
+        for r in _top_n(rows):
+            if _in_grace(r['registered_at'], now_dt):
+                continue
+            checked += 1
+            total = r['total_chips']
+            target = r['target_wager'] if r['target_wager'] is not None else int(total * config.TOURNAMENT_ACTIVITY_QUOTA)
+            if r['wagered'] >= target:
+                continue
 
-        async with db.execute("SELECT cycle_day FROM tourney_state WHERE id=1") as c:
-            row = await c.fetchone()
-            cycle_day = row[0] if row else 1
+            penalty = int(total * config.TOURNAMENT_PENALTY_PCT)
+            wallet_part = min(r['balance'], penalty)
+            stack_part = min(r['chips_in_play'], penalty - wallet_part)
+            if not dry_run and wallet_part:
+                await db.execute("UPDATE players SET balance = balance - ? WHERE user_id = ?",
+                                 (wallet_part, r['user_id']))
+            penalties.append({
+                "user_id": r['user_id'], "username": r['username'],
+                "target": target, "actual": r['wagered'],
+                "penalty": wallet_part + stack_part,
+                "wallet_part": wallet_part, "stack_penalty": stack_part,
+                "total_before": total, "total_after": total - wallet_part - stack_part,
+            })
 
-        if cycle_day == 1:
-            # --- DAY 1: WARNING PHASE ---
-            for player in top_10:
-                user_id, total_chips = player['user_id'], player['total_chips']
-                async with db.execute("SELECT COALESCE(period_wagered, 0), COALESCE(target_wager, 1250), registered_at FROM players WHERE user_id=?", (user_id,)) as c:
-                    w = await c.fetchone()
-                    wagered = w[0] if w else 0
-                    target = w[1] if w else int(total_chips * 0.25)
-                    reg_str = w[2] if w else now_dt.isoformat()
-
-                # 🛠️ FIXED: Ignore brand new players who just entered the Top 10
-                reg_dt = datetime.datetime.fromisoformat(reg_str)
-                if now_dt < reg_dt + datetime.timedelta(hours=48):
-                    continue
-
-                if wagered < target:
-                    warnings.append({
-                        "user_id": user_id, "username": player['username'],
-                        "shortfall": target - wagered, "target": target, "wagered": wagered, "total_chips": total_chips
-                    })
-            await db.execute("UPDATE tourney_state SET cycle_day = 2 WHERE id=1")
-
-        else:
-            # --- DAY 2: ENFORCEMENT PHASE ---
-            for player in top_10:
-                user_id, total_chips = player['user_id'], player['total_chips']
-                async with db.execute("SELECT COALESCE(period_wagered, 0), COALESCE(target_wager, 1250), registered_at FROM players WHERE user_id=?", (user_id,)) as c:
-                    w = await c.fetchone()
-                    wagered = w[0] if w else 0
-                    target = w[1] if w else int(total_chips * 0.25)
-                    reg_str = w[2] if w else now_dt.isoformat()
-
-                reg_dt = datetime.datetime.fromisoformat(reg_str)
-                if now_dt < reg_dt + datetime.timedelta(hours=48):
-                    continue
-
-                if wagered < target:
-                    shortfall = target - wagered
-                    await db.execute("UPDATE players SET balance = MAX(0, balance - ?) WHERE user_id = ?", (shortfall, user_id))
-                    penalties.append({
-                        "user_id": user_id, "username": player['username'],
-                        "shortfall": shortfall, "target": target, "actual": wagered, "total_chips": total_chips
-                    })
-
+        if not dry_run:
+            pen_after = {p['user_id']: p['total_after'] for p in penalties}
             await db.execute("UPDATE players SET period_wagered = 0")
-            await db.execute("""
-                UPDATE players 
-                SET target_wager = CAST((balance + COALESCE((SELECT amount FROM chips_in_play WHERE user_id = players.user_id), 0)) * 0.25 AS INTEGER)
-            """)
-            await db.execute("UPDATE tourney_state SET cycle_day = 1 WHERE id=1")
+            for r in rows:
+                total_after = pen_after.get(r['user_id'], r['total_chips'])
+                await db.execute("UPDATE players SET target_wager = ? WHERE user_id = ?",
+                                 (int(total_after * config.TOURNAMENT_ACTIVITY_QUOTA), r['user_id']))
+            await db.commit()
 
+    return penalties, checked
+
+
+async def reduce_chips_in_play(user_id: int, amount: int):
+    """Removes chips from a player's recorded table stack (penalty fallback when no live table holds them)."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("UPDATE chips_in_play SET amount = MAX(0, amount - ?) WHERE user_id = ?", (amount, user_id))
         await db.commit()
-
-    return cycle_day, warnings, penalties
 
 
 async def refresh_player_name(user_id: int, username: str):

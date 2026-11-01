@@ -226,6 +226,7 @@ class PokerGame:
         self.is_tournament = False
         self.tax_exempt = False
         self.pending_blinds = None   # (sb, bb) queued by staff; applied when the current hand ends
+        self.pending_penalties = {}  # {user_id: chips} tournament activity penalties; taken from the stack when the hand ends
         self.vpip = False
 
         # ── AFK / decision-timeout hook ─────────────────────────────────────
@@ -1945,6 +1946,12 @@ class PokerGame:
         if self.pending_blinds:
             self.SMALL_BLIND, self.BIG_BLIND = self.pending_blinds
             self.pending_blinds = None
+        if self.pending_penalties:
+            for uid, amt in self.pending_penalties.items():
+                pl = self.get_player(uid)
+                if pl:
+                    pl.chips = max(0, pl.chips - amt)
+            self.pending_penalties = {}
         self.community = []
         self.pot       = 0
         for p in self.players:

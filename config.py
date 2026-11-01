@@ -1,4 +1,5 @@
 import os
+import datetime
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -18,8 +19,6 @@ NET_CHIPS_HISTORY_CSV_PATH = BASE_DIR / "historical_net_chips.csv"   # one-time 
 POKER_NET_HISTORY_DB_PATH = BASE_DIR / "data" / "poker" / "net_history.db"
 UNO_DB_PATH = BASE_DIR / "data" / "uno" / "uno.db"
 UNO_STATS_DB_PATH = BASE_DIR / "data" / "uno" / "uno_stats.db"
-TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
-TOURNAMENT_STARTING_CHIPS = 5000
 
 # ── SERVER & CHANNELS ──
 GUILD_ID = 799685121582039141
@@ -102,6 +101,29 @@ UNO_DONATION_CHANNELS = {1554550010962518086}
 UNO_ADD_CHIPS_CHANNELS = {1554550010962518086,1554675031966220360}
 UNO_REMOVE_CHIPS_CHANNELS = {1554550010962518086,1554675031966220360}
 UNO_PAYOUT_MANAGER_ROLE = 1019909875913998388
+
+# ── TOURNAMENT SCHEDULE & ACTIVITY RULES (all times UTC) — EDIT THESE PER TOURNAMENT ──
+_UTC = datetime.timezone.utc
+# Players can only /tourney register inside this window
+TOURNAMENT_REGISTRATION_OPEN  = datetime.datetime(2026, 11, 8, 12, 0, tzinfo=_UTC)
+TOURNAMENT_REGISTRATION_CLOSE = datetime.datetime(2026, 11, 13, 12, 0, tzinfo=_UTC)
+# Tournament start = start of the first session on day 1.
+# Wipes are enforced only after this moment, up to and including TOURNAMENT_END
+# (7 days => 7 wipes; the last one runs right after day 7's second session).
+TOURNAMENT_START = datetime.datetime(2026, 11, 11, 3, 0, tzinfo=_UTC)
+TOURNAMENT_END   = TOURNAMENT_START + datetime.timedelta(days=7)
+# Two 2-hour sessions per day (time of day). Reminders are derived from these.
+TOURNAMENT_SESSION_STARTS = [datetime.time(3, 0), datetime.time(15, 0)]   # session 1, session 2
+TOURNAMENT_SESSION_LENGTH_H = 2
+TOURNAMENT_WIPE_LEAD_MIN = 60                  # daily wipe runs this long before session 1
+TOURNAMENT_REMINDER_BEFORE_SESSION_MIN = 30    # reminder 1 = before session 1 (30 min after the wipe), reminder 2 = before session 2
+# Activity rules (apply to the top 10 by total chips; ties at 10th place are all included)
+TOURNAMENT_ACTIVITY_QUOTA = 0.25               # must wager this fraction of total chips per day
+TOURNAMENT_PENALTY_PCT = 0.10                  # fraction of total chips lost when the quota is missed
+TOURNAMENT_GRACE_HOURS = 24                    # new registrants are skipped by any wipe that happens within this long of registering
+
+TOURNAMENT_REGISTER_CHANNEL_ID = 1509457673014481006
+TOURNAMENT_STARTING_CHIPS = 5000
 
 DEV_USER_IDS = (
     1339935869598961728, # baymax for backups

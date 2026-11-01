@@ -227,6 +227,28 @@ else:
     global_rejoin_locks: dict[int, dict] = {}
 
 
+# Tournament rejoin locks live in their own pool so they never interact with regular-table locks.
+if bot_instance and hasattr(bot_instance, 'poker_tourney_locks'):
+    tournament_rejoin_locks: dict[int, float] = bot_instance.poker_tourney_locks
+else:
+    tournament_rejoin_locks: dict[int, float] = {}
+
+
+def apply_tourney_lock(user_id: int, seconds: int):
+    tournament_rejoin_locks[user_id] = time.time() + seconds
+
+
+def get_tourney_lock(user_id: int) -> float | None:
+    # Returns the expiry timestamp if user_id is on a tournament rejoin cooldown, else None
+    expiry = tournament_rejoin_locks.get(user_id)
+    if expiry is None:
+        return None
+    if time.time() >= expiry:
+        tournament_rejoin_locks.pop(user_id, None)
+        return None
+    return expiry
+
+
 def apply_global_lock(user_id: int, seconds: int, payable: bool):
     # Locks user_id out of joining any table for `seconds`
     global_rejoin_locks[user_id] = {"expiry": time.time() + seconds, "payable": payable}
@@ -752,10 +774,7 @@ async def _auto_next_hand(t: TableState, channel):
     delay    = settings.get("next_hand_delay", NEXT_HAND_DELAY_DEFAULT)
     view = None
     try:
-        if t.is_tournament:
-            from tournament import tournament
-            view = tournament.TournamentBetweenHandsView(t)
-        else:
+        if not t.is_tournament:
             view = BetweenHandsView(t)
         t.between_msg = await channel.send(f"⏳ Next hand starting in **{delay}s**...", view=view)
     except Exception as e:
@@ -892,15 +911,6 @@ async def _auto_next_hand(t: TableState, channel):
         await refresh(channel, t, cosmetics_cache=None)
         await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
-
-    if getattr(t, 'is_tournament', False):
-        # Include pending_with_chips in the UID list
-        active_uids = [p.user_id for p in active] + [p.user_id for p in pending_with_chips]
-        dominance_warning = await tdb.get_team_dominance_warning(active_uids)
-        if dominance_warning:
-            await channel.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}")
-            await refresh(channel, t, cosmetics_cache=t.cosmetics_cache)
-            return
 
     if not getattr(t, 'is_tournament', False):
         t.game.SMALL_BLIND = settings["small_blind"]
@@ -1273,7 +1283,7 @@ def build_embed(t: TableState, title_cache: dict[int, str | None] | None = None,
         chunk_size = config.PLAYERS_PER_FIELD
         chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
         for i, chunk in enumerate(chunks):
-            field_title = f"Players ({len(game.players)}/{config.MAX_PLAYERS})" if i == 0 else "\u200b"
+            field_title = f"Players ({len(game.players)}/{game.MAX_PLAYERS})" if i == 0 else "\u200b"
 
             # Fallback just in case Discord strips the invisible character
             if not field_title.strip():
@@ -2022,8 +2032,10 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
         t.leave_cooldown_pending.add(interaction.user.id)
         await channel.send(f"👋 **{interaction.user.display_name}** will leave after this hand.")
     elif "left" in msg or "cashed out" in msg:
-        cooldown = config.TOURNAMENT_REJOIN_COOLDOWN if getattr(t, 'is_tournament', False) else config.REGULAR_REJOIN_COOLDOWN
-        apply_global_lock(interaction.user.id, cooldown, payable=True)
+        if getattr(t, 'is_tournament', False):
+            apply_tourney_lock(interaction.user.id, config.TOURNAMENT_REJOIN_COOLDOWN)
+        else:
+            apply_global_lock(interaction.user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
         await channel.send(
             f"👋 **{interaction.user.display_name}** left the table. Chips returned to wallet.")
 
@@ -3044,7 +3056,7 @@ async def _process_result(guild, channel, t: TableState):
                     await tournament_db.return_chips(uid, total_to_return)
                 await tournament_db.clear_chips_in_play(uid)
             if uid in t.leave_cooldown_pending:
-                apply_global_lock(uid, config.TOURNAMENT_REJOIN_COOLDOWN, payable=True)
+                apply_tourney_lock(uid, config.TOURNAMENT_REJOIN_COOLDOWN)
 
         # Remove them from game.players now so the post-hand embed is clean.
         for uid in list(t.game.pending_leaves):
@@ -5822,7 +5834,7 @@ class GameView(discord.ui.View):
 
         view = LeaveConfirmView(self.t)
         await interaction.response.send_message(
-            "⚠️ Are you sure you want to leave?\n*(This will trigger a 10-minute rejoin cooldown!)*",
+            f"⚠️ Are you sure you want to leave?\n*(This will trigger a {(config.TOURNAMENT_REJOIN_COOLDOWN if getattr(self.t, 'is_tournament', False) else config.REGULAR_REJOIN_COOLDOWN) // 60}-minute rejoin cooldown!)*",
             view=view,
             ephemeral=True
         )
@@ -6616,26 +6628,7 @@ class PokerCog(commands.Cog):
         t.game.pending_leaves.clear()
         t.game.kicked_users.clear()
 
-        if getattr(t, 'is_tournament', False):
-            bb = t.game.BIG_BLIND
-
-            # 1. Grab seated players who can play
-            active = [p for p in t.game.players if
-                      (p.chips + p.pending_rebuy) >= bb and p.user_id not in t.game.pending_leaves]
-
-            # 2. Grab joining players who can play
-            pending_with_chips = [p for p in t.game.pending_joins if
-                                  (p.chips + p.pending_rebuy) >= bb]
-
-            # 3. Combine their IDs for the strict dominance check
-            active_uids = [p.user_id for p in active] + [p.user_id for p in pending_with_chips]
-
-            dominance_warning = await tdb.get_team_dominance_warning(active_uids)
-            if dominance_warning:
-                await interaction.followup.send(f"⚠️ **Team stats abuse guard: **\n{dominance_warning}",
-                                                ephemeral=True)
-                return
-        else:
+        if not getattr(t, 'is_tournament', False):
             bb = t.game.BIG_BLIND
             active = [p for p in t.game.players if (p.chips + p.pending_rebuy) >= bb]
             pending_with_chips = [p for p in t.game.pending_joins if (p.chips + p.pending_rebuy) >= bb]
@@ -6716,8 +6709,6 @@ class PokerCog(commands.Cog):
             await interaction.followup.send(f"❌ **{user.display_name}** is not at the table.", ephemeral=True);
             return
 
-        if cooldown_seconds is not None:
-            t.rejoin_cooldowns[user.id] = time.time() + cooldown_seconds
         await send_mod_dm(user, "kick", reason, duration_display, interaction.user, interaction.guild.name,
                           duration_field="Expires")
 
@@ -6728,7 +6719,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            apply_global_lock(user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
+            apply_global_lock(user.id, cooldown_seconds if cooldown_seconds is not None else config.REGULAR_REJOIN_COOLDOWN, payable=True)
             await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_display, reason, duration_field="Expires"))
             return
 
@@ -6739,7 +6730,7 @@ class PokerCog(commands.Cog):
             if total_to_return > 0:
                 await db.return_chips(user.id, total_to_return)
             await db.clear_chips_in_play(user.id)
-            apply_global_lock(user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
+            apply_global_lock(user.id, cooldown_seconds if cooldown_seconds is not None else config.REGULAR_REJOIN_COOLDOWN, payable=True)
             await interaction.followup.send(format_mod_message("🦵", "kicked", user, t.name, duration_display, reason, duration_field="Expires"))
             await refresh(interaction.channel, t)
             return
@@ -6752,7 +6743,7 @@ class PokerCog(commands.Cog):
         # this is unambiguously a kick regardless of which pending-leave
         # bucket it'd otherwise land in, so there's no need to wait for
         # _process_result's generic drain to decide the duration.
-        apply_global_lock(user.id, config.REGULAR_REJOIN_COOLDOWN, payable=True)
+        apply_global_lock(user.id, cooldown_seconds if cooldown_seconds is not None else config.REGULAR_REJOIN_COOLDOWN, payable=True)
 
         if not p.folded:
             ok, fold_msg = t.game.force_fold(user.id)
@@ -7571,20 +7562,16 @@ class PokerCog(commands.Cog):
             await interaction.followup.send("❌ You're not at the table.", ephemeral=True);
             return
 
-        is_tourney = getattr(t, 'is_tournament', False)
-        if is_tourney:
-            _bal = tdb.get_balance
-            _deduct = tdb.deduct_chips
-            _return = tdb.return_chips
-            _mark = tdb.mark_chips_in_play
-            max_w = getattr(t.game, "MAX_BUYIN", 0)
-        else:
-            _bal = db.get_balance
-            _deduct = db.deduct_chips
-            _return = db.return_chips
-            _mark = db.mark_chips_in_play
-            settings = await db.get_settings(interaction.guild_id)
-            max_w = settings.get("max_wallet", 0)
+        if getattr(t, 'is_tournament', False):
+            await interaction.followup.send("❌ Rebuys aren't available at tournament tables.", ephemeral=True)
+            return
+
+        _bal = db.get_balance
+        _deduct = db.deduct_chips
+        _return = db.return_chips
+        _mark = db.mark_chips_in_play
+        settings = await db.get_settings(interaction.guild_id)
+        max_w = settings.get("max_wallet", 0)
 
         wallet_bal = await _bal(interaction.user.id)
         if chips > wallet_bal:
@@ -10141,5 +10128,7 @@ async def setup(bot):
         bot.poker_tables = tables
     if not hasattr(bot, "poker_global_locks"):
         bot.poker_global_locks = global_rejoin_locks
+    if not hasattr(bot, "poker_tourney_locks"):
+        bot.poker_tourney_locks = tournament_rejoin_locks
     asyncio.create_task(_migrate_active_tables(bot))
     await bot.add_cog(PokerCog(bot))

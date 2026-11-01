@@ -4,143 +4,43 @@ from discord.ext import commands
 from discord.ext import tasks
 import datetime
 from discord import app_commands
+import asyncio
 import traceback
 
 import config
 from poker import database as db
 from . import tournament_db as tdb
-from poker.poker import TableState, tables, refresh, slog, slog_clear, schedule_next_hand, Street, parse_chips, RawSQLPaginationView, GameView
+from poker.poker import TableState, tables, refresh, slog, slog_clear, schedule_next_hand, Street, parse_chips, RawSQLPaginationView, GameView, get_tourney_lock
+from poker.leaderboard_image import generate_leaderboard_image
 
-# -- Tournament Join Modal ----------------------------------------------------
+# -- Tournament Join ----------------------------------------------------------
+# Tournament joins always take the player's ENTIRE wallet (no modal, no max).
 
-class TournamentJoinModal(discord.ui.Modal, title="Tournament Buy In"):
-    amount = discord.ui.TextInput(label="Buy-in Amount", placeholder="e.g. 500", required=True)
+async def tourney_join_execute(interaction: discord.Interaction, t: TableState, amt: int):
+    """Seat the player with `amt` chips. Caller must already have deferred (ephemeral)."""
+    uid = interaction.user.id
+    success = await tdb.deduct_chips(uid, amt)
+    if not success:
+        await interaction.followup.send(f"Failed to deduct {config.TOURNAMENT_CHIP_EMOJI}. Try again.", ephemeral=True)
+        return
 
-    def __init__(self, t: TableState, balance: int, min_w: int, max_w: int):
-        super().__init__()
-        self.t = t
-        self.balance = balance
-        self.min_w = min_w
-        self.max_w = max_w
-        limit_str = f"{max_w}" if max_w > 0 else "None"
-        self.amount.placeholder = f"min {min_w} - max {limit_str}  (wallet: {balance})"
+    await tdb.refresh_player_name(uid, interaction.user.name)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+    name = interaction.user.name
+    msg = t.game.add_player(uid, name, amt)
+    if not msg.startswith("✅"):
+        await tdb.return_chips(uid, amt)
+        await interaction.followup.send(msg, ephemeral=True)
+        return
 
-        # Prevent multi-tabling across the entire bot
-        uid = interaction.user.id
-        for other_t in tables.values():
-            if any(p.user_id == uid for p in other_t.game.players + other_t.game.pending_joins):
-                if other_t is not self.t: # If they are at a DIFFERENT table
-                    await interaction.followup.send("❌ You are already seated at another table! You can only play at one table at a time.", ephemeral=True)
-                    return
+    await tdb.mark_chips_in_play(uid, name, amt)
 
-        # Double check cooldown
-        expiry = self.t.rejoin_cooldowns.get(interaction.user.id)
-        if expiry and time.time() < expiry:
-            await interaction.followup.send("❌ You are currently on a rejoin cooldown.", ephemeral=True)
-            return
+    await interaction.channel.send(
+        f"**✅ {interaction.user.display_name}** joined the tournament table with **{amt}** {config.TOURNAMENT_CHIP_EMOJI}!")
+    await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
 
-        amt = parse_chips(self.amount.value)
-        if amt is None or amt <= 0:
-            await interaction.followup.send("❌ Enter a valid positive amount (e.g. 500, 2k).", ephemeral=True)
-            return
-
-        if amt < self.min_w:
-            await interaction.followup.send(f"Minimum buy-in is {self.min_w} {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
-            return
-        if self.max_w > 0 and amt > self.max_w:
-            await interaction.followup.send(f"Maximum buy-in is {self.max_w} {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
-            return
-        if amt > self.balance:
-            await interaction.followup.send(f"You only have {self.balance} {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
-            return
-
-        uid = interaction.user.id
-        success = await tdb.deduct_chips(uid, amt)
-        if not success:
-            await interaction.followup.send(f"Failed to deduct {config.TOURNAMENT_CHIP_EMOJI}. Try again.", ephemeral=True)
-            return
-
-        await tdb.refresh_player_name(interaction.user.id, interaction.user.name)
-
-        name = interaction.user.name
-        msg = self.t.game.add_player(uid, name, amt)
-        if not msg.startswith("✅"):
-            await tdb.return_chips(uid, amt)
-            await interaction.followup.send(msg, ephemeral=True)
-            return
-
-        await tdb.mark_chips_in_play(uid, name, amt)
-
-        # Team tags are removed from cosmetics as requested
-
-        await interaction.channel.send(
-            f"**✅ {interaction.user.display_name}** joined the tournament table with **{amt}** {config.TOURNAMENT_CHIP_EMOJI}!")
-        await interaction.followup.send("✅ Successfully joined!", ephemeral=True)
-
-        if self.t.game.street == Street.WAITING:
-            await refresh(interaction.channel, self.t, cosmetics_cache=self.t.cosmetics_cache)
-
-
-# -- Tournament Rebuy Modal ---------------------------------------------------
-
-class TournamentRebuyModal(discord.ui.Modal, title="Add Tournament Chips"):
-    amount = discord.ui.TextInput(label="Amount to Add", placeholder="e.g. 500", required=True)
-
-    def __init__(self, t: TableState, balance: int, max_w: int, current_stack: int):
-        super().__init__()
-        self.t = t
-        self.balance = balance
-        self.max_w = max_w
-        self.current_stack = current_stack
-
-        if max_w > 0:
-            allowed = max(0, max_w - current_stack)
-            self.amount.placeholder = f"Max: {min(balance, allowed)}  (wallet: {balance})"
-        else:
-            self.amount.placeholder = f"Max: {balance}  (wallet: {balance})"
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        amt = parse_chips(self.amount.value)
-        if amt is None or amt <= 0:
-            await interaction.followup.send("❌ Enter a valid positive amount (e.g. 500, 2k).", ephemeral=True)
-            return
-
-        # Calculate live stack size right now
-        p = self.t.game.get_player(interaction.user.id)
-        pj = next((x for x in self.t.game.pending_joins if x.user_id == interaction.user.id), None)
-        live_stack = (p.chips + p.pending_rebuy) if p else ((pj.chips + pj.pending_rebuy) if pj else 0)
-
-        if self.max_w > 0 and (live_stack + amt) > self.max_w:
-            await interaction.followup.send(
-                f"Table max is {self.max_w} {config.TOURNAMENT_CHIP_EMOJI}. You can add up to {max(0, self.max_w - live_stack)} {config.TOURNAMENT_CHIP_EMOJI}.",
-                ephemeral=True)
-            return
-
-        if amt > self.balance:
-            await interaction.followup.send(f"You only have {self.balance} {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
-            return
-
-        uid = interaction.user.id
-        success = await tdb.deduct_chips(uid, amt)
-        if not success:
-            await interaction.followup.send(f"Failed to deduct {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
-            return
-
-        msg = self.t.game.queue_rebuy(uid, amt, emoji=config.TOURNAMENT_CHIP_EMOJI)
-        if msg.startswith("❌"):
-            await tdb.return_chips(uid, amt)
-            await interaction.followup.send(msg, ephemeral=True)
-            return
-
-        await tdb.mark_chips_in_play(uid, interaction.user.name, amt)
-
-        await interaction.channel.send(
-            f"**{interaction.user.display_name}** added **{amt}** {config.TOURNAMENT_CHIP_EMOJI} to their tournament stack for the next hand!")
-        await interaction.followup.send(f"{config.TOURNAMENT_CHIP_EMOJI} queued for the next hand!", ephemeral=True)
+    if t.game.street == Street.WAITING:
+        await refresh(interaction.channel, t, cosmetics_cache=t.cosmetics_cache)
 
 
 # -- Tournament Game View -----------------------------------------------------
@@ -184,16 +84,20 @@ class TournamentGameView(GameView):
                 ephemeral=True)
             return
 
-        expiry = self.t.rejoin_cooldowns.get(uid)
-        if expiry and time.time() < expiry:
+        if uid in self.t.game.kicked_users:
             await interaction.response.send_message(
-                f"You recently left this table. You can rejoin <t:{int(expiry)}:R>.",
+                "❌ You have been kicked and will be removed after this hand.", ephemeral=True)
+            return
+
+        # Rejoin cooldown (separate tournament lock pool, no bypass)
+        expiry = get_tourney_lock(uid)
+        if expiry:
+            await interaction.response.send_message(
+                f"⏳ You recently left the table. You can rejoin <t:{int(expiry)}:R>.",
                 ephemeral=True)
             return
-        self.t.rejoin_cooldowns.pop(uid, None)
 
         min_w = getattr(self.t.game, "MIN_BUYIN", 50)
-        max_w = getattr(self.t.game, "MAX_BUYIN", 0)
         bal   = await tdb.get_balance(uid)
 
         if bal < min_w:
@@ -201,128 +105,19 @@ class TournamentGameView(GameView):
                 f"Need at least {min_w} {config.TOURNAMENT_CHIP_EMOJI} to join. Wallet: {bal} {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
             return
 
-        await interaction.response.send_modal(TournamentJoinModal(self.t, bal, min_w, max_w))
-
-
-# -- Between-Hands View -------------------------------------------------------
-
-class TournamentBetweenHandsView(discord.ui.View):
-    def __init__(self, t: TableState):
-        super().__init__(timeout=None)
-        self.t = t
-
-    @discord.ui.button(label="Add Chips", style=discord.ButtonStyle.green)
-    async def add_chips(self, interaction: discord.Interaction, button: discord.ui.Button):
-        t = self.t
-        if t.closing:
-            await interaction.response.send_message("This table is closing.", ephemeral=True)
-            return
-
-        p  = t.game.get_player(interaction.user.id)
-        pj = next((x for x in t.game.pending_joins if x.user_id == interaction.user.id), None)
-        if not p and not pj:
-            await interaction.response.send_message("You are not at the table.", ephemeral=True)
-            return
-
-        current_stack = (p.chips + p.pending_rebuy) if p else (pj.chips + pj.pending_rebuy)
-
+        # Full-stack rule: always join with the entire wallet
         await interaction.response.defer(ephemeral=True)
-        bal   = await tdb.get_balance(interaction.user.id)
-        max_w = getattr(self.t.game, "MAX_BUYIN", 0)
-
-        await interaction.followup.send(
-            "Add tournament chips to your stack:",
-            view=TournamentRebuyView(self.t, bal, max_w, current_stack),
-            ephemeral=True)
-
-
-class TournamentRebuyView(discord.ui.View):
-    def __init__(self, t, bal, max_w, current_stack):
-        super().__init__(timeout=60)
-        self.t = t
-        self.bal = bal
-        self.max_w = max_w
-        self.current_stack = current_stack
-
-    @discord.ui.button(label="Open Rebuy Menu", style=discord.ButtonStyle.green)
-    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            TournamentRebuyModal(self.t, self.bal, self.max_w, self.current_stack))
-
-
-# -- Leaderboard View ---------------------------------------------------------
-
-class TournamentLeaderboardView(discord.ui.View):
-    def __init__(self, caller_id: int, caller_row: dict | None, caller_rank: int | None, indiv: list[dict], teams: list[dict]):
-        super().__init__(timeout=120)
-        self.caller_id = caller_id
-        self.caller_row = caller_row
-        self.caller_rank = caller_rank
-        self.indiv = indiv
-        self.teams = teams
-        self.show_teams = False
-
-    def get_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="🏆 Tournament Leaderboard", color=0xF1C40F)
-        if not self.show_teams:
-            MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
-            top_ids = {r['user_id'] for r in self.indiv}
-
-            lines = []
-            for i, r in enumerate(self.indiv):
-                rank = i + 1
-                total = r['total_chips']
-                uname = r['username']  # No need to truncate names anymore!
-                medal = MEDALS.get(rank, f"{rank}.")
-                you_tag = " ◀" if r['user_id'] == self.caller_id else ""
-
-                lines.append(f"{medal} **{uname}** - {total:,} {config.TOURNAMENT_CHIP_EMOJI}{you_tag}")
-
-            embed.description = "\n".join(lines) if lines else "No players."
-
-            # Caller's stats - shown at the bottom whether or not they're in the top 10
-            if self.caller_row:
-                in_top = self.caller_id in top_ids
-                rank_str = f"#{self.caller_rank}" if self.caller_rank else "—"
-                label = f"📊 Your Tournament Stats  ·  {rank_str}" + (" *(in top 10)*" if in_top else "")
-                embed.add_field(
-                    name=label,
-                    value=(
-                        f"Total **{self.caller_row['total_chips']:,}** {config.TOURNAMENT_CHIP_EMOJI}"
-                    ),
-                    inline=False
-                )
-            else:
-                embed.add_field(name="📊 Your Tournament Stats", value="No hands played yet.", inline=False)
-        else:
-            text = "\n".join(
-                f"{i + 1}. **{tm['name']}** - {tm['total_wins']} hands won"
-                for i, tm in enumerate(self.teams)) or "No teams."
-            embed.add_field(name="Team Top 10", value=text, inline=False)
-        return embed
-
-    @discord.ui.button(label="Switch to Teams", style=discord.ButtonStyle.blurple)
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.caller_id:
-            return await interaction.response.send_message("This is not your leaderboard.", ephemeral=True)
-        self.show_teams = not self.show_teams
-        button.label = "Switch to Individual" if self.show_teams else "Switch to Teams"
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        await tourney_join_execute(interaction, self.t, bal)
 
 
 # -- Stats View ---------------------------------------------------------------
 
-class TournamentStatsView(discord.ui.View):
-    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict, roster=None, team_info=None):
-        super().__init__(timeout=120)
+class TournamentStatsView:
+    """Plain stats embed builder (no buttons)."""
+    def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict):
         self.caller = caller
         self.target = target
         self.stats = stats
-        self.roster = roster
-        self.team_info = team_info
-        self.show_team = False
-        if not roster:
-            self.toggle.disabled = True
 
     def build_personal_embed(self) -> discord.Embed:
         net = self.stats['total_chips'] - config.TOURNAMENT_STARTING_CHIPS
@@ -340,117 +135,7 @@ class TournamentStatsView(discord.ui.View):
         embed.add_field(name="Net Chips", value=f"{'+' if net >= 0 else ''}{net:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
         embed.add_field(name="Wallet Balance", value=f"{self.stats['balance']:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
         embed.add_field(name="VPIP %", value=vpip_str, inline=True)
-
-        team_val = self.stats['team_name'] or "None"
-        embed.add_field(name="Team", value=team_val, inline=False)
         return embed
-
-    def build_team_embed(self) -> discord.Embed:
-        embed = discord.Embed(title=f"Team Stats — {self.stats['team_name']}", color=0xE67E22)
-
-        leader_id = self.team_info.get('leader_id') if self.team_info else None
-
-        lines = []
-        if self.roster:
-            for i, p in enumerate(self.roster):
-                is_leader = " 👑 *(Captain)*" if p['user_id'] == leader_id else ""
-                lines.append(
-                    f"{i + 1}. **{p['username']}**{is_leader} - {p['total_chips']:,} {config.TOURNAMENT_CHIP_EMOJI} ({p['hands_won']} wins)")
-
-        text = "\n".join(lines) or "No players."
-        embed.add_field(name="Player Contributions", value=text, inline=False)
-        return embed
-
-    @discord.ui.button(label="Switch to Team Stats", style=discord.ButtonStyle.blurple)
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.caller.id:
-            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
-        self.show_team = not self.show_team
-        button.label = "Switch to My Stats" if self.show_team else "Switch to Team Stats"
-        embed = self.build_team_embed() if self.show_team else self.build_personal_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-
-class TournamentTeamsView(discord.ui.View):
-    def __init__(self, caller: discord.User | discord.Member, teams: list[dict]):
-        super().__init__(timeout=120)
-        self.caller = caller
-        self.teams = teams
-        self.page = 0
-        self.update_buttons()
-
-    def update_buttons(self):
-        max_pages = len(self.teams)
-        self.btn_first.disabled = self.page == 0
-        self.btn_prev.disabled = self.page == 0
-        self.btn_next.disabled = self.page >= max_pages - 1
-        self.btn_last.disabled = self.page >= max_pages - 1
-
-    async def build_embed(self) -> discord.Embed:
-        team = self.teams[self.page]
-        embed = discord.Embed(title=f"🛡️ Team: {team['name']}", color=0x3498DB)
-
-        import config
-
-        # Dynamically fetch the live roster for this specific team
-        roster = await tdb.get_team_roster(team['id'])
-
-        leader_id = team.get('leader_id')
-        leader_str = f"👑 {team['leader_name']}" if team.get('leader_name') else "No Captain Set"
-
-        embed.add_field(name="Captain", value=leader_str, inline=False)
-
-        lines = []
-        if roster:
-            for i, p in enumerate(roster):
-                is_leader = " 👑" if p['user_id'] == leader_id else ""
-                lines.append(
-                    f"{i + 1}. **{p['username']}**{is_leader} - {p['total_chips']:,} {config.TOURNAMENT_CHIP_EMOJI} ({p['hands_won']} wins)")
-
-        text = "\n".join(lines) or "No players yet."
-
-        # Dynamic status tag
-        status = " *(Looking for players!)*" if len(roster) < 4 else " *(Full)*"
-        embed.add_field(name=f"Roster ({len(roster)}/4){status}", value=text, inline=False)
-
-        embed.set_footer(text=f"Page {self.page + 1} of {len(self.teams)}")
-        return embed
-
-    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.blurple, row=1)
-    async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.caller.id:
-            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
-            return
-        self.page = 0
-        self.update_buttons()
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-
-    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.blurple, row=1)
-    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.caller.id:
-            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
-            return
-        self.page = max(0, self.page - 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-
-    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.blurple, row=1)
-    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.caller.id:
-            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
-            return
-        self.page = min(len(self.teams) - 1, self.page + 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-
-    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.blurple, row=1)
-    async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.caller.id:
-            await interaction.response.send_message("❌ This is not your menu.", ephemeral=True)
-            return
-        self.page = len(self.teams) - 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
 
 # -- Cog ----------------------------------------------------------------------
@@ -572,9 +257,9 @@ class TournamentCog(commands.Cog):
 
     # -- Manager: Table -------------------------------------------------------
 
-    @tourneymgr.command(name="open", description="[Manager] Open a new tournament table")
-    @app_commands.describe(name="Table name", max_buyin="Max buy-in (0 for no limit)")
-    async def open_table(self, interaction: discord.Interaction, name: str, max_buyin: int = 5000):
+    @tourney.command(name="open", description="[Manager] Open a new tournament table")
+    @app_commands.describe(name="Table name")
+    async def open_table(self, interaction: discord.Interaction, name: str):
         # 1. Defer the response first
         await interaction.response.defer()
 
@@ -592,10 +277,11 @@ class TournamentCog(commands.Cog):
         t.is_tournament = True
 
         # 3. Deep-Stack Tournament Limits
-        t.game.SMALL_BLIND = 25
-        t.game.BIG_BLIND = 50
+        small_blind, big_blind = await tdb.get_blinds()
+        t.game.SMALL_BLIND = small_blind
+        t.game.BIG_BLIND = big_blind
         t.game.MIN_BUYIN = 250
-        t.game.MAX_BUYIN = max_buyin
+        t.game.MAX_PLAYERS = 9
         t.game.tax_rate = 0
         t.game.tax_exempt = True
 
@@ -607,8 +293,55 @@ class TournamentCog(commands.Cog):
 
         # 4. Use followup.send for the final confirmation!
         await interaction.followup.send(
-            f"Tournament Table Open!\nBlind: {t.game.SMALL_BLIND}/{t.game.BIG_BLIND} | Min: {t.game.MIN_BUYIN} | Max: {t.game.MAX_BUYIN or 'None'}")
+            f"Tournament Table Open!\nBlind: {t.game.SMALL_BLIND}/{t.game.BIG_BLIND} | Min: {t.game.MIN_BUYIN} | Full-stack buy-in | {t.game.MAX_PLAYERS}-max")
         await refresh(interaction.channel, t)
+
+    # -- Aliases for /poker start and /poker close ----------------------------
+
+    async def _run_poker_cmd(self, name: str, interaction: discord.Interaction):
+        poker_cog = self.bot.get_cog("PokerCog")
+        cmd = poker_cog.poker.get_command(name) if poker_cog else None
+        if not cmd:
+            await interaction.response.send_message("❌ Poker cog isn't loaded.", ephemeral=True)
+            return
+        await cmd.callback(poker_cog, interaction)
+
+    @tourney.command(name="start", description="[Manager] Deal the first hand")
+    async def mgr_start(self, interaction: discord.Interaction):
+        await self._run_poker_cmd("start", interaction)
+
+    @tourney.command(name="close", description="[Manager] Close table after current hand")
+    async def mgr_close(self, interaction: discord.Interaction):
+        await self._run_poker_cmd("close", interaction)
+
+    @tourneymgr.command(name="blinds", description="[Manager] Set the tournament blinds (saved; applies from the next hand)")
+    @app_commands.describe(small_blind="New small blind", big_blind="New big blind")
+    async def set_blinds(self, interaction: discord.Interaction, small_blind: int, big_blind: int):
+        if not await self.is_manager(interaction):
+            await interaction.response.send_message("Managers only.", ephemeral=True); return
+
+        if small_blind <= 0 or big_blind <= small_blind:
+            await interaction.response.send_message("❌ Blinds must satisfy 0 < small < big.", ephemeral=True); return
+
+        await tdb.set_blinds(small_blind, big_blind)
+
+        applied_now = queued = 0
+        for key, t in list(tables.items()):
+            if not getattr(t, 'is_tournament', False):
+                continue
+            g = t.game
+            if g.street == Street.WAITING:
+                g.SMALL_BLIND, g.BIG_BLIND = small_blind, big_blind
+                g.pending_blinds = None
+                applied_now += 1
+            else:
+                # Hand in progress: min-raise/blind math reads BIG_BLIND mid-hand, so queue it
+                g.pending_blinds = (small_blind, big_blind)
+                queued += 1
+
+        await interaction.response.send_message(
+            f"📈 Tournament blinds set to **{small_blind}/{big_blind}** (saved for future tables). "
+            f"Applied now: {applied_now} table(s), after current hand: {queued}.")
 
     @tourneymgr.command(name="forcefold", description="Force fold a player")
     async def forcefold(self, interaction: discord.Interaction, user: discord.Member):
@@ -742,78 +475,13 @@ class TournamentCog(commands.Cog):
         else:
             await interaction.response.send_message(f"Failed - player may not have enough {config.TOURNAMENT_CHIP_EMOJI}.", ephemeral=True)
 
-    @tourneymgr.command(name="createteam", description="Create a tournament team")
-    async def createteam(self, interaction: discord.Interaction, name: str):
-        if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True); return
-
-        success = await tdb.create_team(name, interaction.user.id)
-        if success:
-            await interaction.response.send_message(f"Team {name} created.")
-        else:
-            await interaction.response.send_message(f"Team {name} already exists.", ephemeral=True)
-
-    @tourneymgr.command(name="addplayer", description="Add player to a team")
-    async def addplayer(self, interaction: discord.Interaction, team_name: str, user: discord.Member):
-        if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True);
-            return
-
-        import datetime
-
-        team = await tdb.get_team_by_name(team_name)
-        if not team:
-            await interaction.response.send_message("Team not found.", ephemeral=True);
-            return
-
-        stats = await tdb.get_player_stats(user.id)
-        if not stats:
-            await interaction.response.send_message("Player not registered.", ephemeral=True);
-            return
-
-        # 🛠️ FIXED: Prevent silent team swapping
-        if stats.get('team_id') is not None:
-            await interaction.response.send_message("❌ Player is already on a team. Remove them first.", ephemeral=True)
-            return
-
-        # --- ⏳ 24-HOUR DEADLINE CHECK ---
-        reg_dt = datetime.datetime.fromisoformat(stats['registered_at']).replace(tzinfo=datetime.timezone.utc)
-        reg_ts = int(reg_dt.timestamp())
-        now = datetime.datetime.now(datetime.timezone.utc)
-        deadline = reg_dt + datetime.timedelta(days=1)
-
-        if now > deadline:
-            await interaction.response.send_message(
-                f"❌ **{user.display_name}** registered more than 24 hours ago (<t:{reg_ts}:R>). Players can only be added to a team within 24 hours of registering!",
-                ephemeral=False
-            )
-            return
-        # --------------------------------------------
-
-        # 🛠️ FIXED: Rely on the DB's atomic lock to prevent TOCTOU overflow
-        success = await tdb.add_player_to_team(user.id, team['id'])
-        if not success:
-            await interaction.response.send_message(f"❌ Team **{team_name}** is already full (Max 4 players).",
-                                                    ephemeral=False)
-            return
-
-        await interaction.response.send_message(f"Added {user.display_name} to team {team_name}.")
-
-    @tourneymgr.command(name="removeplayer", description="Remove player from their team")
-    async def removeplayer(self, interaction: discord.Interaction, user: discord.Member):
-        if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True); return
-
-        await tdb.remove_player_from_team(user.id)
-        await interaction.response.send_message(f"Removed {user.display_name} from their team.")
-
     # -- Player ---------------------------------------------------------------
 
     @tourney.command(name="register", description="Register for the tournament")
     async def register(self, interaction: discord.Interaction):
 
-        await interaction.response.send_message("Registration is closed now.", ephemeral=True)
-        return
+        #await interaction.response.send_message("Registration is closed now.", ephemeral=True)
+        #return
 
         if interaction.channel_id != config.TOURNAMENT_REGISTER_CHANNEL_ID:
             await interaction.response.send_message(
@@ -862,53 +530,41 @@ class TournamentCog(commands.Cog):
             await interaction.followup.send("❌ Player not registered. Use `/tourney register` first.", ephemeral=True)
             return
 
-        roster = None
-        team_info = None
-        if stats.get('team_id'):
-            roster = await tdb.get_team_roster(stats['team_id'])
-            team_info = await tdb.get_team_by_id(stats['team_id'])
+        view = TournamentStatsView(interaction.user, target, stats)
+        await interaction.followup.send(embed=view.build_personal_embed(), ephemeral=hidden)
 
-        view = TournamentStatsView(interaction.user, target, stats, roster, team_info)
-        await interaction.followup.send(embed=view.build_personal_embed(), view=view, ephemeral=hidden)
-
-    @tourneymgr.command(name="setleader", description="[Manager] Set the captain/leader of a team")
-    async def setleader(self, interaction: discord.Interaction, team_name: str, user: discord.Member):
-        if not await self.is_manager(interaction):
-            await interaction.response.send_message("Managers only.", ephemeral=True)
-            return
-
-        team = await tdb.get_team_by_name(team_name)
-        if not team:
-            await interaction.response.send_message("❌ Team not found.", ephemeral=True)
-            return
-
-        stats = await tdb.get_player_stats(user.id)
-        if not stats or stats.get('team_id') != team['id']:
-            await interaction.response.send_message(
-                f"❌ **{user.display_name}** is not on team **{team_name}**. They must be on the team to be made captain.",
-                ephemeral=True)
-            return
-
-        await tdb.set_team_leader(team['id'], user.id)
-        await interaction.response.send_message(
-            f"👑 **{user.display_name}** has been officially set as the captain of team **{team_name}**.")
-
-    @tourney.command(name="leaderboard", description="View tournament leaderboards")
+    @tourney.command(name="leaderboard", description="View the tournament leaderboard")
     async def leaderboard(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        indiv = await tdb.get_individual_leaderboard(10)
+        rows = await tdb.get_individual_leaderboard(10)
+        if not rows:
+            await interaction.followup.send("No players yet!", ephemeral=True)
+            return
 
-        for r in indiv:
-            member = interaction.guild.get_member(r['user_id'])
-            if member:
-                r['username'] = member.name
-
-        teams = await tdb.get_team_leaderboard(10)
         caller_id = interaction.user.id
         caller_row = await tdb.get_player_stats(caller_id)
         caller_rank = await tdb.get_player_rank(caller_id) if caller_row else None
-        view = TournamentLeaderboardView(caller_id, caller_row, caller_rank, indiv, teams)
-        await interaction.followup.send(embed=view.get_embed(), view=view)
+        image_bytes = await asyncio.to_thread(
+            generate_leaderboard_image,
+            rows,
+            caller_id,
+            caller_row,
+            caller_rank,
+            title="Tournament Leaderboard",
+        )
+
+        file = discord.File(image_bytes, filename="tournament_leaderboard.png")
+
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem("attachment://tournament_leaderboard.png")
+            ),
+            accent_color=0xF1C40F,
+        )
+        view = discord.ui.LayoutView()
+        view.add_item(container)
+
+        await interaction.followup.send(file=file, view=view)
 
     @tourney.command(name="myactivity", description="Check your dynamic 25% wager quota and activity")
     async def myactivity(self, interaction: discord.Interaction):
@@ -994,7 +650,7 @@ class TournamentCog(commands.Cog):
         bar = ("🟩" * filled) + ("⬛" * (10 - filled))
 
         if is_pre_tourney:
-            embed.description = "⏳ **The tournament officially begins on June 7th!**\nTeam registration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
+            embed.description = "⏳ **The tournament officially begins on June 7th!**\nRegistration is open, but wager quotas and coasting penalties will not be enforced until the games begin."
         else:
             embed.description = f"{status_msg}{warning}\n\n**Progress:** {percent_complete:.1f}%\n{bar}"
 
@@ -1046,21 +702,6 @@ class TournamentCog(commands.Cog):
                 await channel.send(content=f"🚨 **Coasting Penalties Applied!** (DMs sent: {dm_sent}/{len(penalties)})",
                                    embed=embed)
 
-    @tourney.command(name="teams", description="View all registered tournament teams")
-    async def list_teams(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        teams = await tdb.get_all_teams_info()
-
-        if not teams:
-            await interaction.followup.send("No teams have been created yet.")
-            return
-
-        # Spawn the interactive paginated view
-        view = TournamentTeamsView(interaction.user, teams)
-        embed = await view.build_embed()
-
-        await interaction.followup.send(embed=embed, view=view)
-
     @tourneymgr.command(name="sql", description="[Dev] Run a read-only tournament database query")
     @app_commands.describe(query="The SELECT query to run")
     async def run_tourney_sql(self, interaction: discord.Interaction, query: str):
@@ -1101,24 +742,6 @@ class TournamentCog(commands.Cog):
         except Exception as e:
             traceback.print_exc()
             await interaction.followup.send(f"❌ **SQL Error:**\n`{e}`", ephemeral=False)
-
-    @tourneymgr.command(name="deleteteam", description="[Manager] Delete a team and unassign its players")
-    @app_commands.describe(team_name="The exact name of the team to delete")
-    async def delete_team_cmd(self, interaction: discord.Interaction, team_name: str):
-        await interaction.response.defer(ephemeral=False)
-
-        if not await self.is_manager(interaction):
-            await interaction.followup.send("Managers only.", ephemeral=True)
-            return
-
-        success = await tdb.delete_team(team_name)
-
-        if success:
-            await interaction.followup.send(
-                f"✅ The team **{team_name}** has been deleted. Its players are still registered but are now unassigned.")
-        else:
-            await interaction.followup.send(
-                f"❌ Could not find a team named **{team_name}**. Please check the spelling.", ephemeral=True)
 
     @tourneymgr.command(name="setcycle", description="[Manager] Force the tournament cycle to a specific day")
     @app_commands.describe(day="1 = Start tracking (Warnings tmrw), 2 = Warnings active (Penalties tmrw)")

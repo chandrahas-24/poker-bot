@@ -24,24 +24,13 @@ async def init_db():
     db = await _get_db()
     async with _write_lock:
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS teams (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                created_by INTEGER NOT NULL,
-                leader_id INTEGER DEFAULT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        await db.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL,
-                team_id INTEGER DEFAULT NULL,
                 balance INTEGER DEFAULT 0,
                 hands_won INTEGER DEFAULT 0,
                 hands_played INTEGER DEFAULT 0,
-                registered_at TEXT NOT NULL,
-                FOREIGN KEY (team_id) REFERENCES teams(id)
+                registered_at TEXT NOT NULL
             )
         """)
         await db.execute("""
@@ -71,18 +60,20 @@ async def init_db():
                 """)
         await db.execute("INSERT OR IGNORE INTO tourney_state (id, cycle_day) VALUES (1, 1)")
 
+        # Staff-editable tournament settings (key/value), e.g. blinds
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tourney_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
 
         # Add the activity tracking columns safely
         try:
             await db.execute("ALTER TABLE players ADD COLUMN period_wagered INTEGER DEFAULT 0")
             await db.execute("ALTER TABLE players ADD COLUMN last_activity TEXT")
             await db.execute("ALTER TABLE players ADD COLUMN target_wager INTEGER DEFAULT 1250")
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e).lower():
-                raise
-
-        try:
-            await db.execute("ALTER TABLE teams ADD COLUMN leader_id INTEGER")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
@@ -101,6 +92,24 @@ async def checkpoint():
     async with _write_lock:
         await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
+# ── Settings ──
+
+DEFAULT_SMALL_BLIND = 25
+DEFAULT_BIG_BLIND = 50
+
+async def get_blinds() -> tuple[int, int]:
+    db = await _get_db()
+    async with db.execute("SELECT key, value FROM tourney_settings WHERE key IN ('small_blind', 'big_blind')") as c:
+        vals = {r[0]: int(r[1]) for r in await c.fetchall()}
+    return vals.get('small_blind', DEFAULT_SMALL_BLIND), vals.get('big_blind', DEFAULT_BIG_BLIND)
+
+async def set_blinds(small_blind: int, big_blind: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("INSERT OR REPLACE INTO tourney_settings (key, value) VALUES ('small_blind', ?)", (str(small_blind),))
+        await db.execute("INSERT OR REPLACE INTO tourney_settings (key, value) VALUES ('big_blind', ?)", (str(big_blind),))
+        await db.commit()
+
 # ── Registration ──
 
 async def is_registered(user_id: int) -> bool:
@@ -110,7 +119,7 @@ async def is_registered(user_id: int) -> bool:
         return bool(row)
 
 
-async def register_player(user_id: int, username: str, team_id: int | None = None) -> bool:
+async def register_player(user_id: int, username: str) -> bool:
     if await is_registered(user_id):
         return False
     db = await _get_db()
@@ -119,9 +128,9 @@ async def register_player(user_id: int, username: str, team_id: int | None = Non
 
     async with _write_lock:
         await db.execute("""
-            INSERT INTO players (user_id, username, team_id, balance, registered_at, last_activity, period_wagered, target_wager)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, username, team_id, config.TOURNAMENT_STARTING_CHIPS, now, now, 0, target))
+            INSERT INTO players (user_id, username, balance, registered_at, last_activity, period_wagered, target_wager)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, username, config.TOURNAMENT_STARTING_CHIPS, now, now, 0, target))
         await db.commit()
     return True
 
@@ -267,107 +276,13 @@ async def log_hand(table_name: str, winner_id: int, winner_name: str, pot: int, 
         """, (table_name, winner_id, winner_name, pot, summary, now))
         await db.commit()
 
-# ── Team Management ──
-
-async def create_team(name: str, created_by: int) -> bool:
-    db = await _get_db()
-    now = datetime.utcnow().isoformat()
-    try:
-        async with _write_lock:
-            # 🛠️ FIXED: Staff create teams, so leader_id defaults to NULL
-            await db.execute(
-                "INSERT INTO teams (name, created_by, leader_id, created_at) VALUES (?, ?, NULL, ?)",
-                (name, created_by, now)
-            )
-            await db.commit()
-        return True
-    except aiosqlite.IntegrityError:
-        return False
-
-async def set_team_leader(team_id: int, user_id: int) -> bool:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute("UPDATE teams SET leader_id = ? WHERE id = ?", (user_id, team_id))
-        async with db.execute("SELECT changes()") as c:
-            row = await c.fetchone()
-            success = bool(row and row[0] > 0)
-        await db.commit()
-        return success
-
-async def get_team_by_name(name: str) -> dict | None:
-    db = await _get_db()
-    async with db.execute("SELECT * FROM teams WHERE name=?", (name,)) as c:
-        row = await c.fetchone()
-        return dict(row) if row else None
-        
-async def get_team_by_id(team_id: int) -> dict | None:
-    db = await _get_db()
-    async with db.execute("SELECT * FROM teams WHERE id=?", (team_id,)) as c:
-        row = await c.fetchone()
-        return dict(row) if row else None
-
-async def get_all_teams() -> list[dict]:
-    db = await _get_db()
-    async with db.execute("SELECT * FROM teams") as c:
-        return [dict(r) for r in await c.fetchall()]
-
-async def get_all_teams_info() -> list[dict]:
-    db = await _get_db()
-    async with db.execute("""
-        SELECT t.id, t.name, t.leader_id,
-               (SELECT username FROM players WHERE user_id = t.leader_id) as leader_name,
-               COUNT(p.user_id) as member_count
-        FROM teams t
-        LEFT JOIN players p ON t.id = p.team_id
-        GROUP BY t.id
-        ORDER BY t.name ASC
-    """) as c:
-        return [dict(r) for r in await c.fetchall()]
-
-async def add_player_to_team(user_id: int, team_id: int) -> bool:
-    db = await _get_db()
-    async with _write_lock:
-        async with db.execute("SELECT COUNT(*) FROM players WHERE team_id = ?", (team_id,)) as c:
-            count = (await c.fetchone())[0]
-        if count >= 4:
-            return False
-
-        await db.execute("UPDATE players SET team_id = ? WHERE user_id = ?", (team_id, user_id))
-        async with db.execute("SELECT changes()") as c:
-            row = await c.fetchone()
-            success = bool(row and row[0] > 0)
-        await db.commit()
-        return success
-
-async def remove_player_from_team(user_id: int) -> bool:
-    db = await _get_db()
-    async with _write_lock:
-        await db.execute("UPDATE players SET team_id = NULL WHERE user_id = ?", (user_id,))
-        async with db.execute("SELECT changes()") as c:
-            row = await c.fetchone()
-            success = bool(row and row[0] > 0)
-        await db.commit()
-        return success
-
-async def get_team_roster(team_id: int) -> list[dict]:
-    db = await _get_db()
-    async with db.execute("""
-        SELECT p.*, (p.balance + COALESCE(c.amount, 0)) as total_chips
-        FROM players p
-        LEFT JOIN chips_in_play c ON p.user_id = c.user_id
-        WHERE p.team_id = ?
-        ORDER BY total_chips DESC
-    """, (team_id,)) as c:
-        return [dict(r) for r in await c.fetchall()]
-
 # ── Stats & Leaderboards ──
 
 async def get_player_stats(user_id: int) -> dict | None:
     db = await _get_db()
     async with db.execute("""
-        SELECT p.*, t.name as team_name, COALESCE(c.amount, 0) as chips_in_play
+        SELECT p.*, COALESCE(c.amount, 0) as chips_in_play
         FROM players p
-        LEFT JOIN teams t ON p.team_id = t.id
         LEFT JOIN chips_in_play c ON p.user_id = c.user_id
         WHERE p.user_id = ?
     """, (user_id,)) as c:
@@ -376,7 +291,9 @@ async def get_player_stats(user_id: int) -> dict | None:
             return None
         stats = dict(row)
         stats['total_chips'] = stats['balance'] + stats['chips_in_play']
-        
+        stats['net_chips'] = stats['total_chips'] - config.TOURNAMENT_STARTING_CHIPS
+        stats['wallet'] = stats['balance']  # same key poker/uno stats use (leaderboard image)
+
         # Calculate win%
         hands_played = stats['hands_played']
         hands_won = stats['hands_won']
@@ -426,23 +343,10 @@ async def get_individual_leaderboard(limit: int = 10) -> list[dict]:
         ORDER BY total_chips DESC
         LIMIT ?
     """, (limit,)) as c:
-        return [dict(r) for r in await c.fetchall()]
-
-async def get_team_leaderboard(limit: int = 10) -> list[dict]:
-    db = await _get_db()
-    async with db.execute("""
-        SELECT 
-            t.id, 
-            COALESCE(t.name, p.username || ' (Solo)') as name, 
-            SUM(p.hands_won) as total_wins
-        FROM players p
-        LEFT JOIN teams t ON p.team_id = t.id
-        GROUP BY COALESCE(p.team_id, p.user_id)
-        ORDER BY total_wins DESC
-        LIMIT ?
-    """, (limit,)) as c:
-        return [dict(r) for r in await c.fetchall()]
-
+        rows = [dict(r) for r in await c.fetchall()]
+    for r in rows:
+        r['net_chips'] = r['total_chips'] - config.TOURNAMENT_STARTING_CHIPS
+    return rows
 
 async def log_period_wagers(wagers: dict):
     """Adds chips wagered to the 48-hour tracker and stamps last activity."""
@@ -535,59 +439,6 @@ async def process_daily_tourney_check() -> tuple[int, list[dict], list[dict]]:
 
     return cycle_day, warnings, penalties
 
-
-async def get_team_dominance_warning(active_user_ids: list[int]) -> str | None:
-    """Checks if any team holds >50% of the provided seats. Returns a warning string if true."""
-    if len(active_user_ids) < 2:
-        return None  # Normal engine logic will pause the game if only 1 person is left anyway
-
-    db = await _get_db()
-    team_counts = {}
-
-    # Count how many players belong to each team at this specific table
-    placeholders = ",".join("?" * len(active_user_ids))
-    async with db.execute(
-            f"SELECT team_id FROM players WHERE user_id IN ({placeholders}) AND team_id IS NOT NULL",
-            active_user_ids
-    ) as c:
-        for row in await c.fetchall():
-            tid = row[0]
-            team_counts[tid] = team_counts.get(tid, 0) + 1
-
-    total_active = len(active_user_ids)
-
-    # Check if any team crossed the 50% line
-    for tid, count in team_counts.items():
-        if count > (total_active / 2.0):
-            # Fetch the actual team name so the bot can call them out in chat
-            async with db.execute("SELECT name FROM teams WHERE id=?", (tid,)) as c:
-                t_row = await c.fetchone()
-                t_name = t_row[0] if t_row else "A team"
-
-            return (
-                f"Team **{t_name}** currently controls more than 50% of the active seats ({count}/{total_active}). "
-                f"The game has been paused. To resume, other players must join, or someone from {t_name} must leave."
-            )
-
-    return None
-
-
-async def delete_team(team_name: str) -> bool:
-    """Deletes a team and unassigns its players. Returns True if successful."""
-    db = await _get_db()
-    async with _write_lock:
-        async with db.execute("SELECT id FROM teams WHERE name = ? COLLATE NOCASE", (team_name,)) as c:
-            row = await c.fetchone()
-
-        if not row:
-            return False
-
-        team_id = row[0]
-
-        await db.execute("UPDATE players SET team_id = NULL WHERE team_id = ?", (team_id,))
-        await db.execute("DELETE FROM teams WHERE id = ?", (team_id,))
-        await db.commit()
-        return True
 
 async def refresh_player_name(user_id: int, username: str):
     db = await _get_db()

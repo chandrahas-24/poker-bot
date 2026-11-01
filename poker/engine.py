@@ -225,6 +225,7 @@ class PokerGame:
         self.tax_rate, _ = taxation.get_tax_config()
         self.is_tournament = False
         self.tax_exempt = False
+        self.pending_blinds = None   # (sb, bb) queued by staff; applied when the current hand ends
         self.vpip = False
 
         # ── AFK / decision-timeout hook ─────────────────────────────────────
@@ -1941,6 +1942,9 @@ class PokerGame:
 
     def _end_hand(self):
         self.street = Street.WAITING
+        if self.pending_blinds:
+            self.SMALL_BLIND, self.BIG_BLIND = self.pending_blinds
+            self.pending_blinds = None
         self.community = []
         self.pot       = 0
         for p in self.players:

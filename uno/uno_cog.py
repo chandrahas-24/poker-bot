@@ -4610,10 +4610,17 @@ class UnoGame(commands.Cog):
         container.add_item(
             TextDisplay(
                 "### <:uno_draw_2:1536919114247839815> Draw 2 Stacking\n"
-                "When a Draw 2 is played, the next player can **stack** another Draw 2 on it "
+                "When a +2 is played, the next player can **stack** another +2 "
                 "instead of drawing: `+2 → +4 → +6 → +8`.\n"
                 "If you can't or don't want to stack, press **Draw N** to take the whole pile\n"
                 "\n"
+            )
+        )
+
+        container.add_item(Separator())
+
+        container.add_item(
+            TextDisplay(
                 "### 💥 Knockout\n"
                 f"Reach **{ue.MAX_HAND} cards** and you're knocked out of the round. "
                 "Your cards go back to the deck and your bet is forfeited, just like quitting."

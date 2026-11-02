@@ -2,14 +2,9 @@
 uno_cog.py
 Discord-facing session layer for UNO, built on top of the pure uno_engine.
 
-Per current scope: NO per-card button/emoji UI is hooked up yet — every
-card is entered through a modal (PlayCardModal). This also means the
-"force modal when hand > 25 or a button fails" requirement is already
-satisfied by construction right now; when the fancy per-card button hand
-(from unodemo.py) gets wired in later, that flow should try the button
-path and fall back to send_modal(PlayCardModal(...)) in the except branch,
-and should check len(hand) > MAX_BUTTONS_TOTAL up front to skip straight
-to the modal.
+Hands never exceed 24 cards (a 25th card is a knockout), so the per-card
+button hand always fits Discord's 25-button ceiling; the PlayCardModal is
+only the fallback when the button hand fails to build in time.
 
 Features implemented here:
   - Persistent table (like a poker table). /uno open posts a join panel;
@@ -39,8 +34,13 @@ Features implemented here:
     concern there since only the clicker sees it) but also uses mentions
     instead of display names for consistency/clickability.
   - Table view buttons: Play / Hand / Draw / Table(turn order) / Callout.
-    Draw and Callout double as Accept/Challenge for a pending Wild Draw
-    Four decision (see below) when the clicking user is the target.
+    While a Wild Draw Four decision is pending the message shows ONLY
+    Accept / Challenge (target only); /uno draw and /uno callout still
+    work as aliases for them. Draw reads "Draw N" while a +2 stack is
+    pending.
+  - House rules: stackable +2s (play a +2 on a +2, otherwise take the
+    whole pile and lose the turn) and a 25-card knockout (a hand that
+    reaches 25 cards is out of the round, bet forfeited like a quit).
   - Wild Draw Four follows the real official rule: it can always be
     played, but the targeted player may challenge it instead of just
     accepting the 4-card penalty. If the WD4 player actually had a card
@@ -103,7 +103,6 @@ from .unodemo import (
     build_rows_with_fallback,
     sanitize_emoji_name,
     FALLBACK_EMOJI_BY_COLOR,
-    MAX_BUTTONS_TOTAL,
 )
 
 from poker.leaderboard_image import generate_leaderboard_image
@@ -345,7 +344,6 @@ async def silent_ack(interaction: discord.Interaction):
         pass
 
 
-# MAX_BUTTONS_TOTAL is imported from unodemo (both are Discord's 5x5 = 25 button ceiling)
 
 COLOR_TO_DISCORD = {
     "Red": discord.Color.red(),
@@ -407,8 +405,11 @@ def describe_last_action(session: "GameSession") -> str:
         parts = [f"{actor} {verb} **{pretty}**."]
         if effects.get("reversed"):
             parts.append("<:uno_reversal:1536288323268780123> Direction reversed!")
+        stacked = effects.get("stacked")
+        if stacked:
+            parts.append(f"<:uno_draw_2:1536919114247839815> The pile is now **+{stacked['n']}**!")
         if effects.get("wd4_pending"):
-            parts.append(f"\n⚠️ {_mention(effects.get('target_id'))} must **Draw** (accept) or **Callout** (challenge) the Wild Draw Four.")
+            parts.append(f"\n⚠️ {_mention(effects.get('target_id'))} must **Accept** or **Challenge** the Wild Draw Four.")
         drew = effects.get("drew")
         if drew:
             parts.append(f"{_plain_name(session, drew['player_id'])} drew {drew['n']} card{'s' if drew['n'] != 1 else ''} and was skipped!")
@@ -421,7 +422,7 @@ def describe_last_action(session: "GameSession") -> str:
         pretty = effects.get("card", "Wild").replace("_", " ")
         parts = [f"{actor} played **{pretty}** and chose **{action['color']}**."]
         if effects.get("wd4_pending"):
-            parts.append(f"⚠️ {_mention(effects.get('target_id'))} must **Draw** (accept) or **Callout** (challenge) the Wild Draw Four.")
+            parts.append(f"⚠️ {_mention(effects.get('target_id'))} must **Accept** or **Challenge** the Wild Draw Four.")
         drew = effects.get("drew")
         if drew:
             parts.append(f"{_plain_name(session, drew['player_id'])} drew {drew['n']} cards and was skipped!")
@@ -442,6 +443,14 @@ def describe_last_action(session: "GameSession") -> str:
     if t == "draw":
         return f"{actor} drew a card."
 
+    if t == "stack_draw":
+        n = action.get("n", 0)
+        return f"{actor} drew **{n}** card{'s' if n != 1 else ''} from the +2 pile"
+
+    if t == "timeout_stack_draw":
+        n = action.get("n", 0)
+        return f"<a:bay_alarm:1536288829248512030> {actor} was AFK and took the +2 pile (**{n}** cards)."
+
     if t == "timeout_draw":
         return f"<a:bay_alarm:1536288829248512030> {actor} was AFK and auto-drew a card."
 
@@ -460,7 +469,7 @@ def describe_last_action(session: "GameSession") -> str:
         return f"❗ {actor} called it out — {caught_names} forgot UNO and drew {n} penalty cards each!"
 
     if t == "callout_miss":
-        return f"❗ {actor} called out the table but nobody was vulnerable — drew {action.get('n', 2)} penalty cards for the false callout."
+        return f"❗ {actor} false callout."
 
     return "..."
 
@@ -487,6 +496,8 @@ def _build_table_text(session: "GameSession") -> str:
             pass  # already covered by the wd4_pending note in describe_last_action
         else:
             lines.append(f"<:uno_arrow:1536135499566157956> It's {_mention(current.player_id)}'s turn.")
+            if engine.draw_penalty > 0:
+                lines.append(f"⚠️ **+{engine.draw_penalty} stacked** - play a **+2** or draw {engine.draw_penalty}.")
     else:
         lines.append("Game over.")
 
@@ -633,7 +644,6 @@ class GameSession:
         self.min_bet = int(s["min_bet"])
         self.max_bet = int(s["max_bet"])  # 0 = no limit
         self.turn_timeout = int(s["turn_timeout"])
-        self.bet_window = int(s["bet_window"])
         self.resend_after = int(s["resend_after_msgs"])
         self.max_players = int(s["max_players"])
         self.num_decks = int(s["num_decks"])
@@ -1437,9 +1447,10 @@ class CallUnoToggleView(discord.ui.View):
 
 
 class PlayCardModal(discord.ui.Modal, title="Play a card"):
-    """Text-entry fallback — used automatically when a hand is too big for
-    a button grid (> MAX_BUTTONS_TOTAL), and always available as a manual
-    option via /uno play for anyone who'd rather type than tap."""
+    """Text-entry fallback — used when the button hand fails to build in time,
+    and always available as a manual option via /uno play for anyone who'd
+    rather type than tap. (Hands never exceed 24 cards: reaching 25 is a
+    knockout, so there's no oversized-hand case any more.)"""
     card_input = discord.ui.TextInput(
         label="Card (e.g. Red_4, Blue Skip, Wild Draw 4)",
         placeholder="Red_4",
@@ -1469,8 +1480,9 @@ class HandPlayView(discord.ui.LayoutView):
     """
     The real per-card button hand — stitched hand image up top, color-
     grouped rows of buttons below, each one playing that exact card when
-    tapped. Only used when the hand fits in Discord's 25-button ceiling;
-    Play falls back to PlayCardModal automatically above that.
+    tapped. A hand always fits the 25-button ceiling because reaching 25
+    cards knocks the player out; if the build fails or is too slow, Play
+    falls back to PlayCardModal.
     """
 
     def __init__(self, cog: "UnoGame", session: GameSession, player_id: int):
@@ -1612,24 +1624,38 @@ class TableView(discord.ui.LayoutView):
 
         container.add_item(Separator(spacing=discord.SeparatorSpacing.small))
 
-        # All 5 buttons fit in a single ActionRow (Discord's cap is 5 per
-        # row) — no reason to split them across two.
         row = ActionRow()
-        play_btn = Button(label="Play", style=discord.ButtonStyle.primary, custom_id="uno_play")
-        play_btn.callback = self._play
-        row.add_item(play_btn)
-        draw_btn = Button(label="Draw", style=discord.ButtonStyle.secondary, custom_id="uno_draw")
-        draw_btn.callback = self._draw
-        row.add_item(draw_btn)
-        callout_btn = Button(label="Callout", style=discord.ButtonStyle.danger, custom_id="uno_callout")
-        callout_btn.callback = self._callout
-        row.add_item(callout_btn)
-        hand_btn = Button(label="Hand", style=discord.ButtonStyle.secondary, custom_id="uno_hand")
-        hand_btn.callback = self._hand
-        row.add_item(hand_btn)
-        table_btn = Button(label="Table", style=discord.ButtonStyle.secondary, custom_id="uno_table")
-        table_btn.callback = self._table
-        row.add_item(table_btn)
+        if engine and engine.pending_wd4_challenge:
+            # A Wild Draw Four is waiting on its target: this message offers
+            # exactly two buttons, nothing else.
+            accept_btn = Button(label="Accept", style=discord.ButtonStyle.success, custom_id="uno_wd4_accept")
+            accept_btn.callback = self._wd4_accept
+            row.add_item(accept_btn)
+            challenge_btn = Button(label="Challenge", style=discord.ButtonStyle.danger, custom_id="uno_wd4_challenge")
+            challenge_btn.callback = self._wd4_challenge
+            row.add_item(challenge_btn)
+            help_btn = Button(emoji="❔", style=discord.ButtonStyle.secondary, custom_id="uno_wd4_challenge_help")
+            help_btn.callback = self._wd4_help
+            row.add_item(help_btn)
+        else:
+            # All 5 buttons fit in a single ActionRow (Discord's cap is 5 per row).
+            play_btn = Button(label="Play", style=discord.ButtonStyle.primary, custom_id="uno_play")
+            play_btn.callback = self._play
+            row.add_item(play_btn)
+            penalty = engine.draw_penalty if engine else 0
+            draw_btn = Button(label=f"Draw {penalty}" if penalty > 0 else "Draw",
+                              style=discord.ButtonStyle.secondary, custom_id="uno_draw")
+            draw_btn.callback = self._draw
+            row.add_item(draw_btn)
+            callout_btn = Button(label="Callout", style=discord.ButtonStyle.danger, custom_id="uno_callout")
+            callout_btn.callback = self._callout
+            row.add_item(callout_btn)
+            hand_btn = Button(label="Hand", style=discord.ButtonStyle.secondary, custom_id="uno_hand")
+            hand_btn.callback = self._hand
+            row.add_item(hand_btn)
+            table_btn = Button(label="Table", style=discord.ButtonStyle.secondary, custom_id="uno_table")
+            table_btn.callback = self._table
+            row.add_item(table_btn)
         container.add_item(row)
 
         self.add_item(container)
@@ -1673,17 +1699,6 @@ class TableView(discord.ui.LayoutView):
             # bot was resumed from a save) — hand it back.
             await interaction.response.send_message(
                 "Choose a color for your Wild:", view=ColorButtonsView(self.cog, session, interaction), ephemeral=True)
-            return
-
-        if len(player.hand) > MAX_BUTTONS_TOTAL:
-            # Too many cards for a button grid — force the text modal.
-            # A modal MUST be the raw, undeferred initial response, so this
-            # branch can't defer — it's engine-only work (no image/network
-            # I/O) up to this point, so it's already fast enough.
-            try:
-                await interaction.response.send_modal(PlayCardModal(self.cog, session))
-            except discord.InteractionResponded:
-                log.warning("uno_play: interaction already responded before send_modal (double-click?)")
             return
 
         # Below this point we're doing real I/O (application-emoji fetch on
@@ -1741,6 +1756,40 @@ class TableView(discord.ui.LayoutView):
             return
         await self.cog.handle_draw_card(interaction, session)
 
+    async def _wd4_accept(self, interaction: discord.Interaction):
+        session = self._guard()
+        if not session:
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
+            return
+        await self.cog.handle_wd4_accept(interaction, session)
+
+    async def _wd4_challenge(self, interaction: discord.Interaction):
+        session = self._guard()
+        if not session:
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
+            return
+        await self.cog.handle_wd4_challenge(interaction, session)
+
+    async def _wd4_help(self, interaction: discord.Interaction):
+        session = self._guard()
+        if not session:
+            await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
+            return
+
+        embed = discord.Embed(
+            title="<:Wild_Draw_4:1536130674908594256> Wild Draw 4 Challenge",
+            description=(
+                "A Wild Draw 4 is only safe to play if they **did not** have the color in their hand.\n\n"
+                "🟢 **ACCEPT:** Draw 4 and lose your turn.\n\n"
+                "🔴 **CHALLENGE:** Call their bluff!\n"
+                "> ✅ **If they had the color:** *They* draw 4. You draw 0\n"
+                "> ❌ **If they dint:** You draw **6**.\n\n"
+                "⏳ *(Running out of time auto-accepts)*"
+            ),
+            color=discord.Color.blurple()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     async def _table(self, interaction: discord.Interaction):
         """
         Shows turn order top-to-bottom as a fixed seat list with an arrow
@@ -1787,30 +1836,10 @@ class TableView(discord.ui.LayoutView):
             return
         engine = session.engine
 
-        # If a Wild Draw Four is pending a decision, Callout doubles as "challenge it".
+        # Old table messages (and nothing else) can still show Callout while a
+        # Wild Draw Four is pending: treat it as Challenge.
         if engine.pending_wd4_challenge:
-            async with session.lock:
-                pc = engine.pending_wd4_challenge
-                if not pc or interaction.user.id != pc["target_id"]:
-                    await interaction.response.send_message(
-                        f"⚠️ Waiting on {_mention(pc['target_id']) if pc else 'someone'} to accept or challenge the Wild Draw Four.",
-                        ephemeral=True, delete_after=ERR_TTL,
-                    )
-                    return
-                result = engine.challenge_wild_draw4(interaction.user.id)
-                if result["success"]:
-                    session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
-                                            "penalty_id": result["penalty_to"]}
-                    await interaction.response.send_message(
-                        "✅ Challenge succeeded! They had a matching card, they draw 4 instead of you.", ephemeral=False
-                    )
-                else:
-                    session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
-                    await interaction.response.send_message(
-                        "❌ Challenge failed, they really didn't have a match. You draw 6.", ephemeral=False
-                    )
-                self.cog.restart_timer(session)
-                await self.cog.refresh_table(session)
+            await self.cog.handle_wd4_challenge(interaction, session)
             return
 
         await self.cog.handle_callout(interaction, session)
@@ -2244,6 +2273,7 @@ class UnoGame(commands.Cog):
         sends a new message rather than editing (see post_table's
         docstring for why editing can't ping).
         """
+        await self._process_knockouts(session)  # safety net: any path that drew cards and then reposts the table
         channel = session.table_message.channel if session.table_message is not None else None
         if channel is None:
             channel = self.bot.get_channel(session.channel_id)
@@ -2767,7 +2797,8 @@ class UnoGame(commands.Cog):
             medal = f"{PLACEMENT_EMOJI.get(0, '')} " if r["winner"] else ""
             sign = "+" if r["net"] >= 0 else ""
             if pid in departed:
-                lines.append(f"{_mention(pid)} **{sign}{r['net']}** {config.UNO_CHIP_EMOJI} → forfeited (left mid-round)")
+                why = "knocked out" if departed[pid].exit_reason == "knockout" else "left mid-round"
+                lines.append(f"{_mention(pid)} **{sign}{r['net']}** {config.UNO_CHIP_EMOJI} → forfeited ({why})")
                 continue
             where = "returned to wallet" if pid in leaving else "on the table"
             lines.append(f"{medal}{_mention(pid)} **{sign}{r['net']}** {config.UNO_CHIP_EMOJI} → "
@@ -2863,10 +2894,98 @@ class UnoGame(commands.Cog):
             if engine.finished:
                 await self.announce_and_cleanup(session)
 
+    async def _process_knockouts(self, session: GameSession) -> bool:
+        """Frees the seats of players the engine just knocked out (hand hit
+        MAX_HAND) and announces it. Caller holds session.lock. Safe to call
+        any time — a no-op when nothing happened. Their bet is forfeited the
+        same way as a quit, via engine.left_early + session.departed."""
+        engine = session.engine
+        pids = engine.pop_knockouts() if engine else []
+        for pid in pids:
+            await self._mark_departed(session, pid, "knockout")
+            await self._send_to_game_channel(
+                session,
+                f"💥 {_mention(pid)} hit **{ue.MAX_HAND}** cards and was knocked out of the round.",
+            )
+        return bool(pids)
+
+    async def _continue_or_finish(self, session: GameSession):
+        """Common tail for an action that moved the turn (and may have ended
+        the round through a knockout). Caller holds session.lock."""
+        engine = session.engine
+        await self._process_knockouts(session)  # free seats / announce before the table repost
+        if engine.finished:
+            session.cancel_timer()
+        else:
+            self.restart_timer(session)
+        await self.refresh_table(session)
+        if engine.finished:
+            await self.announce_and_cleanup(session)
+
+    async def handle_wd4_accept(self, interaction: discord.Interaction, session: GameSession):
+        """The Accept button (and /uno draw while a Wild Draw Four is pending)."""
+        if not self._is_live(session):
+            await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
+            return
+        engine = session.engine
+        async with session.lock:
+            if not engine or session.engine is not engine or engine.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
+                return
+            pc = engine.pending_wd4_challenge
+            if not pc:
+                await interaction.response.send_message(
+                    "⚠️ There's no Wild Draw Four waiting on a decision.", ephemeral=True, delete_after=ERR_TTL)
+                return
+            if interaction.user.id != pc["target_id"]:
+                await interaction.response.send_message(
+                    f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
+                    ephemeral=True, delete_after=ERR_TTL,
+                )
+                return
+            engine.accept_wild_draw4(interaction.user.id)
+            session.last_action = {"type": "wd4_accept", "actor_id": interaction.user.id}
+            await silent_ack(interaction)  # the table message already says they accepted
+            await self._continue_or_finish(session)
+
+    async def handle_wd4_challenge(self, interaction: discord.Interaction, session: GameSession):
+        """The Challenge button (and /uno callout while a Wild Draw Four is pending)."""
+        if not self._is_live(session):
+            await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
+            return
+        engine = session.engine
+        async with session.lock:
+            if not engine or session.engine is not engine or engine.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
+                return
+            pc = engine.pending_wd4_challenge
+            if not pc:
+                await interaction.response.send_message(
+                    "⚠️ There's no Wild Draw Four waiting on a decision.", ephemeral=True, delete_after=ERR_TTL)
+                return
+            if interaction.user.id != pc["target_id"]:
+                await interaction.response.send_message(
+                    f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
+                    ephemeral=True, delete_after=ERR_TTL,
+                )
+                return
+            result = engine.challenge_wild_draw4(interaction.user.id)
+            if result["success"]:
+                session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
+                                        "penalty_id": result["penalty_to"]}
+                await interaction.response.send_message(
+                    "✅ Challenge succeeded! They had a matching card — they draw 4 instead of you.", ephemeral=False)
+            else:
+                session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
+                await interaction.response.send_message(
+                    "❌ Challenge failed — they really didn't have a match. You draw 6.", ephemeral=False)
+            await self._continue_or_finish(session)
+
     async def handle_draw_card(self, interaction: discord.Interaction, session: GameSession):
         """Shared by the Draw button and /uno draw. If the drawn card can
         legally be played, offers a Play-this-card/No follow-up instead of
-        always ending the turn outright."""
+        always ending the turn outright. While a +2 stack is pending, Draw
+        takes the whole pile (forced, turn is lost, no follow-up)."""
         if not self._is_live(session):
             await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
             return
@@ -2876,23 +2995,14 @@ class UnoGame(commands.Cog):
             await interaction.response.send_message("No active game here.", ephemeral=True, delete_after=ERR_TTL)
             return
 
+        if engine.pending_wd4_challenge:
+            # /uno draw (or an old Draw button) while a Wild Draw Four is pending = Accept.
+            await self.handle_wd4_accept(interaction, session)
+            return
+
         async with session.lock:
             if not self._is_live(session) or session.engine is not engine or engine.finished:
                 await interaction.response.send_message("This game has ended.", ephemeral=True, delete_after=ERR_TTL)
-                return
-            if engine.pending_wd4_challenge:
-                pc = engine.pending_wd4_challenge
-                if interaction.user.id != pc["target_id"]:
-                    await interaction.response.send_message(
-                        f"⚠️ Waiting on {_mention(pc['target_id'])} to accept or challenge the Wild Draw Four.",
-                        ephemeral=True, delete_after=ERR_TTL,
-                    )
-                    return
-                engine.accept_wild_draw4(interaction.user.id)
-                session.last_action = {"type": "wd4_accept", "actor_id": interaction.user.id}
-                await silent_ack(interaction)  # the table message already says they accepted
-                self.restart_timer(session)
-                await self.refresh_table(session)
                 return
 
             if engine.current_player().player_id != interaction.user.id:
@@ -2909,6 +3019,25 @@ class UnoGame(commands.Cog):
             # engine.draw_card() already clears armed_uno itself when the
             # draw moves the hand off exactly 2 cards — see the
             # armed_uno invariant note in uno_engine.py.
+
+            if result["forced"]:
+                n = result["n"]
+                session.last_action = {"type": "stack_draw", "actor_id": interaction.user.id, "n": n}
+                if result["knocked_out"]:
+                    msg = f"You took the +2 pile (**{n}** cards) and hit {ue.MAX_HAND} cards — you're knocked out."
+                else:
+                    msg = f"You took the +2 pile — drew **{n}** cards."
+                await interaction.response.send_message(msg, ephemeral=True, delete_after=ERR_TTL)
+                await self._continue_or_finish(session)
+                return
+
+            if result["knocked_out"]:
+                session.last_action = {"type": "draw", "actor_id": interaction.user.id}
+                await interaction.response.send_message(
+                    f"You drew **{drawn}** and hit {ue.MAX_HAND} cards — you're knocked out.",
+                    ephemeral=True, delete_after=ERR_TTL)
+                await self._continue_or_finish(session)
+                return
 
             if result["still_playable"]:
                 session.pending_draw = {"player_id": interaction.user.id, "card": drawn, "engine": engine}
@@ -2986,6 +3115,13 @@ class UnoGame(commands.Cog):
                     f"{caught_mentions} forgot to call UNO and draw {result['n']} cards each.",
                     ephemeral=False,
                 )
+
+            # A callout penalty can push someone to the knockout cap.
+            if await self._process_knockouts(session):
+                if engine.finished:
+                    await self.announce_and_cleanup(session)
+                else:
+                    await self.refresh_table(session)
 
     async def handle_toggle_arm_uno(self, interaction: discord.Interaction, session: GameSession):
         """
@@ -3179,9 +3315,14 @@ class UnoGame(commands.Cog):
                     if result["kicked"]:
                         await self._mark_departed(session, result["player_id"], "afk_kick")
                         session.last_action = {"type": "timeout_kick", "actor_id": result["player_id"]}
+                    elif result["stack_n"]:
+                        session.last_action = {"type": "timeout_stack_draw", "actor_id": result["player_id"],
+                                               "n": result["stack_n"]}
                     else:
                         session.last_action = {"type": "timeout_draw", "actor_id": result["player_id"]}
 
+                # An AFK auto-draw / auto-accept can push someone to the knockout cap.
+                await self._process_knockouts(session)
                 finished = engine.finished
         except Exception:
             log.exception("Turn timeout auto-action failed for channel %s", session.channel_id)
@@ -3368,28 +3509,7 @@ class UnoGame(commands.Cog):
         engine = session.engine
 
         if engine.pending_wd4_challenge:
-            async with session.lock:
-                pc = engine.pending_wd4_challenge
-                if not pc or interaction.user.id != pc["target_id"]:
-                    await interaction.response.send_message(
-                        f"⚠️ Waiting on {_mention(pc['target_id']) if pc else 'someone'} to accept or challenge the Wild Draw Four.",
-                        ephemeral=True,
-                    )
-                    return
-                result = engine.challenge_wild_draw4(interaction.user.id)
-                if result["success"]:
-                    session.last_action = {"type": "wd4_challenge_win", "actor_id": interaction.user.id,
-                                            "penalty_id": result["penalty_to"]}
-                    await interaction.response.send_message(
-                        "✅ Challenge succeeded! They had a matching card — they draw 4 instead of you.", ephemeral=False
-                    )
-                else:
-                    session.last_action = {"type": "wd4_challenge_lose", "actor_id": interaction.user.id}
-                    await interaction.response.send_message(
-                        "❌ Challenge failed — they really didn't have a match. You draw 6.", ephemeral=False
-                    )
-                self.restart_timer(session)
-                await self.refresh_table(session)
+            await self.handle_wd4_challenge(interaction, session)  # Callout = Challenge while a WD4 is pending
             return
 
         await self.handle_callout(interaction, session)
@@ -3799,7 +3919,6 @@ class UnoGame(commands.Cog):
         min_bet: app_commands.Range[int, 1, 1_000_000] | None = None,
         max_bet: app_commands.Range[int, 0, 100_000_000] | None = None,
         turn_timer: app_commands.Range[int, MIN_TURN_TIMEOUT, MAX_TURN_TIMEOUT] | None = None,
-        bet_window: app_commands.Range[int, 10, 120] | None = None,
         resend_after: app_commands.Range[int, 1, 50] | None = None,
         max_players: app_commands.Range[int, MIN_PLAYERS_LIMIT, MAX_PLAYERS_LIMIT] | None = None,
         decks: app_commands.Range[int, MIN_DECKS, MAX_DECKS] | None = None,
@@ -3823,7 +3942,6 @@ class UnoGame(commands.Cog):
         want("min_bet", min_bet, "Min bet")
         want("max_bet", max_bet, "Max bet", lambda v: str(v) if v else "no limit")
         want("turn_timeout", turn_timer, "Turn timer", lambda v: f"{v}s")
-        want("bet_window", bet_window, "Bet window", lambda v: f"{v}s")
         want("resend_after_msgs", resend_after, "Resend after", lambda v: f"{v} messages")
         want("max_players", max_players, "Max players")
         want("num_decks", decks, "Decks")
@@ -4492,9 +4610,13 @@ class UnoGame(commands.Cog):
         container.add_item(
             TextDisplay(
                 "### <:uno_draw_2:1536919114247839815> Draw 2 Stacking\n"
-                "Each consecutive Draw 2 increases the penalty by 2.\n"
-                "Example: `+2 → +4 → +6 → +8`.\n"
-                "Playing anything other than a Draw 2, or drawing normally, resets the chain."
+                "When a Draw 2 is played, the next player can **stack** another Draw 2 on it "
+                "instead of drawing: `+2 → +4 → +6 → +8`.\n"
+                "If you can't or don't want to stack, press **Draw N** to take the whole pile\n"
+                "\n"
+                "### 💥 Knockout\n"
+                f"Reach **{ue.MAX_HAND} cards** and you're knocked out of the round. "
+                "Your cards go back to the deck and your bet is forfeited, just like quitting."
             )
         )
 
@@ -4509,7 +4631,7 @@ class UnoGame(commands.Cog):
                 "matching the previous color.\n\n"
                 "**Successful challenge:** Wild Draw 4 player draws 4.\n"
                 "**Failed challenge:** Challenger draws 6.\n"
-                "**No response:** Automatically accepted; challenger draws 4."
+                "**No response:** Automatically accepted; the targeted player draws 4."
             )
         )
 

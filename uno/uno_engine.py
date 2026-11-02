@@ -26,6 +26,7 @@ COLORS = ["Red", "Yellow", "Green", "Blue"]
 NUMBER_VALUES = [str(n) for n in range(10)]
 ACTION_VALUES = ["Skip", "Reverse", "Draw_2"]
 WILD_CARDS = ["Wild", "Wild_Draw_4"]
+MAX_HAND = 25  # a hand that reaches this many cards is knocked out of the round
 
 
 class UnoError(Exception):
@@ -301,7 +302,11 @@ class GameState:
         self.pending_wild_card: Optional[str] = None
         self.pending_wd4_challenge: Optional[dict] = None  # {"wd4_player_id","target_id","prior_color"}
         self.last_wd4_by: Optional[int] = None
-        self.draw2_chain_count: int = 0  # consecutive Draw_2 plays in the current unbroken chain
+        # Stacking +2s: total cards the CURRENT player must draw unless they
+        # stack another Draw_2 on top. 0 = no penalty pending.
+        self.draw_penalty: int = 0
+        self._ko_queue: list[int] = []     # players whose hand just hit MAX_HAND, resolved at end of action
+        self.knocked_out: list[int] = []   # resolved knockouts the cog hasn't processed yet (pop_knockouts)
         self.winner: Optional[int] = None
         self.finished: bool = False
         self.callout_window: Optional[int] = None
@@ -312,9 +317,10 @@ class GameState:
         elif card_value(first) == "Skip":
             self.current_index = self._offset(1)
         elif card_value(first) == "Draw_2":
-            self._force_draw(self.players[self._offset(1)], 2)
-            self.current_index = self._offset(2)
-            self.draw2_chain_count = 1  # so an immediate follow-up +2 correctly continues the chain at 4, not restarts at 2
+            # Acts as if the dealer played it: the first player faces the
+            # +2 and may stack another one instead of drawing.
+            self.draw_penalty = 2
+            self.current_index = self._offset(0)
 
         self._log_event("deal", 0, "table", card=first,
                          extra={"num_players": len(self.players), "hand_size": hand_size})
@@ -363,7 +369,8 @@ class GameState:
             "pending_wild_card": self.pending_wild_card,
             "pending_wd4_challenge": dict(self.pending_wd4_challenge) if self.pending_wd4_challenge else None,
             "last_wd4_by": self.last_wd4_by,
-            "draw2_chain_count": self.draw2_chain_count,
+            "draw_penalty": self.draw_penalty,
+            "knocked_out": list(self.knocked_out),
             "winner": self.winner,
             "finished": self.finished,
             "callout_window": self.callout_window,
@@ -455,7 +462,12 @@ class GameState:
                 raise UnoError("Corrupt save data — pending_wd4_challenge has an invalid prior_color.")
 
         self.last_wd4_by = d.get("last_wd4_by")
-        self.draw2_chain_count = d.get("draw2_chain_count", 0)
+        try:
+            self.draw_penalty = max(0, int(d.get("draw_penalty", 0) or 0))
+        except (TypeError, ValueError):
+            raise UnoError("Corrupt save data — malformed draw_penalty.")
+        self._ko_queue = []
+        self.knocked_out = [int(x) for x in d.get("knocked_out", [])]
 
         self.winner = d.get("winner")
         if self.winner is not None and self.winner not in self.all_names:
@@ -524,6 +536,45 @@ class GameState:
             player.hand.append(self._draw_raw())
         player.said_uno = False
         player.armed_uno = False
+        self._note_hand(player)
+
+    def _draw_up_to(self, player: Player, n: int) -> int:
+        """Like _force_draw but never raises: draws as many of the n cards as
+        actually exist. Used for stack penalties / AFK stack draws, where
+        there is no sane way to refuse the draw. Returns how many were drawn."""
+        n = max(0, min(n, self._cards_available()))
+        for _ in range(n):
+            player.hand.append(self._draw_raw())
+        player.said_uno = False
+        if len(player.hand) != 2:
+            player.armed_uno = False
+        self._note_hand(player)
+        return n
+
+    def _note_hand(self, player: Player):
+        """Queues a knockout when a hand reaches MAX_HAND. Never removes
+        anyone here — draws happen mid-effect with the turn index half
+        updated; _resolve_knockouts() runs at the end of the action."""
+        if len(player.hand) >= MAX_HAND and player.player_id not in self._ko_queue:
+            self._ko_queue.append(player.player_id)
+
+    def pop_knockouts(self) -> list[int]:
+        """Drains the knockouts that happened since the last call (the cog
+        uses this to free seats and announce them)."""
+        out, self.knocked_out = self.knocked_out, []
+        return out
+
+    def _resolve_knockouts(self):
+        while self._ko_queue:
+            pid = self._ko_queue.pop(0)
+            p = self.player_by_id(pid)
+            if p is None or self.finished or len(p.hand) < MAX_HAND:
+                continue
+            size = len(p.hand)
+            self.knocked_out.append(pid)
+            self._log_event("knockout", pid, p.name, hand_size_after=size, extra={"hand_size": size})
+            self.last_summary = f"{p.name} hit {MAX_HAND} cards and was knocked out."
+            self.remove_player(pid, reason="knockout")
 
     def current_player(self) -> Player:
         return self.players[self.current_index]
@@ -540,6 +591,10 @@ class GameState:
     def is_legal(self, player: Player, card: str) -> bool:
         if card not in player.hand:
             return False
+        if self.draw_penalty > 0:
+            # Facing a +2 stack: the only legal play is stacking another +2
+            # (any color — same value). Everything else, wilds included, is out.
+            return card_value(card) == "Draw_2"
         if is_wild(card):
             return True
         return card_color(card) == self.current_color or card_value(card) == card_value(self.top_card())
@@ -561,33 +616,42 @@ class GameState:
         this is their MAX_MISSED_TURNS-th consecutive timeout in a row.
         """
         player = self.current_player()
-        drawn = self._draw_raw()
-        player.hand.append(drawn)
-        player.said_uno = False
-        if len(player.hand) != 2:
-            # armed_uno only ever means anything at exactly 2 cards; this
-            # AFK auto-draw just moved them off that checkpoint (almost
-            # always upward, to 3+), so any pre-arm from before no longer
-            # applies.
-            player.armed_uno = False
+        if self.draw_penalty > 0:
+            # AFK while facing a +2 stack: they take the whole pile.
+            stack_n = self._draw_up_to(player, self.draw_penalty)
+            self.draw_penalty = 0
+            drawn = None
+        else:
+            stack_n = 0
+            drawn = self._draw_raw()
+            player.hand.append(drawn)
+            player.said_uno = False
+            if len(player.hand) != 2:
+                # armed_uno only ever means anything at exactly 2 cards; this
+                # AFK auto-draw just moved them off that checkpoint (almost
+                # always upward, to 3+), so any pre-arm from before no longer
+                # applies.
+                player.armed_uno = False
+            self._note_hand(player)
         player.missed_turns += 1
-        self.draw2_chain_count = 0  # AFK auto-draw doesn't continue a Draw_2 chain
 
         kicked = player.missed_turns >= self.MAX_MISSED_TURNS
         result = {"player_id": player.player_id, "name": player.name,
-                   "drawn": drawn, "kicked": kicked}
+                   "drawn": drawn, "kicked": kicked, "stack_n": stack_n, "knocked_out": False}
 
         if kicked:
-            self._log_event("afk_draw", player.player_id, player.name, card=drawn, extra={"kicked": True})
+            self._log_event("afk_draw", player.player_id, player.name, card=drawn, extra={"kicked": True, "stack_n": stack_n})
             self.remove_player(player.player_id, reason="afk_kick")
             self.last_summary = f"{player.name} was AFK too long and was removed from the game."
         else:
             self.current_index = self._offset(1)
-            self.last_summary = f"{player.name} was AFK and auto-drew a card."
+            self.last_summary = (f"{player.name} was AFK and drew {stack_n} cards from the +2 stack."
+                                 if stack_n else f"{player.name} was AFK and auto-drew a card.")
             self._log_event("afk_draw", player.player_id, player.name, card=drawn,
-                             hand_size_after=len(player.hand), extra={"kicked": False})
+                             hand_size_after=len(player.hand), extra={"kicked": False, "stack_n": stack_n})
 
-        self._check_win()
+        self._check_win()  # also resolves any knockout
+        result["knocked_out"] = player.player_id in self.knocked_out
         return result
 
     # ---------- player join/leave ----------
@@ -621,6 +685,11 @@ class GameState:
         self.left_early.add(player_id)
 
         was_current = idx == self.current_index
+        if was_current:
+            # Whoever was facing a +2 stack is gone; the penalty was aimed at
+            # them, so it dies with their seat instead of landing on the next
+            # player out of nowhere.
+            self.draw_penalty = 0
         # The color choice for a pending Wild is owed by the CURRENT player
         # (the turn doesn't advance until they pick). Only their departure
         # voids it — an unrelated player leaving must not touch it.
@@ -701,6 +770,8 @@ class GameState:
             raise IllegalCard("Waiting on a color choice for the last wild card")
         if self.pending_wd4_challenge:
             raise IllegalCard("Waiting on the targeted player to accept or challenge the Wild Draw Four")
+        if self.draw_penalty > 0 and card in player.hand and card_value(card) != "Draw_2":
+            raise IllegalCard(f"You're facing a +2 stack — play a +2 or draw {self.draw_penalty}.")
         if not self.is_legal(player, card):
             raise IllegalCard(f"{card} is not a legal play right now")
 
@@ -764,7 +835,6 @@ class GameState:
         return effects
 
     def _apply_wild_color(self, card: str, color: str, player: Player, effects: dict):
-        self.draw2_chain_count = 0  # any wild (plain or +4) breaks a Draw_2 chain
         prior_color = self.current_color  # color that was in effect before this wild
         self.current_color = color
         if card == "Wild_Draw_4":
@@ -855,7 +925,6 @@ class GameState:
     def _apply_value_effects(self, card: str, player: Player, effects: dict):
         value = card_value(card)
         if value == "Reverse":
-            self.draw2_chain_count = 0
             if len(self.players) == 2:
                 effects["skipped"] = self.players[self._offset(1)].player_id
                 self.current_index = self._offset(2)
@@ -864,26 +933,17 @@ class GameState:
                 effects["reversed"] = True
                 self.current_index = self._offset(1)
         elif value == "Skip":
-            self.draw2_chain_count = 0
             target = self.players[self._offset(1)]
             effects["skipped"] = target.player_id
             self.current_index = self._offset(2)
         elif value == "Draw_2":
-            # Chained Draw_2: each one played back-to-back (no other card
-            # type in between) increases the forced draw by another 2 —
-            # 1st = 2, 2nd = 4, 3rd = 6, etc. Applied immediately to
-            # whoever's next (not deferred/stackable-by-choice), and the
-            # chain only resets once something other than a Draw_2 gets
-            # played, or a player draws normally instead of continuing it.
-            self.draw2_chain_count += 1
-            amount = 2 * self.draw2_chain_count
+            # Stackable: nobody draws yet. The penalty grows by 2 and the next
+            # player must stack another Draw_2 or take the whole pile.
+            self.draw_penalty += 2
             target = self.players[self._offset(1)]
-            self._force_draw(target, amount)
-            effects["drew"] = {"player_id": target.player_id, "n": amount}
-            effects["skipped"] = target.player_id
-            self.current_index = self._offset(2)
+            effects["stacked"] = {"n": self.draw_penalty, "target_id": target.player_id}
+            self.current_index = self._offset(1)
         else:
-            self.draw2_chain_count = 0
             self.current_index = self._offset(1)
 
     def draw_card(self, player_id: int) -> dict:
@@ -904,6 +964,21 @@ class GameState:
         if self.pending_wd4_challenge:
             raise IllegalCard("Waiting on the targeted player to accept or challenge the Wild Draw Four")
 
+        if self.draw_penalty > 0:
+            # Facing a +2 stack and not stacking: take the whole pile and lose
+            # the turn. No "play the drawn card" follow-up — the draw is forced.
+            want = self.draw_penalty
+            self.draw_penalty = 0
+            got = self._draw_up_to(player, want)
+            self.record_action(player_id)
+            self.current_index = self._offset(1)
+            self.last_summary = f"{player.name} drew {got} cards from the +2 stack."
+            self._log_event("draw_stack", player_id, player.name,
+                             hand_size_after=len(player.hand), extra={"n": got})
+            self._check_win()  # resolves a knockout if this pushed them to MAX_HAND
+            return {"player_id": player_id, "drawn": None, "still_playable": False,
+                    "forced": True, "n": got, "knocked_out": player_id in self.knocked_out}
+
         card = self._draw_raw()
         player.hand.append(card)
         player.said_uno = False
@@ -913,16 +988,22 @@ class GameState:
             # pre-arm from before no longer applies.
             player.armed_uno = False
         self.record_action(player_id)
-        # NOTE: the Draw_2 chain is deliberately NOT reset here — a drawn +2
-        # that gets played right away must continue the chain. The chain
-        # breaks in pass_turn() (drew and kept/passed) or when another card
-        # type is played.
         self.last_summary = f"{player.name} drew a card."
+        self._note_hand(player)
+        if player_id in self._ko_queue:
+            # Hit the cap: out of the round immediately (they were current, so
+            # remove_player hands the turn to the next player).
+            self._log_event("draw", player_id, player.name, card=card,
+                             hand_size_after=len(player.hand), extra={"still_playable": False})
+            self._resolve_knockouts()
+            return {"player_id": player_id, "drawn": card, "still_playable": False,
+                    "forced": False, "n": 1, "knocked_out": True}
 
         still_playable = self.is_legal(player, card)
         self._log_event("draw", player_id, player.name, card=card,
                          hand_size_after=len(player.hand), extra={"still_playable": still_playable})
-        return {"player_id": player_id, "drawn": card, "still_playable": still_playable}
+        return {"player_id": player_id, "drawn": card, "still_playable": still_playable,
+                "forced": False, "n": 1, "knocked_out": False}
 
     def pass_turn(self, player_id: int):
         player = self.current_player()
@@ -930,7 +1011,8 @@ class GameState:
             raise NotYourTurn(f"It is not player {player_id}'s turn")
         if self.pending_wd4_challenge:
             raise IllegalCard("Waiting on the targeted player to accept or challenge the Wild Draw Four")
-        self.draw2_chain_count = 0  # drew and passed instead of continuing the Draw_2 chain
+        if self.draw_penalty > 0:
+            raise IllegalCard(f"You're facing a +2 stack — play a +2 or draw {self.draw_penalty}.")
         self.current_index = self._offset(1)
         self._log_event("pass", player_id, player.name, hand_size_after=len(player.hand))
 
@@ -995,6 +1077,7 @@ class GameState:
             self._log_event("challenge_uno", accuser_id, accuser.name if accuser else str(accuser_id),
                              hand_size_after=len(target.hand),
                              extra={"target_id": target_id, "success": True, "n": penalty})
+            self._resolve_knockouts()
             return True
         return False
 
@@ -1024,11 +1107,13 @@ class GameState:
             self.callout_window = None
             self._log_event("challenge_uno_auto", accuser_id, accuser.name,
                              extra={"caught": [p.player_id for p in caught], "penalty_to_accuser": False, "n": penalty})
+            self._resolve_knockouts()
             return {"caught": [p.player_id for p in caught], "penalty_to_accuser": False, "n": penalty}
 
         self._force_draw(accuser, penalty)
         self._log_event("challenge_uno_auto", accuser_id, accuser.name, hand_size_after=len(accuser.hand),
                          extra={"caught": [], "penalty_to_accuser": True, "n": penalty})
+        self._resolve_knockouts()
         return {"caught": [], "penalty_to_accuser": True, "n": penalty}
 
     # ---------- win check ----------
@@ -1073,6 +1158,9 @@ class GameState:
         everyone else leaves/gets removed first, whoever's left wins by
         attrition. If literally everyone leaves, the round is void
         (winner stays None) and compute_settlement refunds every bet."""
+        if self.finished:
+            return
+        self._resolve_knockouts()  # anyone who just hit MAX_HAND is out before we look for a winner
         if self.finished:
             return
 

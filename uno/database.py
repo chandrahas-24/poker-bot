@@ -246,6 +246,17 @@ async def init_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_table_log_table ON table_log(table_id, ts)")
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS dealer_session_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id    TEXT NOT NULL,
+                dealer_id   INTEGER NOT NULL,
+                dealer_name TEXT NOT NULL,
+                event       TEXT NOT NULL,
+                ts          TEXT NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_dealer_session_table ON dealer_session_log(table_id, ts)")
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS seat_log (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts         TEXT NOT NULL,
@@ -908,6 +919,203 @@ async def log_table_event(guild_id: int, channel_id: int, table_id: str, event: 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (datetime.utcnow().isoformat(), guild_id, channel_id, table_id, round_num, event, actor_id, detail))
         await db.commit()
+
+
+# ── Dealer hours (mirrors poker.database; separate from table_log) ──
+
+async def log_dealer_event(table_id: str, dealer_id: int, dealer_name: str, event: str):
+    """start / dealer_change begin a dealer session; close / no_players / idle / crash end it."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute(
+            "INSERT INTO dealer_session_log (table_id, dealer_id, dealer_name, event, ts) VALUES (?,?,?,?,?)",
+            (table_id, dealer_id, dealer_name, event, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+
+async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
+
+    from collections import defaultdict
+    from datetime import datetime as dt, timedelta
+
+    db = await _get_db()
+
+    # Treat the requested dates as a half-open UTC interval:
+    #
+    #   [start_date 00:00, day_after_end_date 00:00)
+    #
+    period_start = dt.fromisoformat(start_date)
+    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
+
+    # We need the last event BEFORE the requested period for EVERY table.
+    # This is what lets us reconstruct a session that started yesterday
+    # and continued past UTC midnight.
+    async with db.execute(
+        """
+        SELECT d1.table_id,
+               d1.dealer_id,
+               d1.dealer_name,
+               d1.event,
+               d1.ts
+        FROM dealer_session_log d1
+        WHERE d1.id = (
+            SELECT d2.id
+            FROM dealer_session_log d2
+            WHERE d2.table_id = d1.table_id
+              AND d2.ts < ?
+            ORDER BY d2.ts DESC, d2.id DESC
+            LIMIT 1
+        )
+        """,
+        (period_start.isoformat(),)
+    ) as c:
+        previous_rows = await c.fetchall()
+
+    # Get all events occurring inside the requested UTC period.
+    async with db.execute(
+        """
+        SELECT table_id,
+               dealer_id,
+               dealer_name,
+               event,
+               ts
+        FROM dealer_session_log
+        WHERE ts >= ?
+          AND ts < ?
+        ORDER BY ts ASC, id ASC
+        """,
+        (period_start.isoformat(), period_end.isoformat())
+    ) as c:
+        period_rows = await c.fetchall()
+
+    # Reconstruct events independently for each table.
+    events_by_table = defaultdict(list)
+
+    for row in previous_rows:
+        events_by_table[row["table_id"]].append(row)
+
+    for row in period_rows:
+        events_by_table[row["table_id"]].append(row)
+
+    totals = defaultdict(lambda: {
+        "dealer_name": "",
+        "seconds": 0,
+    })
+
+    # Don't count an active session into the future when querying today.
+    now_utc = dt.utcnow()
+    calculation_end = min(period_end, now_utc)
+
+    for table_id, events in events_by_table.items():
+        open_event = None
+
+        for row in events:
+            dealer_id = row["dealer_id"]
+            dealer_name = row["dealer_name"]
+            event = row["event"]
+            event_time = dt.fromisoformat(row["ts"])
+
+            if event in ("start", "dealer_change"):
+                # Close the previous dealer's session on this table.
+                if open_event:
+                    old_id, old_name, session_start = open_event
+
+                    effective_start = max(session_start, period_start)
+                    effective_end = min(event_time, calculation_end)
+
+                    if effective_end > effective_start:
+                        totals[old_id]["dealer_name"] = old_name
+                        totals[old_id]["seconds"] += int(
+                            (effective_end - effective_start).total_seconds()
+                        )
+
+                # This dealer now becomes the active dealer.
+                open_event = (
+                    dealer_id,
+                    dealer_name,
+                    event_time,
+                )
+
+            elif event in ("close", "no_players", "crash", "idle"):
+                if open_event:
+                    old_id, old_name, session_start = open_event
+
+                    effective_start = max(session_start, period_start)
+                    effective_end = min(event_time, calculation_end)
+
+                    if effective_end > effective_start:
+                        totals[old_id]["dealer_name"] = old_name
+                        totals[old_id]["seconds"] += int(
+                            (effective_end - effective_start).total_seconds()
+                        )
+
+                    open_event = None
+
+        # If the dealer is still active at the end of the requested period,
+        # count the open portion up to the current time (never into the future).
+        if open_event:
+            old_id, old_name, session_start = open_event
+
+            effective_start = max(session_start, period_start)
+            effective_end = calculation_end
+
+            if effective_end > effective_start:
+                totals[old_id]["dealer_name"] = old_name
+                totals[old_id]["seconds"] += int(
+                    (effective_end - effective_start).total_seconds()
+                )
+
+    return [
+        {
+            "dealer_id": dealer_id,
+            "dealer_name": data["dealer_name"],
+            "minutes": round(data["seconds"] / 60, 1),
+        }
+        for dealer_id, data in sorted(
+            totals.items(),
+            key=lambda x: -x[1]["seconds"]
+        )
+    ]
+
+
+async def close_unclosed_dealer_sessions():
+    """Called on restart — closes only the currently active dealer per table."""
+    db = await _get_db()
+
+    async with db.execute("""
+        SELECT table_id, dealer_id, dealer_name, ts
+        FROM dealer_session_log d1
+        WHERE d1.id = (
+            SELECT d2.id
+            FROM dealer_session_log d2
+            WHERE d2.table_id = d1.table_id
+            ORDER BY d2.ts DESC, d2.id DESC
+            LIMIT 1
+        )
+        AND d1.event IN ('start', 'dealer_change')
+    """) as c:
+        rows = await c.fetchall()
+
+    if not rows:
+        return
+
+    now = datetime.utcnow().isoformat()
+
+    async with _write_lock:
+        for row in rows:
+            await db.execute(
+                """
+                INSERT INTO dealer_session_log
+                (table_id, dealer_id, dealer_name, event, ts)
+                VALUES (?, ?, ?, 'crash', ?)
+                """,
+                (row["table_id"], row["dealer_id"], row["dealer_name"], now)
+            )
+
+        await db.commit()
+
+    print(f"⚠️ Closed {len(rows)} unclosed UNO dealer session(s) after restart")
 
 
 async def log_seat_event(table_id: str, round_num: int | None, round_uuid: str | None, user_id: int,

@@ -242,6 +242,37 @@ async def is_uno_manager(interaction: discord.Interaction) -> bool:
             return True
     return interaction.user.guild_permissions.administrator
 
+DATE_FORMAT = "%Y-%m-%d"
+
+def parse_date(value: str):
+    dt = dateparser.parse(
+        value,
+        settings={
+            "PREFER_DATES_FROM": "past",
+            "DATE_ORDER": "YMD",
+            "TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "RELATIVE_BASE": datetime.now(_tz.utc).replace(tzinfo=None),
+        },
+    )
+    if dt is None:
+        raise ValueError("Invalid date")
+    return dt.date()
+
+
+async def date_autocomplete(interaction: discord.Interaction, current: str):
+    current = current.lower()
+    choices = []
+    for name, value in [("Today", "today"), ("Yesterday", "yesterday"), ("Last Week", "last week")]:
+        if current in name.lower() or current in value:
+            choices.append(app_commands.Choice(name=name, value=value))
+    # Last 14 days through today
+    for i in range(14, -1, -1):
+        s_ = (datetime.now(_tz.utc).date() - timedelta(days=i)).strftime(DATE_FORMAT)
+        if current in s_:
+            choices.append(app_commands.Choice(name=s_, value=s_))
+    return choices
+
 _BG_TASKS: set = set()
 
 
@@ -549,6 +580,7 @@ class GameSession:
         self.round_num = 0
         self.state = "lobby"
         self.closed = False  # set by close_table so stale modals/buttons can tell the table is gone
+        self.dealer_active = False  # True between a dealer 'start' and the next stop event (not persisted)
         # Host does NOT auto-join — a pid only ever appears in `seats` once
         # it has put a bet on the table.
         self.seats: dict[int, Seat] = {}
@@ -1885,6 +1917,7 @@ class UnoGame(commands.Cog):
             session.cancel_timer()
             session.cancel_window()
             if not session.closed:
+                await self._log_dealer(session, "close")  # live tables come back via /uno resume; the next Start logs a new 'start'
                 try:
                     await asyncio.to_thread(self._save_session, session)
                 except Exception:
@@ -2090,6 +2123,7 @@ class UnoGame(commands.Cog):
                     await self.announce_and_cleanup(session)
                 elif engine:
                     session.state = "playing"
+                    await self._log_dealer(session, "start")  # round is live again, dealer clock resumes
                     self.restart_timer(session)  # before the render so the table shows a fresh deadline
                     await self.post_table(session, interaction.channel)
                 elif session.state == "lobby":
@@ -2309,12 +2343,44 @@ class UnoGame(commands.Cog):
         session.state = "window"
         session.window_ends_at = 0.0
         await self.post_panel(session, channel, ping=True)
+        session.window_task = safe_task(self._dealer_idle_timer(session, session.window_generation),
+                                        name=f"uno-dealer-idle-{session.channel_id}")
         self._save_session(session)
+
+    async def _log_dealer(self, session: GameSession, event: str):
+        """dealer_session_log (drives /unomgr dealerhours). start/dealer_change
+        begin counting; close/no_players/idle end it. Stops are only written
+        while a session is actually counting, so nothing is double-closed,
+        and dealer_change while stopped is skipped (the next Start logs the
+        then-current dealer)."""
+        if event in ("start", "dealer_change"):
+            if event == "dealer_change" and not session.dealer_active:
+                return
+            session.dealer_active = True
+        else:
+            if not session.dealer_active:
+                return
+            session.dealer_active = False
+        try:
+            await db.log_dealer_event(session.table_id, session.dealer_id, session.dealer_name, event)
+        except Exception:
+            log.exception("dealer_session_log write failed (%s, table %s)", event, session.table_id)
+
+    async def _dealer_idle_timer(self, session: GameSession, generation: int):
+        """Between rounds with 2+ seats and nobody pressing Start: stop the
+        dealer's clock after UNO_DEALER_IDLE_SECONDS. The table stays open;
+        the next Start logs a fresh 'start'."""
+        await asyncio.sleep(config.UNO_DEALER_IDLE_SECONDS)
+        async with session.lock:
+            if session.closed or generation != session.window_generation or session.state != "window":
+                return
+            await self._log_dealer(session, "idle")
 
     async def _enter_waiting(self, session: GameSession, channel: discord.abc.Messageable):
         session.cancel_window()
         session.state = "waiting"
         session.window_ends_at = 0.0
+        await self._log_dealer(session, "no_players")
         await self.post_panel(session, channel)
         session.window_task = safe_task(self._idle_timer(session, session.window_generation),
                                         name=f"uno-idle-{session.channel_id}")
@@ -2382,6 +2448,7 @@ class UnoGame(commands.Cog):
         session.last_action = None
         session.callout_balance = {}
         session._last_turn_player_id = None
+        await self._log_dealer(session, "start")
         await self._retire_panel(session)
         self.restart_timer(session)  # before the render: otherwise the table shows the previous round's stale turn_started_at
         await self.post_table(session, channel)  # also checkpoints the table
@@ -2429,6 +2496,7 @@ class UnoGame(commands.Cog):
             session.departed.clear()
             await self._log_forfeits(session, forfeits, "the house (table closed)", session.round_num)
         await self._log_table(session, "close", detail=(message or "")[:200])
+        await self._log_dealer(session, "close")
         session.seats.clear()
         if self.sessions.get(session.channel_id) is session:
             self.sessions.pop(session.channel_id, None)
@@ -3539,9 +3607,45 @@ class UnoGame(commands.Cog):
         session.dealer_id = user.id
         session.dealer_name = user.name
         await self._log_table(session, "dealer", interaction.user.id, f"{old_dealer} -> {user.id}")
+        await self._log_dealer(session, "dealer_change")
         self._save_session(session)
         await self.refresh_panel(session, create=False)
         await interaction.followup.send(f"🔄 **{user.mention}** has taken over as the dealer! All new tips will go to them.")
+
+    @unomgr.command(name="dealerhours", description="[Manager] Show minutes hosted per dealer between two UTC dates")
+    @app_commands.describe(start="Start date (required)",
+                           end="End date (optional, defaults to today)")
+    @app_commands.autocomplete(start=date_autocomplete, end=date_autocomplete)
+    async def dealer_hours(self, interaction: discord.Interaction, start: str, end: str = None):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_uno_manager(interaction):
+            await interaction.followup.send("❌ UNO Managers only.", ephemeral=True)
+            return
+
+        try:
+            start = parse_date(start).strftime(DATE_FORMAT)
+
+            if end:
+                end = parse_date(end).strftime(DATE_FORMAT)
+            else:
+                end = datetime.now(_tz.utc).date().strftime(DATE_FORMAT)
+
+        except ValueError:
+            await interaction.followup.send("❌ Invalid date.", ephemeral=True)
+            return
+        rows = await db.get_dealer_minutes(start, end)
+
+        if not rows:
+            label = start if not end else f"{start} → {end}"
+            await interaction.followup.send(f"No dealer sessions logged for `{label}`.", ephemeral=True)
+            return
+
+        label = start if end == start else f"{start} → {end}"
+        lines = [f"**Dealer Hours — {label}**"]
+        for r in rows:
+            lines.append(f"• **{r['dealer_name']}** — {r['minutes']} min")
+
+        await interaction.followup.send("\n".join(lines))
 
     @unomgr.command(name="addchips", description="[Manager] Add chips to a player's UNO wallet")
     @app_commands.describe(user="Player", amount="Chips to add", note="Optional reason")

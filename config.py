@@ -93,6 +93,7 @@ UNO_RESEND_AFTER_MSGS = 7      # chat messages before the table/panel is reposte
 UNO_MAX_PLAYERS = 6
 UNO_NUM_DECKS = 4
 UNO_IDLE_CLOSE_SECONDS = 600   # a table with fewer than 2 players this long closes and refunds everyone
+UNO_DEALER_IDLE_SECONDS = 300   # between rounds, the dealer's hours stop counting this long after the round ended if nobody pressed Start
 
 # ── UNO SERVER & CHANNELS
 UNO_CASHOUT_CHANNEL_ID = 1554549964741287986

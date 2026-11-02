@@ -344,6 +344,7 @@ async def _run_startup():
 
     recovered = await recover_chips_in_play()
     await close_unclosed_dealer_sessions()
+    await uno_db.close_unclosed_dealer_sessions()
     if recovered:
         print(f"⚠️  Recovered chips for {len(recovered)} player(s) after restart:")
         for r in recovered:

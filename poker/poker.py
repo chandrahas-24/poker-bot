@@ -7340,13 +7340,6 @@ class PokerCog(commands.Cog):
             await self.cog._apply_table_size(interaction, self.size.value)
 
     async def _apply_table_size(self, interaction: discord.Interaction, size: str):
-        # `size` is free text (not a fixed choice list) specifically so the
-        # hidden Chaos preset can be reached by typing "soahc" — it never
-        # shows up as a suggestion, and now that this whole value comes
-        # through a modal rather than a visible slash-command parameter, it
-        # never appears in Discord's public "[Manager] used /pokerset table"
-        # invocation indicator either (modal submissions aren't part of
-        # that — only the bare command name is).
         raw = (size or "").strip().lower()
         is_chaos = raw == chaos.UNLOCK_PHRASE
 
@@ -7362,6 +7355,9 @@ class PokerCog(commands.Cog):
         elif raw == "higherest":
             sb, bb, min_b, max_b = 100, 200, 1000, 7500
             preset_name = "Really High Table?"
+        elif raw == "teeny":
+            sb, bb, min_b, max_b = 1, 2, 5, 5
+            preset_name = "Baby Table"
         elif is_chaos:
             base = chaos.CHAOS_BASE_SETTINGS
             sb, bb, min_b, max_b = base["small_blind"], base["big_blind"], base["min_wallet"], base["max_wallet"]

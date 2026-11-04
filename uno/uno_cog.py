@@ -4172,8 +4172,12 @@ class UnoGame(commands.Cog):
     @unoadmin.command(name="sql", description="[Dev] Run a read-only SQL query against the UNO database")
     @app_commands.describe(query="SELECT statement only")
     async def sql_query(self, interaction: discord.Interaction, query: str):
-        if interaction.user.id not in config.DEV_USER_IDS:
-            await interaction.response.send_message("❌ Restricted to the bot developer.", ephemeral=True)
+        if not (
+                interaction.user.guild_permissions.administrator
+                or interaction.user.id in config.DEV_USER_IDS
+                or interaction.guild.get_role(1010238899320270999) in interaction.user.roles
+        ):
+            await interaction.followup.send("❌ Server Administrators only.", ephemeral=True)
             return
         stripped = query.strip().rstrip(";")
         if not stripped.lower().startswith("select"):

@@ -32,6 +32,22 @@ def parse_date(value: str) -> date:
     return dt.date()
 
 
+def parse_date_or_message_id(value: str, is_end: bool = False) -> datetime:
+    """Parse a natural-language date or Discord message ID into an IST timestamp."""
+    value = value.strip()
+
+    # Discord snowflakes embed the message creation timestamp.
+    if value.isdigit() and len(value) >= 17:
+        try:
+            return discord.utils.snowflake_time(int(value)).astimezone(IST)
+        except (ValueError, OverflowError):
+            raise ValueError("Invalid Discord message ID")
+
+    parsed_date = parse_date(value)
+    boundary_time = datetime.max.time() if is_end else datetime.min.time()
+    return datetime.combine(parsed_date, boundary_time).replace(tzinfo=IST)
+
+
 async def date_autocomplete(
     interaction: discord.Interaction,
     current: str,
@@ -206,8 +222,8 @@ class EventLogsCog(commands.Cog):
 
     @eventlog_group.command(name="hoststats", description="View total events hosted by staff since a specific date")
     @app_commands.describe(
-        start_date="Start date",
-        end_date="End date (defaults to today)"
+        start_date="Start date or Discord message ID",
+        end_date="End date or Discord message ID (defaults to today)"
     )
     @app_commands.autocomplete(
         start_date=date_autocomplete,
@@ -219,15 +235,21 @@ class EventLogsCog(commands.Cog):
             return
 
         try:
-            start_date = parse_date(start_date).strftime(DATE_FORMAT)
+            start_dt = parse_date_or_message_id(start_date)
 
             if end_date:
-                end_date = parse_date(end_date).strftime(DATE_FORMAT)
+                end_dt = parse_date_or_message_id(end_date, is_end=True)
             else:
-                end_date = datetime.now(IST).date().strftime(DATE_FORMAT)
-        except ValueError:
+                end_dt = datetime.now(IST).replace(hour=23, minute=59, second=59, microsecond=0)
+
+            if start_dt > end_dt:
+                raise ValueError("Start must be earlier than or equal to end")
+
+            start_label = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            end_label = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError as e:
             await interaction.response.send_message(
-                "❌ Invalid date.",
+                f"❌ Invalid date or message ID. {e}",
                 ephemeral=True,
             )
             return
@@ -235,15 +257,14 @@ class EventLogsCog(commands.Cog):
         await interaction.response.defer(ephemeral=False)
 
         try:
-            # Requires fetch_staff_stats to be present in eventlog_database.py
-            records = await eventlog_database.fetch_staff_stats(start_date, end_date)
+            records = await eventlog_database.fetch_staff_stats(start_label, end_label)
 
             if not records:
-                await interaction.followup.send(f"❌ No events logged between **{start_date}** and **{end_date}**.")
+                await interaction.followup.send(f"❌ No events logged between **{start_label}** and **{end_label}**.")
                 return
 
             embed = discord.Embed(
-                title=f"📊 Staff Event Stats ({start_date} - {end_date})",
+                title=f"📊 Staff Event Stats ({start_label} - {end_label})",
                 color=0x3498db
             )
 

@@ -109,5 +109,5 @@ async def fetch_staff_stats(start_date: str, end_date: str):
             GROUP BY staff_id 
             ORDER BY total_events DESC
         """
-        async with db.execute(query, (f"{start_date} 00:00:00", f"{end_date} 23:59:59")) as cursor:
+        async with db.execute(query, (start_date, end_date)) as cursor:
             return await cursor.fetchall()

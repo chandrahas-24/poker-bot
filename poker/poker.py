@@ -7356,7 +7356,7 @@ class PokerCog(commands.Cog):
             sb, bb, min_b, max_b = 100, 200, 1000, 7500
             preset_name = "Really High Table?"
         elif raw == "teeny":
-            sb, bb, min_b, max_b = 1, 2, 5, 100
+            sb, bb, min_b, max_b = 1, 2, 5, 5
             preset_name = "Baby Table"
         elif is_chaos:
             base = chaos.CHAOS_BASE_SETTINGS

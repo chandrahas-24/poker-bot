@@ -1105,6 +1105,17 @@ async def get_jackpot_payouts() -> list[tuple]:
     return [tuple(r) for r in rows]
 
 
+async def get_revenue_between(start, end) -> int:
+    """House revenue in the half-open UTC window [start, end) (naive datetimes); manual adjustments excluded."""
+    db = await _get_db()
+    async with db.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM house_revenue WHERE ts >= ? AND ts < ? AND source != 'adjustment'",
+        (start.isoformat(), end.isoformat())
+    ) as c:
+        row = await c.fetchone()
+    return int(row[0] or 0)
+
+
 async def get_revenue_stats() -> dict:
     db = await _get_db()
     now = datetime.utcnow()
@@ -2716,7 +2727,9 @@ async def log_dealer_event(table_id: str, table_name: str, dealer_id: int, deale
         )
         await db.commit()
 
-async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
+async def get_dealer_minutes_between(period_start, period_end) -> list[dict]:
+    """Dealer time inside the half-open UTC window [period_start, period_end) (naive datetimes).
+    Same reconstruction as get_dealer_minutes, but timestamp-granular. Rows also carry raw 'seconds'."""
 
     from collections import defaultdict
     from datetime import datetime as dt, timedelta
@@ -2727,8 +2740,6 @@ async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
     #
     #   [start_date 00:00, day_after_end_date 00:00)
     #
-    period_start = dt.fromisoformat(start_date)
-    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
 
     # We need the last event BEFORE the requested period for EVERY table.
     # This is what lets us reconstruct a session that started yesterday
@@ -2853,9 +2864,246 @@ async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
             "dealer_id": dealer_id,
             "dealer_name": data["dealer_name"],
             "minutes": round(data["seconds"] / 60, 1),
+            "seconds": data["seconds"],
         }
         for dealer_id, data in sorted(
             totals.items(),
             key=lambda x: -x[1]["seconds"]
         )
     ]
+
+
+async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
+    from datetime import datetime as dt, timedelta
+    # Whole UTC dates, half-open: [start_date 00:00, day_after_end_date 00:00)
+    period_start = dt.fromisoformat(start_date)
+    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
+    return await get_dealer_minutes_between(period_start, period_end)
+
+
+# ── Dealer payroll (weekly payout runs) ───────────────────────────────────────
+
+async def init_payroll_tables():
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payout_runs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_start  TEXT NOT NULL,
+                window_end    TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                poker_revenue INTEGER NOT NULL DEFAULT 0,
+                uno_revenue   INTEGER NOT NULL DEFAULT 0,
+                pool          INTEGER NOT NULL DEFAULT 0,
+                rate          REAL NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                created_ts    TEXT NOT NULL,
+                message_id    INTEGER,
+                channel_id    INTEGER,
+                decided_by    INTEGER,
+                decided_ts    TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payout_items (
+                run_id          INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                user_name       TEXT NOT NULL,
+                poker_seconds   INTEGER NOT NULL DEFAULT 0,
+                uno_seconds     INTEGER NOT NULL DEFAULT 0,
+                base_amount     INTEGER NOT NULL DEFAULT 0,
+                adjusted_amount INTEGER,
+                adjusted_by     INTEGER,
+                PRIMARY KEY (run_id, user_id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payout_runs_msg ON payout_runs(message_id)")
+        await db.commit()
+
+
+async def get_last_payroll_end():
+    """End of the most recent run of any status (windows never overlap), or None."""
+    db = await _get_db()
+    async with db.execute("SELECT MAX(window_end) FROM payout_runs") as c:
+        row = await c.fetchone()
+    return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+
+async def create_payroll_run(start, end, kind: str, poker_rev: int, uno_rev: int, pool: int,
+                             rate: float, status: str, items: list[dict]) -> int:
+    db = await _get_db()
+    async with _write_lock:
+        try:
+            cur = await db.execute(
+                "INSERT INTO payout_runs (window_start, window_end, kind, poker_revenue, uno_revenue, pool, rate, status, created_ts) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (start.isoformat(), end.isoformat(), kind, poker_rev, uno_rev, pool, rate, status,
+                 datetime.utcnow().isoformat()))
+            run_id = cur.lastrowid
+            await cur.close()
+            for it in items:
+                await db.execute(
+                    "INSERT INTO payout_items (run_id, user_id, user_name, poker_seconds, uno_seconds, base_amount) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (run_id, it["user_id"], it["name"], it["p_sec"], it["u_sec"], it["base"]))
+            await db.commit()
+            return run_id
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def set_payroll_message(run_id: int, message_id: int, channel_id: int):
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("UPDATE payout_runs SET message_id=?, channel_id=? WHERE id=?", (message_id, channel_id, run_id))
+        await db.commit()
+
+
+async def delete_payroll_run(run_id: int):
+    """Only for a run whose report message never got posted."""
+    db = await _get_db()
+    async with _write_lock:
+        await db.execute("DELETE FROM payout_items WHERE run_id=? AND run_id IN (SELECT id FROM payout_runs WHERE id=? AND message_id IS NULL)", (run_id, run_id))
+        await db.execute("DELETE FROM payout_runs WHERE id=? AND message_id IS NULL", (run_id,))
+        await db.commit()
+
+
+async def _load_run(db, where: str, arg):
+    async with db.execute(f"SELECT * FROM payout_runs WHERE {where}", (arg,)) as c:
+        run = await c.fetchone()
+    if not run:
+        return None
+    run = dict(run)
+    async with db.execute("SELECT * FROM payout_items WHERE run_id=? ORDER BY (poker_seconds + uno_seconds) DESC, user_id", (run["id"],)) as c:
+        items = [dict(r) for r in await c.fetchall()]
+    return run, items
+
+
+async def get_payroll_run(run_id: int):
+    return await _load_run(await _get_db(), "id=?", run_id)
+
+
+async def get_payroll_run_by_message(message_id: int):
+    return await _load_run(await _get_db(), "message_id=?", message_id)
+
+
+async def set_payroll_adjustment(run_id: int, user_id: int, user_name: str, final_amount: int,
+                                 adjuster_id: int, adjuster_name: str) -> tuple[bool, str]:
+    """Set the FINAL payout for a user in a pending run. Equal to base clears the adjustment;
+    a user who isn't a dealer in the run gets a base-0 row."""
+    db = await _get_db()
+    now = datetime.utcnow()
+    async with _write_lock:
+        try:
+            async with db.execute("SELECT status FROM payout_runs WHERE id=?", (run_id,)) as c:
+                r = await c.fetchone()
+            if not r:
+                return False, "Run not found."
+            if r["status"] != "pending":
+                return False, f"Run is already {r['status']}."
+            async with db.execute("SELECT base_amount FROM payout_items WHERE run_id=? AND user_id=?", (run_id, user_id)) as c:
+                it = await c.fetchone()
+            if it:
+                base = it["base_amount"]
+                if final_amount == base:
+                    await db.execute("UPDATE payout_items SET adjusted_amount=NULL, adjusted_by=NULL WHERE run_id=? AND user_id=?", (run_id, user_id))
+                else:
+                    await db.execute("UPDATE payout_items SET adjusted_amount=?, adjusted_by=?, user_name=? WHERE run_id=? AND user_id=?",
+                                     (final_amount, adjuster_id, user_name, run_id, user_id))
+            else:
+                base = 0
+                if final_amount > 0:
+                    await db.execute(
+                        "INSERT INTO payout_items (run_id, user_id, user_name, poker_seconds, uno_seconds, base_amount, adjusted_amount, adjusted_by) "
+                        "VALUES (?,?,?,0,0,0,?,?)", (run_id, user_id, user_name, final_amount, adjuster_id))
+            await db.execute(
+                "INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",
+                (now.strftime("%Y-%m-%d %H:%M UTC"), "PAYROLL_ADJUST", adjuster_id, adjuster_name,
+                 f"run #{run_id}: {user_name} ({user_id}) base {base} -> final {final_amount}"))
+            await db.commit()
+            return True, ""
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def pay_payroll_run(run_id: int, approver_id: int, approver_name: str) -> tuple[bool, str]:
+    """Atomically approve a pending run and credit every payee's poker wallet.
+    Returns (True, '') on success, or (False, current_status_or_error) if it wasn't pending.
+    One transaction under the write lock: all payees paid, or none."""
+    db = await _get_db()
+    now = datetime.utcnow().isoformat()
+    async with _write_lock:
+        try:
+            cur = await db.execute(
+                "UPDATE payout_runs SET status='approved', decided_by=?, decided_ts=? WHERE id=? AND status='pending'",
+                (approver_id, now, run_id))
+            claimed = cur.rowcount
+            await cur.close()
+            if claimed != 1:
+                await db.rollback()
+                async with db.execute("SELECT status FROM payout_runs WHERE id=?", (run_id,)) as c:
+                    r = await c.fetchone()
+                return False, (r["status"] if r else "missing")
+
+            async with db.execute("SELECT * FROM payout_items WHERE run_id=?", (run_id,)) as c:
+                items = [dict(r) for r in await c.fetchall()]
+
+            total = 0
+            for it in items:
+                adj = it["adjusted_amount"]
+                final = adj if adj is not None else it["base_amount"]
+                if final <= 0:
+                    continue
+                total += final
+                mins = round((it["poker_seconds"] + it["uno_seconds"]) / 60, 1)
+                note = f"Dealer pay run #{run_id}: {mins} min"
+                if adj is not None and adj != it["base_amount"]:
+                    d = adj - it["base_amount"]
+                    note += f" (base {it['base_amount']}, adjusted {'+' if d > 0 else '-'}{abs(d)})"
+                # same wallet upsert as add_chips (incl. dust revive), inside this transaction
+                await db.execute("""
+                    INSERT INTO wallets (user_id, username, balance, last_activity, recent_hands, recent_chips_wagered)
+                    VALUES (?, ?, MAX(0, ?), ?, 0, 0)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username = excluded.username,
+                        last_activity = CASE WHEN balance < 50 THEN ? ELSE COALESCE(wallets.last_activity, ?) END,
+                        recent_hands = CASE WHEN balance < 50 THEN 0 ELSE COALESCE(wallets.recent_hands, 0) END,
+                        recent_chips_wagered = CASE WHEN balance < 50 THEN 0 ELSE COALESCE(wallets.recent_chips_wagered, 0) END,
+                        balance  = MAX(0, balance + ?)
+                """, (it["user_id"], it["user_name"], final, now, now, now, final))
+                await db.execute(
+                    "INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note) VALUES (?,?,?,?,?,?,?)",
+                    (now, approver_id, approver_name, it["user_id"], it["user_name"], final, note))
+
+            await db.execute(
+                "INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",
+                (datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), "PAYROLL_APPROVE", approver_id, approver_name,
+                 f"run #{run_id}: paid {total} chips to {sum(1 for i in items if (i['adjusted_amount'] if i['adjusted_amount'] is not None else i['base_amount']) > 0)} staff"))
+            await db.commit()
+            return True, ""
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def reject_payroll_run(run_id: int, user_id: int, user_name: str) -> bool:
+    db = await _get_db()
+    now = datetime.utcnow()
+    async with _write_lock:
+        try:
+            cur = await db.execute(
+                "UPDATE payout_runs SET status='rejected', decided_by=?, decided_ts=? WHERE id=? AND status='pending'",
+                (user_id, now.isoformat(), run_id))
+            ok = cur.rowcount == 1
+            await cur.close()
+            if ok:
+                await db.execute(
+                    "INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",
+                    (now.strftime("%Y-%m-%d %H:%M UTC"), "PAYROLL_REJECT", user_id, user_name, f"run #{run_id}"))
+            await db.commit()
+            return ok
+        except Exception:
+            await db.rollback()
+            raise

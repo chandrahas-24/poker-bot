@@ -370,6 +370,7 @@ async def _run_startup():
     #await bot.load_extension("uno.unodemo")
     await _load_ext("uno.uno_cog")
     await _load_ext("highlight")
+    await _load_ext("payroll")
     #await bot.load_extension("tournament.tournament")
 
 
@@ -754,6 +755,8 @@ async def reload(ctx, cog_name: str = None):
             return (UNO_HELPERS, ["uno.uno_cog"])
         elif name_lower in ("highlight", "hl"):
             return (["config"], ["highlight"])
+        elif name_lower == "payroll":
+            return (["config"], ["payroll"])
         else:
             # Generic fallback: any dotted path works here, not just the named
             # targets above — no need to pre-register a module in this file.
@@ -775,7 +778,7 @@ async def reload(ctx, cog_name: str = None):
     if cog_name is None:
         helpers_to_reload = ["config", "poker.net_history_db", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db", "poker.leaderboard_image", "poker.net_chips_graph"]
         helpers_to_reload += [h for h in UNO_HELPERS if h not in helpers_to_reload]
-        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "uno.uno_cog", "highlight"]
+        cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "uno.uno_cog", "highlight", "payroll"]
     else:
         # Comma-separated list of targets — aliases, dotted helper modules, or cogs, any mix.
         for token in [t.strip() for t in cog_name.split(",") if t.strip()]:

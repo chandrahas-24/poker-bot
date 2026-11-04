@@ -820,6 +820,17 @@ async def log_house_revenue(amount: int, source: str = 'game', table_id: str | N
         await db.commit()
 
 
+async def get_revenue_between(start, end) -> int:
+    """House revenue in the half-open UTC window [start, end) (naive datetimes); manual adjustments excluded."""
+    db = await _get_db()
+    async with db.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM house_revenue WHERE ts >= ? AND ts < ? AND source != 'adjustment'",
+        (start.isoformat(), end.isoformat())
+    ) as c:
+        row = await c.fetchone()
+    return int(row[0] or 0)
+
+
 async def get_revenue_stats() -> dict:
     db = await _get_db()
     now = datetime.utcnow()
@@ -934,7 +945,9 @@ async def log_dealer_event(table_id: str, dealer_id: int, dealer_name: str, even
         await db.commit()
 
 
-async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
+async def get_dealer_minutes_between(period_start, period_end) -> list[dict]:
+    """Dealer time inside the half-open UTC window [period_start, period_end) (naive datetimes).
+    Same reconstruction as get_dealer_minutes, but timestamp-granular. Rows also carry raw 'seconds'."""
 
     from collections import defaultdict
     from datetime import datetime as dt, timedelta
@@ -945,8 +958,6 @@ async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
     #
     #   [start_date 00:00, day_after_end_date 00:00)
     #
-    period_start = dt.fromisoformat(start_date)
-    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
 
     # We need the last event BEFORE the requested period for EVERY table.
     # This is what lets us reconstruct a session that started yesterday
@@ -1071,12 +1082,21 @@ async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
             "dealer_id": dealer_id,
             "dealer_name": data["dealer_name"],
             "minutes": round(data["seconds"] / 60, 1),
+            "seconds": data["seconds"],
         }
         for dealer_id, data in sorted(
             totals.items(),
             key=lambda x: -x[1]["seconds"]
         )
     ]
+
+
+async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
+    from datetime import datetime as dt, timedelta
+    # Whole UTC dates, half-open: [start_date 00:00, day_after_end_date 00:00)
+    period_start = dt.fromisoformat(start_date)
+    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
+    return await get_dealer_minutes_between(period_start, period_end)
 
 
 async def close_unclosed_dealer_sessions():

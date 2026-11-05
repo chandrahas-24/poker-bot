@@ -321,6 +321,10 @@ async def report_component_error(interaction: discord.Interaction, error: Except
 # which is what kept landing clicks on the Callout button underneath.
 ERR_TTL = 6
 
+# Seconds a player gets to answer the "play the card you drew?" prompt or the
+# Wild color picker before it auto-resolves (keep card / random color).
+DECISION_TIMEOUT = 15
+
 
 async def silent_ack(interaction: discord.Interaction):
     """Acknowledge an interaction leaving NOTHING on screen — for actions
@@ -1255,7 +1259,7 @@ class DrawFollowupView(discord.ui.View):
     """
 
     def __init__(self, cog: "UnoGame", session: GameSession, card: str, player_id: int):
-        super().__init__(timeout=60)
+        super().__init__(timeout=DECISION_TIMEOUT)
         self.cog = cog
         self.session = session
         self.card = card
@@ -1322,7 +1326,7 @@ class ColorButtonsView(discord.ui.View):
     """
 
     def __init__(self, cog: "UnoGame", session: GameSession, interaction: discord.Interaction | None = None):
-        super().__init__(timeout=60)
+        super().__init__(timeout=DECISION_TIMEOUT)
         self.cog = cog
         self.session = session
         # Stashed so on_timeout can edit the original ephemeral response —

@@ -216,17 +216,17 @@ def _section_text(items: list[dict], game: str, pool: int) -> str:
         final = it[adj_k] if it[adj_k] is not None else it[base_k]
         total += final
 
-        share = f" · `{final / pool * 100:.1f}%`" if pool > 0 else ""
+        share = f" · {final / pool * 100:.1f}%" if pool > 0 else ""
 
         lines.append(
-            f"<@{it['user_id']}>  ·  **{fmt_pay(it[base_k], it[adj_k])}** {chip}"
+            f"<@{it['user_id']}>  ·  **{fmt_pay(it[base_k], it[adj_k])} {chip}"
             f"  ·  `{it[sec] / 60:.1f} min`{share}"
         )
 
     if len(lines) == 1:
         lines.append("_No dealer minutes._")
 
-    lines.append(f"\n**Total payout**　**{total:,}** {chip}")
+    lines.append(f"\n**Total payout:** **{total:,}** {chip}")
 
     body = "\n".join(lines)
 
@@ -273,14 +273,14 @@ def _payroll_layout(
     dry=False,
     uno_paid=True,
 ):
-    title = "<a:money:1567791927334674492> PAYYYTIMEEEEE"
+    title = "<a:money:1567798474613850143> PAYYYTIMEEEEE"
     window = f"**Period**　{_ts(start)}  →  {_ts(end)}"
 
     summary = (
-        f"**Revenue**　`{max(0, p_rev):,}` {_chip_emoji('poker')} poker"
-        f"　·　`{max(0, u_rev):,}` {_chip_emoji('uno')} UNO\n"
-        f"**Pools**　**{pool_p:,}** {_chip_emoji('poker')}"
-        f"　·　**{pool_u:,}** {_chip_emoji('uno')}"
+        f"**Revenue:** **{max(0, p_rev):,}** {_chip_emoji('poker')} poker"
+        f" · **{max(0, u_rev):,}** {_chip_emoji('uno')} UNO\n"
+        f"**Pools:** **{pool_p:,}** {_chip_emoji('poker')}"
+        f" · **{pool_u:,}** {_chip_emoji('uno')}"
     )
 
     return discord.ui.Container(

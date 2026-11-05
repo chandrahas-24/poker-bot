@@ -297,6 +297,17 @@ def slog(t: TableState, text: str):
 def slog_clear(t: TableState):
     t.street_log = []
 
+async def _log_table_host_event(t: TableState, event: str, host_id=None, host_name=None):
+    """Keep tournament-host time out of the regular dealer session log."""
+    uid = t.manager_id if host_id is None else host_id
+    name = t.manager_name if host_name is None else host_name
+
+    if getattr(t, "is_tournament", False):
+        await db.log_tournament_host_event(t.id, t.name, uid, name, event)
+    else:
+        await db.log_dealer_event(t.id, t.name, uid, name, event)
+
+
 # ── Permissions ───────────────────────────────────────────────────────────────
 
 async def is_manager(interaction: discord.Interaction) -> bool:
@@ -907,7 +918,7 @@ async def _auto_next_hand(t: TableState, channel):
     total = len(active) + len(pending_with_chips)
 
     if total < 2:
-        await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'no_players')
+        await _log_table_host_event(t, 'no_players')
         await refresh(channel, t, cosmetics_cache=None)
         await channel.send("⚠️ Not enough players for another hand. Waiting for a Manager to `/poker start`.")
         return
@@ -956,7 +967,7 @@ async def _close_table(channel, t: TableState):
     if getattr(t, 'is_fully_closed', False):
         return
     t.is_fully_closed = True
-    await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'close')
+    await _log_table_host_event(t, 'close')
 
     # closing chaos falls back to a normal Medium table.
     if getattr(t, "chaos_mode", False):
@@ -6662,7 +6673,7 @@ class PokerCog(commands.Cog):
             t.pending_gamble_bets = {}
 
         t.msg_count = 0
-        await db.log_dealer_event(t.id, t.name, t.manager_id, t.manager_name, 'start')
+        await _log_table_host_event(t, 'start')
         await refresh(interaction.channel, t, new_hand=True)
         await _fire_sticky_premove(interaction.guild, interaction.channel, t)  # AFK player acting first
         await interaction.followup.send("✅ Hand started!", ephemeral=True)
@@ -7258,7 +7269,7 @@ class PokerCog(commands.Cog):
         # Switch the tip recipient
         t.manager_id = user.id
         t.manager_name = user.name  # Update the saved name!
-        await db.log_dealer_event(t.id, t.name, user.id, user.name, 'dealer_change')
+        await _log_table_host_event(t, 'dealer_change', user.id, user.name)
 
         await interaction.followup.send(
             f"🔄 **{user.mention}** has taken over as the dealer! All new tips will go to them.")
@@ -8744,6 +8755,37 @@ class PokerCog(commands.Cog):
             lines.append(f"• **{r['dealer_name']}** — {r['minutes']} min")
 
         await interaction.followup.send("\n".join(lines))
+
+    @pokermgr.command(
+        name="tourneyhosthours",
+        description="[Manager] Show tournament host minutes between two UTC dates",
+    )
+    @app_commands.describe(start="Start date (required)", end="End date (optional, defaults to today)")
+    @app_commands.autocomplete(start=date_autocomplete, end=date_autocomplete)
+    async def tournament_host_hours(self, interaction: discord.Interaction, start: str, end: str = None):
+        await interaction.response.defer(ephemeral=False)
+        if not await is_manager(interaction):
+            await interaction.followup.send("❌ Poker Managers only.", ephemeral=True)
+            return
+
+        try:
+            start = parse_date(start).strftime(DATE_FORMAT)
+            end = parse_date(end).strftime(DATE_FORMAT) if end else datetime.now(_tz.utc).date().strftime(DATE_FORMAT)
+        except ValueError:
+            await interaction.followup.send("❌ Invalid date.", ephemeral=True)
+            return
+
+        rows = await db.get_tournament_host_minutes(start, end)
+        label = start if end == start else f"{start} → {end}"
+        if not rows:
+            await interaction.followup.send(
+                f"No tournament host sessions logged for `{label}`.", ephemeral=True
+            )
+            return
+
+        lines = [f"**Tournament Host Hours — {label}**"]
+        lines.extend(f"• **{row['host_name']}** — {row['minutes']} min" for row in rows)
+        await interaction.followup.send("\\n".join(lines))
 
     @app_commands.command(name="changelog",description="View the poker bot's Git changelog",)
     @app_commands.describe(search="Only show commits matching this term",)

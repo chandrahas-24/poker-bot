@@ -371,7 +371,7 @@ async def _run_startup():
     await _load_ext("uno.uno_cog")
     await _load_ext("highlight")
     await _load_ext("payroll")
-    #await bot.load_extension("tournament.tournament")
+    await bot.load_extension("tournament.tournament")
 
 
     YOUR_GUILD_ID = config.GUILD_ID

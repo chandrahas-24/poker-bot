@@ -393,6 +393,19 @@ async def init_db():
             )
         """)
 
+        # Separate tournament host sessions from regular dealer sessions.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tournament_host_session_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id    TEXT NOT NULL,
+                table_name  TEXT NOT NULL,
+                host_id     INTEGER NOT NULL,
+                host_name   TEXT NOT NULL,
+                event       TEXT NOT NULL,
+                ts          TEXT NOT NULL
+            )
+        """)
+
         # ── AFK / decision-timeout forgiveness tracking (global, all tables) ──
         await db.execute("""
             CREATE TABLE IF NOT EXISTS afk_tracking (
@@ -798,25 +811,52 @@ async def close_unclosed_dealer_sessions():
     """) as c:
         rows = await c.fetchall()
 
-    if not rows:
-        return
+    if rows:
+        now = datetime.utcnow().isoformat()
 
-    now = datetime.utcnow().isoformat()
+        async with _write_lock:
+            for row in rows:
+                await db.execute(
+                    """
+                    INSERT INTO dealer_session_log
+                    (table_id, table_name, dealer_id, dealer_name, event, ts)
+                    VALUES (?, '', ?, ?, 'crash', ?)
+                    """,
+                    (row["table_id"], row["dealer_id"], row["dealer_name"], now)
+                )
 
-    async with _write_lock:
-        for row in rows:
-            await db.execute(
-                """
-                INSERT INTO dealer_session_log
-                (table_id, table_name, dealer_id, dealer_name, event, ts)
-                VALUES (?, '', ?, ?, 'crash', ?)
-                """,
-                (row["table_id"], row["dealer_id"], row["dealer_name"], now)
-            )
+            await db.commit()
 
-        await db.commit()
+        print(f"⚠️ Closed {len(rows)} unclosed dealer session(s) after restart")
 
-    print(f"⚠️ Closed {len(rows)} unclosed dealer session(s) after restart")
+    async with db.execute("""
+        SELECT table_id, host_id, host_name
+        FROM tournament_host_session_log h1
+        WHERE h1.id = (
+            SELECT h2.id
+            FROM tournament_host_session_log h2
+            WHERE h2.table_id = h1.table_id
+            ORDER BY h2.ts DESC, h2.id DESC
+            LIMIT 1
+        )
+        AND h1.event IN ('start', 'dealer_change')
+    """) as c:
+        host_rows = await c.fetchall()
+
+    if host_rows:
+        now = datetime.utcnow().isoformat()
+        async with _write_lock:
+            for row in host_rows:
+                await db.execute(
+                    """
+                    INSERT INTO tournament_host_session_log
+                    (table_id, table_name, host_id, host_name, event, ts)
+                    VALUES (?, '', ?, ?, 'crash', ?)
+                    """,
+                    (row["table_id"], row["host_id"], row["host_name"], now)
+                )
+            await db.commit()
+        print(f"⚠️ Closed {len(host_rows)} unclosed tournament host session(s) after restart")
 
 
 # ── Audit log ─────────────────────────────────────────────────────────────────
@@ -2726,6 +2766,113 @@ async def log_dealer_event(table_id: str, table_name: str, dealer_id: int, deale
             (table_id, table_name, dealer_id, dealer_name, event, datetime.utcnow().isoformat())
         )
         await db.commit()
+
+async def log_tournament_host_event(
+    table_id: str, table_name: str, host_id: int, host_name: str, event: str
+):
+    """Record tournament host lifecycle events separately from regular dealers."""
+    async with _write_lock:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO tournament_host_session_log
+            (table_id, table_name, host_id, host_name, event, ts)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (table_id, table_name, host_id, host_name, event, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+
+async def get_tournament_host_minutes_between(period_start, period_end) -> list[dict]:
+    """Tournament-host time in the half-open UTC interval [start, end)."""
+    from collections import defaultdict
+    from datetime import datetime as dt
+
+    db = await _get_db()
+    async with db.execute(
+        """
+        SELECT h1.table_id, h1.host_id, h1.host_name, h1.event, h1.ts
+        FROM tournament_host_session_log h1
+        WHERE h1.id = (
+            SELECT h2.id FROM tournament_host_session_log h2
+            WHERE h2.table_id = h1.table_id AND h2.ts < ?
+            ORDER BY h2.ts DESC, h2.id DESC LIMIT 1
+        )
+        """,
+        (period_start.isoformat(),)
+    ) as c:
+        previous_rows = await c.fetchall()
+
+    async with db.execute(
+        """
+        SELECT table_id, host_id, host_name, event, ts
+        FROM tournament_host_session_log
+        WHERE ts >= ? AND ts < ?
+        ORDER BY ts ASC, id ASC
+        """,
+        (period_start.isoformat(), period_end.isoformat())
+    ) as c:
+        period_rows = await c.fetchall()
+
+    by_table = defaultdict(list)
+    for row in previous_rows:
+        by_table[row["table_id"]].append(row)
+    for row in period_rows:
+        by_table[row["table_id"]].append(row)
+
+    totals = defaultdict(lambda: {"host_name": "", "seconds": 0})
+    calculation_end = min(period_end, dt.utcnow())
+
+    for events in by_table.values():
+        active = None
+        for row in events:
+            host_id, host_name = row["host_id"], row["host_name"]
+            event_time = dt.fromisoformat(row["ts"])
+
+            if row["event"] in ("start", "dealer_change"):
+                if active:
+                    old_id, old_name, started = active
+                    a, b = max(started, period_start), min(event_time, calculation_end)
+                    if b > a:
+                        totals[old_id]["host_name"] = old_name
+                        totals[old_id]["seconds"] += int((b - a).total_seconds())
+                active = (host_id, host_name, event_time)
+
+            elif row["event"] in ("close", "no_players", "crash"):
+                if active:
+                    old_id, old_name, started = active
+                    a, b = max(started, period_start), min(event_time, calculation_end)
+                    if b > a:
+                        totals[old_id]["host_name"] = old_name
+                        totals[old_id]["seconds"] += int((b - a).total_seconds())
+                    active = None
+
+        if active:
+            old_id, old_name, started = active
+            a, b = max(started, period_start), calculation_end
+            if b > a:
+                totals[old_id]["host_name"] = old_name
+                totals[old_id]["seconds"] += int((b - a).total_seconds())
+
+    return [
+        {
+            "host_id": uid,
+            "host_name": data["host_name"],
+            "minutes": round(data["seconds"] / 60, 1),
+            "seconds": data["seconds"],
+        }
+        for uid, data in sorted(totals.items(), key=lambda item: -item[1]["seconds"])
+    ]
+
+
+async def get_tournament_host_minutes(start_date: str, end_date: str) -> list[dict]:
+    from datetime import datetime as dt, timedelta
+    return await get_tournament_host_minutes_between(
+        dt.fromisoformat(start_date),
+        dt.fromisoformat(end_date) + timedelta(days=1),
+    )
+
 
 async def get_dealer_minutes_between(period_start, period_end) -> list[dict]:
     """Dealer time inside the half-open UTC window [period_start, period_end) (naive datetimes).

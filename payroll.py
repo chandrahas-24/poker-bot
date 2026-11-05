@@ -183,7 +183,7 @@ def fmt_pay(base: int, adj) -> str:
         return f"{base:,}"
 
     d = adj - base
-    return f"{base:,} {'+' if d > 0 else '−'} {abs(d):,} → **{adj:,}**"
+    return f"{base:,} {'+' if d > 0 else '−'} {abs(d):,} → {adj:,}"
 
 
 def _chip_emoji(game: str) -> str:
@@ -219,14 +219,14 @@ def _section_text(items: list[dict], game: str, pool: int) -> str:
         share = f" · {final / pool * 100:.1f}%" if pool > 0 else ""
 
         lines.append(
-            f"<@{it['user_id']}>  ·  **{fmt_pay(it[base_k], it[adj_k])} {chip}"
-            f"  ·  `{it[sec] / 60:.1f} min`{share}"
+            f"<@{it['user_id']}>  ·  **{fmt_pay(it[base_k], it[adj_k])}** {chip}"
+            f"  ·  {it[sec] / 60:.1f} min{share}"
         )
 
     if len(lines) == 1:
         lines.append("_No dealer minutes._")
 
-    lines.append(f"\n**Total payout:** **{total:,}** {chip}")
+    lines.append(f"\n**Total payout:**  **{total:,}** {chip}")
 
     body = "\n".join(lines)
 
@@ -277,9 +277,9 @@ def _payroll_layout(
     window = f"**Period**　{_ts(start)}  →  {_ts(end)}"
 
     summary = (
-        f"**Revenue:** **{max(0, p_rev):,}** {_chip_emoji('poker')} poker"
-        f" · **{max(0, u_rev):,}** {_chip_emoji('uno')} UNO\n"
-        f"**Pools:** **{pool_p:,}** {_chip_emoji('poker')}"
+        f"**Revenue:**  **{max(0, p_rev):,}** {_chip_emoji('poker')}"
+        f" · **{max(0, u_rev):,}** {_chip_emoji('uno')}\n"
+        f"**Pools:      ** **{pool_p:,}** {_chip_emoji('poker')}"
         f" · **{pool_u:,}** {_chip_emoji('uno')}"
     )
 

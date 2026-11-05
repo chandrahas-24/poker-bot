@@ -6424,19 +6424,32 @@ class PokerCog(commands.Cog):
             await refresh(message.channel, t, new_hand=True)
 
 
-    # ── THE BACKUP ENGINE (Hidden Helper) ──────────────────────────────────
-    async def _send_backup(self, user: discord.User):
-        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    # ── THE BACKUP ENGINE ─────────────────────────────────────────────────
+    async def _send_backup(self):
+        """Create a database archive and post it to config.BACKUP_THREAD_ID."""
+        thread_id = getattr(config, "BACKUP_THREAD_ID", None)
+        if not thread_id:
+            raise RuntimeError("config.BACKUP_THREAD_ID is not configured.")
 
-        # 1. Get the absolute path to the directory this script lives in
+        # Resolve the configured thread (fetch_channel also works when it is
+        # not present in the bot's cache).
+        thread = self.bot.get_channel(int(thread_id))
+        if thread is None:
+            thread = await self.bot.fetch_channel(int(thread_id))
+        if not isinstance(thread, discord.Thread):
+            raise TypeError(
+                f"config.BACKUP_THREAD_ID ({thread_id}) must point to a Discord thread, "
+                f"not {type(thread).__name__}."
+            )
+
+        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
         base_dir = os.path.dirname(os.path.abspath(__file__))
         clean_zip_name = f"data_backup_{date_str}.zip"
-        zip_path = os.path.join("", clean_zip_name)
-
-        data_dir = os.path.join(base_dir, "..", "data")
+        zip_path = os.path.join(base_dir, clean_zip_name)
+        data_dir = os.path.abspath(os.path.join(base_dir, "..", "data"))
 
         try:
-            # Force SQLite to flush the WAL to the main DB safely for the main poker DB
+            # Flush SQLite WAL data before archiving the database files.
             async with db._write_lock:
                 conn = await db._get_db()
                 await conn.execute("PRAGMA wal_checkpoint(RESTART)")
@@ -6449,22 +6462,22 @@ class PokerCog(commands.Cog):
             except Exception:
                 traceback.print_exc()
 
-            # 2. Write the zip file safely using absolute paths and arcname
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Build the archive using paths relative to the data directory.
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
                 for root, _, files in os.walk(data_dir):
-                    for file in files:
-                        full_path = os.path.join(root, file)
-
+                    for filename in files:
+                        full_path = os.path.join(root, filename)
                         zipf.write(
                             full_path,
                             arcname=os.path.relpath(full_path, data_dir)
                         )
 
-            # 3. Send the file to Discord
-            with open(zip_path, 'rb') as f:
+            with open(zip_path, "rb") as f:
                 discord_file = discord.File(f, filename=clean_zip_name)
-                await user.send(f"📦 **Database Backup** ({date_str})", file=discord_file)
-
+                await thread.send(
+                    f"📦 **Database Backup** ({date_str})",
+                    file=discord_file
+                )
         finally:
             # 4. ALWAYS clean up the zip file, even if the Discord send fails
             if os.path.exists(zip_path):

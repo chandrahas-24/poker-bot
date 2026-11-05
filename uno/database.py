@@ -1684,3 +1684,50 @@ async def wipe_inactive_players() -> list[dict]:
 
         await db.commit()
     return wiped
+
+
+# ── Dealer payroll: UNO side (idempotent per run, so a retry can never double-pay) ──
+
+async def credit_payroll(run_id: int, approver_id: int, approver_name: str, payees: list[dict]) -> int:
+    """payees: [{user_id, name, amount, note}]. Credits each UNO wallet + chip_log once per (run, user);
+    already-credited rows are skipped. One transaction. Returns number newly credited."""
+    db = await _get_db()
+    now = datetime.utcnow().isoformat()
+    paid = 0
+    async with _write_lock:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payroll_credits (
+                run_id INTEGER NOT NULL, user_id INTEGER NOT NULL, amount INTEGER NOT NULL, ts TEXT NOT NULL,
+                PRIMARY KEY (run_id, user_id)
+            )
+        """)
+        for p in payees:
+            if p["amount"] <= 0:
+                continue
+            cur = await db.execute("INSERT OR IGNORE INTO payroll_credits (run_id, user_id, amount, ts) VALUES (?,?,?,?)",
+                                   (run_id, p["user_id"], p["amount"], now))
+            fresh = cur.rowcount == 1
+            await cur.close()
+            if not fresh:
+                continue
+            await db.execute("""
+                INSERT INTO wallets (user_id, username, balance, last_activity, recent_rounds, recent_chips_wagered)
+                VALUES (?, ?, MAX(0, ?), ?, 0, 0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    last_activity = CASE WHEN balance < ? THEN ? ELSE COALESCE(wallets.last_activity, ?) END,
+                    recent_rounds = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_rounds, 0) END,
+                    recent_chips_wagered = CASE WHEN balance < ? THEN 0 ELSE COALESCE(wallets.recent_chips_wagered, 0) END,
+                    balance = MAX(0, balance + ?)
+            """, (p["user_id"], p["name"], p["amount"], now,
+                  config.UNO_MIN_BET, now, now, config.UNO_MIN_BET, config.UNO_MIN_BET, p["amount"]))
+            await db.execute(
+                "INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note, table_id) VALUES (?,?,?,?,?,?,?,NULL)",
+                (now, approver_id, approver_name, p["user_id"], p["name"], p["amount"], p["note"]))
+            paid += 1
+        if paid:
+            await db.execute("INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",
+                             (datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), "PAYROLL_APPROVE", approver_id, approver_name,
+                              f"run #{run_id}: UNO payout, {paid} staff credited"))
+        await db.commit()
+    return paid

@@ -1,9 +1,10 @@
 """Weekly dealer payroll.
 
-Every Monday 11:00 (config.PAYROLL_TZ, default Asia/Kolkata) the bot totals house revenue (poker + UNO,
-1 UNO chip = 1 poker chip) since the previous run, takes DEALER_PAY_RATE of it and splits it by dealer
-minutes (rounded UP per dealer). The report goes to config.PAYROLL_CHANNEL_ID with Approve / Adjust /
-Reject buttons; approval credits the poker wallets atomically (poker.database.pay_payroll_run).
+Every Monday 11:00 (config.PAYROLL_TZ, default Asia/Kolkata) the bot totals house revenue per game since the
+previous run, takes DEALER_PAY_RATE of each game's revenue and splits it by that game's dealer minutes
+(rounded UP per dealer). Poker and UNO pools are separate and paid in their own chips. The report goes to
+config.PAYROLL_CHANNEL_ID with Approve / Adjust / Reject buttons. Approval credits poker wallets atomically
+(poker.database.pay_payroll_run), then UNO wallets (uno.database.credit_payroll, idempotent + auto-retried).
 """
 import asyncio
 import calendar
@@ -61,27 +62,52 @@ async def compute(start: dt.datetime, end: dt.datetime) -> dict:
                       ("u_sec", await udb.get_dealer_minutes_between(start, end))):
         for r in rows:
             e = people.setdefault(r["dealer_id"], {"user_id": r["dealer_id"], "name": r["dealer_name"],
-                                                   "p_sec": 0, "u_sec": 0, "adj": None})
+                                                   "p_sec": 0, "u_sec": 0})
             e[key] += int(r["seconds"])
             e["name"] = r["dealer_name"]
-    revenue = max(0, p_rev + u_rev)
-    total_secs = sum(e["p_sec"] + e["u_sec"] for e in people.values())
-    pool_exact = _rate() * revenue
+    pool_p = _rate() * max(0, p_rev)
+    pool_u = _rate() * max(0, u_rev)
+    tot_p = sum(e["p_sec"] for e in people.values())
+    tot_u = sum(e["u_sec"] for e in people.values())
     items = []
     for e in people.values():
-        secs = e["p_sec"] + e["u_sec"]
-        if secs <= 0:
+        if e["p_sec"] + e["u_sec"] <= 0:
             continue
-        base = math.ceil(pool_exact * secs / total_secs) if revenue > 0 and total_secs > 0 else 0
-        items.append({**e, "base": base})
+        p_base = math.ceil(pool_p * e["p_sec"] / tot_p) if tot_p > 0 and pool_p > 0 else 0
+        u_base = math.ceil(pool_u * e["u_sec"] / tot_u) if tot_u > 0 and pool_u > 0 else 0
+        items.append({**e, "p_base": p_base, "u_base": u_base, "p_adj": None, "u_adj": None})
     items.sort(key=lambda x: -(x["p_sec"] + x["u_sec"]))
-    return {"p_rev": p_rev, "u_rev": u_rev, "revenue": revenue, "pool": math.ceil(pool_exact),
+    return {"p_rev": p_rev, "u_rev": u_rev, "pool_p": math.ceil(pool_p), "pool_u": math.ceil(pool_u),
             "rate": float(_rate()), "items": items}
 
 
 def _norm_db_items(db_items: list[dict]) -> list[dict]:
-    return [{"user_id": i["user_id"], "name": i["user_name"], "p_sec": i["poker_seconds"],
-             "u_sec": i["uno_seconds"], "base": i["base_amount"], "adj": i["adjusted_amount"]} for i in db_items]
+    return [{"user_id": i["user_id"], "name": i["user_name"], "p_sec": i["poker_seconds"], "u_sec": i["uno_seconds"],
+             "p_base": i["base_amount"], "p_adj": i["adjusted_amount"],
+             "u_base": i["uno_amount"], "u_adj": i["adj_uno"]} for i in db_items]
+
+
+async def settle_uno(run_id: int) -> bool:
+    """Credit the UNO half of an approved run. Idempotent (per run+user in uno.db); safe to call repeatedly."""
+    try:
+        got = await pdb.get_payroll_run(run_id)
+        if not got:
+            return False
+        run, db_items = got
+        if run["status"] != "approved" or run["uno_paid"]:
+            return True
+        payees = []
+        for it in _norm_db_items(db_items):
+            amt = it["u_adj"] if it["u_adj"] is not None else it["u_base"]
+            if amt > 0:
+                payees.append({"user_id": it["user_id"], "name": it["name"], "amount": amt,
+                               "note": pdb._pay_note(run_id, "UNO", it["u_sec"], it["u_base"], it["u_adj"])})
+        await udb.credit_payroll(run_id, run["decided_by"], run["decided_name"] or "payroll", payees)
+        await pdb.mark_uno_paid(run_id)
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────
@@ -97,33 +123,39 @@ def fmt_pay(base: int, adj) -> str:
     return f"{base:,}{'+' if d > 0 else '-'}{abs(d):,} -> {adj:,}"
 
 
-def render(run_id, start, end, p_rev, u_rev, pool, rate, items, status="pending", decided_by=None, dry=False) -> discord.Embed:
-    revenue = max(0, p_rev + u_rev)
-    lines = []
-    total_paid = 0
+def _section(items: list[dict], game: str, pool: int):
+    sec, base_k, adj_k = ("p_sec", "p_base", "p_adj") if game == "poker" else ("u_sec", "u_base", "u_adj")
+    lines, total = [], 0
     for it in items:
-        final = it["adj"] if it["adj"] is not None else it["base"]
-        total_paid += final
-        p, u = it["p_sec"], it["u_sec"]
-        detail = f"{(p + u) / 60:.1f} min" + (f" (P {p / 60:.1f} / U {u / 60:.1f})" if p and u else "")
-        pct = f" ({it['base'] / pool * 100:.1f}%)" if pool > 0 else ""
-        lines.append(f"<@{it['user_id']}> · {detail} · **{fmt_pay(it['base'], it['adj'])}**{pct}")
-    desc = "\n".join(lines) if lines else "*No dealer minutes in this window.*"
-    if len(desc) > 3800:
-        desc = desc[:3800] + "\n…"
+        if not (it[sec] or it[base_k] or it[adj_k] is not None):
+            continue
+        final = it[adj_k] if it[adj_k] is not None else it[base_k]
+        total += final
+        pct = f" ({final / pool * 100:.1f}%)" if pool > 0 else ""
+        lines.append(f"<@{it['user_id']}> · {it[sec] / 60:.1f} min · **{fmt_pay(it[base_k], it[adj_k])}**{pct}")
+    body = "\n".join(lines) if lines else "*No dealer minutes.*"
+    if len(body) > 850:
+        body = body[:850] + "\n…"
+    return f"{body}\nTotal payout **{total:,}**"
+
+
+def render(run_id, start, end, p_rev, u_rev, pool_p, pool_u, rate, items, status="pending", decided_by=None,
+           dry=False, uno_paid=True) -> discord.Embed:
     colors = {"pending": 0xF1C40F, "approved": 0x2ECC71, "rejected": 0xE74C3C, "empty": 0x95A5A6}
     title = "Dealer Payroll" + (" — DRY RUN" if dry else f" — Run #{run_id}")
-    e = discord.Embed(title=title, description=desc, color=0x3498DB if dry else colors.get(status, 0x95A5A6))
+    e = discord.Embed(title=title, color=0x3498DB if dry else colors.get(status, 0x95A5A6))
     e.add_field(name="Window", value=f"{_ts(start)} → {_ts(end)}", inline=False)
-    e.add_field(name="Revenue", value=f"Poker {p_rev:,}\nUNO {u_rev:,}\nTotal **{revenue:,}**", inline=True)
-    e.add_field(name=f"Pool ({rate * 100:g}%)", value=f"**{pool:,}**", inline=True)
-    e.add_field(name="Total payout", value=f"**{total_paid:,}**", inline=True)
+    e.add_field(name=f"🃏 Poker — revenue {max(0, p_rev):,} → pool {pool_p:,} ({rate * 100:g}%)",
+                value=_section(items, "poker", pool_p), inline=False)
+    e.add_field(name=f"🎴 UNO — revenue {max(0, u_rev):,} → pool {pool_u:,} ({rate * 100:g}%)",
+                value=_section(items, "uno", pool_u), inline=False)
     if dry:
         e.set_footer(text="Dry run — nothing saved or paid")
     elif status == "pending":
         e.add_field(name="Status", value="⏳ Pending approval", inline=False)
     elif status == "approved":
-        e.add_field(name="Status", value=f"✅ Approved by <@{decided_by}> — paid to poker balances", inline=False)
+        tail = "poker + UNO wallets credited" if uno_paid else "poker credited · ⚠️ UNO credit pending, auto-retrying"
+        e.add_field(name="Status", value=f"✅ Approved by <@{decided_by}> — {tail}", inline=False)
     elif status == "rejected":
         e.add_field(name="Status", value=f"❌ Rejected by <@{decided_by}> — nothing paid", inline=False)
     elif status == "empty":
@@ -133,8 +165,9 @@ def render(run_id, start, end, p_rev, u_rev, pool, rate, items, status="pending"
 
 def render_run(run: dict, db_items: list[dict]) -> discord.Embed:
     return render(run["id"], dt.datetime.fromisoformat(run["window_start"]), dt.datetime.fromisoformat(run["window_end"]),
-                  run["poker_revenue"], run["uno_revenue"], run["pool"], run["rate"], _norm_db_items(db_items),
-                  status=run["status"], decided_by=run["decided_by"])
+                  run["poker_revenue"], run["uno_revenue"], run["pool_poker"], run["pool_uno"], run["rate"],
+                  _norm_db_items(db_items), status=run["status"], decided_by=run["decided_by"],
+                  uno_paid=bool(run["uno_paid"]))
 
 
 # ── Buttons (persistent: run is looked up by message id, so no per-run custom_ids) ──
@@ -151,8 +184,9 @@ async def _guard(interaction: discord.Interaction):
 
 
 class AdjustModal(discord.ui.Modal, title="Adjust payout"):
+    game = discord.ui.TextInput(label="Game (poker / uno)", default="poker", max_length=5)
     user = discord.ui.TextInput(label="User (ID or @mention)", placeholder="123456789012345678", max_length=60)
-    amount = discord.ui.TextInput(label="Final payout (chips)", placeholder="250", max_length=12)
+    amount = discord.ui.TextInput(label="Final payout (that game's chips)", placeholder="250", max_length=12)
 
     def __init__(self, message: discord.Message):
         super().__init__()
@@ -165,8 +199,10 @@ class AdjustModal(discord.ui.Modal, title="Adjust payout"):
             final = int(self.amount.value.replace(",", "").strip())
         except ValueError:
             final = -1
-        if not m or final < 0:
-            await interaction.followup.send("❌ Need a user ID/@mention and a whole-number amount ≥ 0.", ephemeral=True)
+        g = self.game.value.strip().lower()
+        game = "uno" if g.startswith("u") else "poker" if g.startswith("p") else None
+        if not m or final < 0 or not game:
+            await interaction.followup.send("❌ Need game (poker/uno), a user ID/@mention and a whole-number amount ≥ 0.", ephemeral=True)
             return
         uid = int(m.group())
         got = await pdb.get_payroll_run_by_message(self.message.id)
@@ -185,15 +221,18 @@ class AdjustModal(discord.ui.Modal, title="Adjust payout"):
         if not name:
             await interaction.followup.send("❌ That user isn't in this server.", ephemeral=True)
             return
-        ok, err = await pdb.set_payroll_adjustment(run["id"], uid, name, final, interaction.user.id, interaction.user.display_name)
+        ok, err = await pdb.set_payroll_adjustment(run["id"], game, uid, name, final, interaction.user.id, interaction.user.display_name)
         if not ok:
             await interaction.followup.send(f"❌ {err}", ephemeral=True)
             return
         run, items = await pdb.get_payroll_run(run["id"])
         await self.message.edit(embed=render_run(run, items), view=PayrollView())
         row = next((i for i in items if i["user_id"] == uid), None)
-        shown = fmt_pay(row["base_amount"], row["adjusted_amount"]) if row else "0"
-        await interaction.followup.send(f"✅ <@{uid}>: {shown}", ephemeral=True)
+        if row:
+            shown = fmt_pay(*((row["base_amount"], row["adjusted_amount"]) if game == "poker" else (row["uno_amount"], row["adj_uno"])))
+        else:
+            shown = "0"
+        await interaction.followup.send(f"✅ {game.upper()} · <@{uid}>: {shown}", ephemeral=True)
 
 
 class PayrollView(discord.ui.View):
@@ -213,6 +252,8 @@ class PayrollView(discord.ui.View):
             traceback.print_exc()
             await interaction.followup.send("❌ Payout failed and was rolled back — nobody was paid. Check logs.", ephemeral=True)
             return
+        if ok or why == "approved":
+            await settle_uno(run["id"])  # idempotent; also finishes a UNO credit that failed earlier
         run, items = await pdb.get_payroll_run(run["id"])
         await interaction.edit_original_response(embed=render_run(run, items), view=None if run["status"] != "pending" else self)
         if not ok:
@@ -277,13 +318,14 @@ class Payroll(commands.Cog):
 
     async def _post(self, channel, kind: str, start: dt.datetime, end: dt.datetime) -> bool:
         data = await compute(start, end)
-        has_content = data["revenue"] > 0 or bool(data["items"])
+        has_content = data["p_rev"] > 0 or data["u_rev"] > 0 or bool(data["items"])
         if kind == "force" and not has_content:
             return False  # don't consume the window for nothing
         status = "pending" if has_content else "empty"
-        run_id = await pdb.create_payroll_run(start, end, kind, data["p_rev"], data["u_rev"], data["pool"],
-                                              data["rate"], status, data["items"])
-        embed = render(run_id, start, end, data["p_rev"], data["u_rev"], data["pool"], data["rate"], data["items"], status=status)
+        run_id = await pdb.create_payroll_run(start, end, kind, data["p_rev"], data["u_rev"], data["pool_p"],
+                                              data["pool_u"], data["rate"], status, data["items"])
+        embed = render(run_id, start, end, data["p_rev"], data["u_rev"], data["pool_p"], data["pool_u"], data["rate"],
+                       data["items"], status=status)
         try:
             msg = await channel.send(embed=embed, view=PayrollView() if status == "pending" else None)
         except Exception:
@@ -299,9 +341,21 @@ class Payroll(commands.Cog):
         await self._post(channel, "scheduled", *w)
         return True
 
+    async def _retry_uno(self):
+        for rid in await pdb.get_unsettled_uno_run_ids():
+            if await settle_uno(rid):
+                run, items = await pdb.get_payroll_run(rid)
+                try:
+                    ch = self.bot.get_channel(run["channel_id"]) or await self.bot.fetch_channel(run["channel_id"])
+                    msg = await ch.fetch_message(run["message_id"])
+                    await msg.edit(embed=render_run(run, items), view=None)
+                except Exception:
+                    traceback.print_exc()
+
     @tasks.loop(minutes=1)
     async def scheduler(self):
         try:
+            await self._retry_uno()
             async with self._lock:
                 ch = await self._channel()
                 if ch is None:
@@ -325,7 +379,7 @@ class Payroll(commands.Cog):
             await interaction.followup.send("Nothing to preview — window is empty.", ephemeral=True)
             return
         data = await compute(*w)
-        embed = render(0, w[0], w[1], data["p_rev"], data["u_rev"], data["pool"], data["rate"], data["items"], dry=True)
+        embed = render(0, w[0], w[1], data["p_rev"], data["u_rev"], data["pool_p"], data["pool_u"], data["rate"], data["items"], dry=True)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @payroll.command(name="force", description="[Admin] Post a payroll report now for the last run → now")

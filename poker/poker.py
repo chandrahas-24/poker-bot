@@ -6493,7 +6493,7 @@ class PokerCog(commands.Cog):
         try:
             user_id = self.DEV_USER_IDS[0]
             user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
-            await self._send_backup(user)
+            await self._send_backup()
         except Exception as e:
             print(f"[Backup Task Error] {e}")
             traceback.print_exc()
@@ -8396,7 +8396,7 @@ class PokerCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
 
-    @pokeradmin.command(name="backup", description="[Dev] Force a database backup to your DMs")
+    @pokeradmin.command(name="backup", description="[Dev] Force a database backup")
     async def force_backup(self, interaction: discord.Interaction):
         # Ironclad Security: Only YOU can run this
         if interaction.user.id not in self.DEV_USER_IDS:
@@ -8407,8 +8407,8 @@ class PokerCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            await self._send_backup(interaction.user)
-            await interaction.followup.send("✅ Backup sent directly to your DMs!", ephemeral=True)
+            await self._send_backup()
+            await interaction.followup.send("✅ Backup sent", ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send(
                 "❌ Failed to send DM. Please check your Discord privacy settings to allow messages from server members.",

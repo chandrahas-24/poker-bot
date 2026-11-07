@@ -1161,6 +1161,29 @@ class BetModal(discord.ui.Modal):
         await report_component_error(interaction, error, None, "BetModal")
 
 
+class UnoTipModal(discord.ui.Modal, title="Tip Dealer"):
+    amount = discord.ui.TextInput(label="How many chips to tip?", placeholder="e.g. 50 or 1k",
+                                  min_length=1, max_length=8)
+
+    def __init__(self, cog: "UnoGame", session: "GameSession", wallet_bal: int, table_bet: int):
+        super().__init__()
+        self.cog = cog
+        self.session = session
+        self.amount.placeholder = f"e.g. 50  (wallet: {wallet_bal:,} | table: {table_bet:,})"[:100]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        tip = _parse_chips(self.amount.value)
+        if tip is None or tip <= 0:
+            await interaction.response.send_message("❌ Enter a valid amount greater than 0 (e.g. 50, 1k).",
+                                                    ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        await self.cog._do_tip(interaction, self.session, tip)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await report_component_error(interaction, error, None, "UnoTipModal")
+
+
 class TablePanelView(discord.ui.View):
     def __init__(self, cog: "UnoGame", session: "GameSession"):
         # Between rounds nothing auto-starts, so the panel must outlive the
@@ -1171,6 +1194,9 @@ class TablePanelView(discord.ui.View):
         if session.state not in ("lobby", "window", "waiting"):
             # No Start while a round is running.
             self.remove_item(self.start)
+        if session.state not in ("window", "waiting"):
+            # Tip Dealer only between rounds (not in the pre-round-1 lobby or mid-round).
+            self.remove_item(self.tip_dealer)
         cog._track_view(self)
 
     async def on_timeout(self):
@@ -1238,6 +1264,19 @@ class TablePanelView(discord.ui.View):
                 return
             await interaction.response.defer()
             await self.cog.begin_round(s, interaction.channel)
+
+    @discord.ui.button(label="Tip Dealer 💸", style=discord.ButtonStyle.blurple, row=1)
+    async def tip_dealer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if s.closed:
+            await interaction.response.send_message("❌ This table has closed.", ephemeral=True)
+            return
+        if interaction.user.id == s.dealer_id:
+            await interaction.response.send_message("❌ You can't tip yourself.", ephemeral=True)
+            return
+        seat = s.seats.get(interaction.user.id)
+        balance = await db.get_balance(interaction.user.id)
+        await interaction.response.send_modal(UnoTipModal(self.cog, s, balance, seat.bet if seat else 0))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         await report_component_error(interaction, error, item, "TablePanelView")
@@ -3652,12 +3691,20 @@ class UnoGame(commands.Cog):
         if not session or session.closed:
             await interaction.followup.send("❌ No table in this channel.", ephemeral=True)
             return
+        await self._do_tip(interaction, session, tip)
+
+    async def _do_tip(self, interaction: discord.Interaction, session: GameSession, tip: int):
+        """Shared by /uno tip and the panel's Tip Dealer modal. The interaction
+        must already be deferred (public); every reply goes through followup."""
         uid = interaction.user.id
         if uid == session.dealer_id:
             await interaction.followup.send("❌ You can't tip yourself.", ephemeral=True)
             return
 
         async with session.lock:
+            if session.closed:
+                await interaction.followup.send("❌ This table has closed.", ephemeral=True)
+                return
             seat = session.seats.get(uid)
             wallet_bal = await db.get_balance(uid)
             # Wallet first, then (between rounds only) the bet on the table —

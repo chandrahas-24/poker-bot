@@ -8432,19 +8432,11 @@ class PokerCog(commands.Cog):
     @app_commands.describe(number="Number of cards to draw",
                            infinite="Use a fresh deck for every card (Default: False)",
                            name="X drew",
-                           saro_shiny="Chance for e-girl Saroshi (As) to be shiny (0 to 1, Default: 0)",
-                           bay_shiny="Chance for Princess Bay (6h) to be shiny (0 to 1, Default: 0)",
-                           draug_shiny="Chance for draug (9s) to be shiny (0 to 1, Default: 0)",
-                           sap_shiny="Chance for sap (Kc) to be shiny (0 to 1, Default: 0)",
                            sort="Sort cards by rank or suit (Default: rank)")
     @app_commands.choices(
         sort=[app_commands.Choice(name="Rank", value="rank"), app_commands.Choice(name="Suit", value="suit")])
     async def draw_cards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
                          infinite: bool = False,
-                         saro_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                         bay_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                         draug_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                         sap_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
                          name: str = "", sort: str = "rank"):
         await interaction.response.defer(ephemeral=False)
 
@@ -8468,18 +8460,11 @@ class PokerCog(commands.Cog):
         else:
             cards.sort(key=lambda card: (suit_order[Card.int_to_str(card)[1]], rank_order[Card.int_to_str(card)[0]]))
 
-        import random
-        chances = {"egirl_saro": saro_shiny, "princess_bay": bay_shiny,
-                   "draug": draug_shiny, "makima_sap": sap_shiny}
-        shiny_ids = [sid for sid, ch in chances.items()
-                     if ch > 0 and shiny_cards.get_by_id(sid).card_int in cards and random.random() < ch]
-
-        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True, shiny_ids)
+        file = await asyncio.to_thread(card_images.make_strip, cards, 0, True)
 
         await interaction.followup.send(
             f"🃏 {name} drew **{number}** card{'s' if number != 1 else ''}"
-            f"{' (infinite deck)' if infinite else ''}: "
-            f"\n {hand_str(cards)}{' ✨' if shiny_ids else ''}",
+            f"{' (infinite deck)' if infinite else ''}: ",
             file=file
         )
 
@@ -8850,23 +8835,13 @@ class PokerCog(commands.Cog):
     @app_commands.describe(number="Number of cards to draw",
                            infinite="Use a fresh deck for every card (Default: False)",
                            name="X drew",
-                           saro_shiny="Chance for e-girl Saroshi (As) to be shiny (0 to 1, Default: 0)",
-                           bay_shiny="Chance for Princess Bay (6h) to be shiny (0 to 1, Default: 0)",
-                           draug_shiny="Chance for draug (9s) to be shiny (0 to 1, Default: 0)",
-                           sap_shiny="Chance for Sap (Kc) to be shiny (0 to 1, Default: 0)",
                            sort="Sort cards by rank or suit (Default: rank)")
     @app_commands.choices(
         sort=[app_commands.Choice(name="Rank", value="rank"), app_commands.Choice(name="Suit", value="suit")])
     async def user_drawcards(self, interaction: discord.Interaction, number: app_commands.Range[int, 1, 10],
                              infinite: bool = False,
-                             name: str = "",
-                             saro_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                             bay_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                             draug_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                             sap_shiny: app_commands.Range[float, 0.0, 1.0] = 0.0,
-                             sort: str = "rank"):
-        await self.draw_cards.callback(self, interaction, number, infinite, saro_shiny, bay_shiny,
-                                       draug_shiny, sap_shiny, name, sort)
+                             name: str = "", sort: str = "rank"):
+        await self.draw_cards.callback(self, interaction, number, infinite, name, sort)
 
     @app_commands.command(name="myactivity", description="Check your poker activity status")
     @app_commands.allowed_installs(guilds=False, users=True)

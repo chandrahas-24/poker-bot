@@ -106,13 +106,13 @@ UNO_PAYOUT_MANAGER_ROLE = 1019909875913998388
 # ── TOURNAMENT SCHEDULE & ACTIVITY RULES (all times UTC) — EDIT THESE PER TOURNAMENT ──
 _UTC = datetime.timezone.utc
 # Players can only /tourney register inside this window
-TOURNAMENT_REGISTRATION_OPEN  = datetime.datetime(2026, 11, 8, 12, 0, tzinfo=_UTC)
-TOURNAMENT_REGISTRATION_CLOSE = datetime.datetime(2026, 11, 13, 12, 0, tzinfo=_UTC)
+TOURNAMENT_REGISTRATION_OPEN  = datetime.datetime(2026, 11, 8, 11, 0, tzinfo=_UTC)
+TOURNAMENT_REGISTRATION_CLOSE = datetime.datetime(2026, 11, 15, 3, 0, tzinfo=_UTC)
 # Tournament start = start of the first session on day 1.
 # Wipes are enforced only after this moment, up to and including TOURNAMENT_END
 # (7 days => 7 wipes; the last one runs right after day 7's second session).
 TOURNAMENT_START = datetime.datetime(2026, 11, 11, 3, 0, tzinfo=_UTC)
-TOURNAMENT_END   = TOURNAMENT_START + datetime.timedelta(days=7)
+TOURNAMENT_END   = TOURNAMENT_START + datetime.timedelta(days=5)
 # Two 2-hour sessions per day (time of day). Reminders are derived from these.
 TOURNAMENT_SESSION_STARTS = [datetime.time(3, 0), datetime.time(15, 0)]   # session 1, session 2
 TOURNAMENT_SESSION_LENGTH_H = 2

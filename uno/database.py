@@ -1724,6 +1724,9 @@ async def credit_payroll(run_id: int, approver_id: int, approver_name: str, paye
             await db.execute(
                 "INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note, table_id) VALUES (?,?,?,?,?,?,?,NULL)",
                 (now, approver_id, approver_name, p["user_id"], p["name"], p["amount"], p["note"]))
+            await db.execute(
+                "INSERT INTO currency_log (user_id, event_type, amount, description, ts) VALUES (?, 'Dealer Pay', ?, ?, ?)",
+                (p["user_id"], p["amount"], p["note"], now))
             paid += 1
         if paid:
             await db.execute("INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",

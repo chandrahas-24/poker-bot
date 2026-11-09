@@ -3102,10 +3102,12 @@ async def create_payroll_run(start, end, kind: str, poker_rev: int, uno_rev: int
             run_id = cur.lastrowid
             await cur.close()
             for it in items:
+                auto = it.get("p_adj") is not None or it.get("u_adj") is not None
                 await db.execute(
-                    "INSERT INTO payout_items (run_id, user_id, user_name, poker_seconds, uno_seconds, base_amount, uno_amount) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (run_id, it["user_id"], it["name"], it["p_sec"], it["u_sec"], it["p_base"], it["u_base"]))
+                    "INSERT INTO payout_items (run_id, user_id, user_name, poker_seconds, uno_seconds, base_amount, uno_amount, "
+                    "adjusted_amount, adj_uno, adjusted_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, it["user_id"], it["name"], it["p_sec"], it["u_sec"], it["p_base"], it["u_base"],
+                     it.get("p_adj"), it.get("u_adj"), 0 if auto else None))  # adjusted_by 0 = automatic bonus
             await db.commit()
             return run_id
         except Exception:
@@ -3161,12 +3163,14 @@ async def mark_uno_paid(run_id: int):
         await db.commit()
 
 
-async def set_payroll_adjustment(run_id: int, game: str, user_id: int, user_name: str, final_amount: int,
-                                 adjuster_id: int, adjuster_name: str) -> tuple[bool, str]:
-    """Set the FINAL payout (in that game's chips) for a user in a pending run. game = 'poker' | 'uno'.
-    Equal to base clears the adjustment; a non-dealer gets a base-0 row."""
+async def apply_payroll_adjustment(run_id: int, game: str, user_id: int, user_name: str, mode: str, amount: int,
+                                   adjuster_id: int, adjuster_name: str) -> tuple[bool, str, int]:
+    """Adjust one user's payout in one game's chips on a pending run. mode='set': amount is the FINAL payout.
+    mode='add': amount (may be negative) is added to the current final (never below 0). Read-modify-write is
+    atomic under the write lock. Final equal to base clears the adjustment; non-dealers get a base-0 row.
+    Returns (ok, error, new_final)."""
     if game not in ("poker", "uno"):
-        return False, "Game must be poker or uno."
+        return False, "Game must be poker or uno.", 0
     base_col, adj_col = ("base_amount", "adjusted_amount") if game == "poker" else ("uno_amount", "adj_uno")
     db = await _get_db()
     now = datetime.utcnow()
@@ -3175,28 +3179,29 @@ async def set_payroll_adjustment(run_id: int, game: str, user_id: int, user_name
             async with db.execute("SELECT status FROM payout_runs WHERE id=?", (run_id,)) as c:
                 r = await c.fetchone()
             if not r:
-                return False, "Run not found."
+                return False, "Run not found.", 0
             if r["status"] != "pending":
-                return False, f"Run is already {r['status']}."
-            async with db.execute(f"SELECT {base_col} AS b FROM payout_items WHERE run_id=? AND user_id=?", (run_id, user_id)) as c:
+                return False, f"Run is already {r['status']}.", 0
+            async with db.execute(f"SELECT {base_col} AS b, {adj_col} AS a FROM payout_items WHERE run_id=? AND user_id=?",
+                                  (run_id, user_id)) as c:
                 it = await c.fetchone()
+            base = it["b"] if it else 0
+            cur = (it["a"] if it["a"] is not None else it["b"]) if it else 0
+            final = max(0, amount) if mode == "set" else max(0, cur + amount)
             if it:
-                base = it["b"]
-                new_adj = None if final_amount == base else final_amount
+                new_adj = None if final == base else final
                 await db.execute(f"UPDATE payout_items SET {adj_col}=?, adjusted_by=?, user_name=? WHERE run_id=? AND user_id=?",
                                  (new_adj, adjuster_id, user_name, run_id, user_id))
-            else:
-                base = 0
-                if final_amount > 0:
-                    await db.execute(
-                        f"INSERT INTO payout_items (run_id, user_id, user_name, poker_seconds, uno_seconds, base_amount, uno_amount, {adj_col}, adjusted_by) "
-                        "VALUES (?,?,?,0,0,0,0,?,?)", (run_id, user_id, user_name, final_amount, adjuster_id))
+            elif final > 0:
+                await db.execute(
+                    f"INSERT INTO payout_items (run_id, user_id, user_name, poker_seconds, uno_seconds, base_amount, uno_amount, {adj_col}, adjusted_by) "
+                    "VALUES (?,?,?,0,0,0,0,?,?)", (run_id, user_id, user_name, final, adjuster_id))
             await db.execute(
                 "INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",
                 (now.strftime("%Y-%m-%d %H:%M UTC"), "PAYROLL_ADJUST", adjuster_id, adjuster_name,
-                 f"run #{run_id} [{game}]: {user_name} ({user_id}) base {base} -> final {final_amount}"))
+                 f"run #{run_id} [{game}]: {user_name} ({user_id}) {mode} {amount:+d}: {cur} -> {final} (base {base})"))
             await db.commit()
-            return True, ""
+            return True, "", final
         except Exception:
             await db.rollback()
             raise
@@ -3207,8 +3212,8 @@ def _final(base, adj):
 
 
 def _pay_note(run_id: int, game: str, secs: int, base: int, adj):
-    note = f"Dealer pay run #{run_id} ({game}): {round(secs / 60, 1)} min"
-    if adj is not None and adj != base:
+    note = f"Dealer pay run #{run_id} ({game}): {round(secs / 60, 1)} min" if secs > 0 else f"Dealer pay run #{run_id} ({game}): manual payout"
+    if secs > 0 and adj is not None and adj != base:
         d = adj - base
         note += f" (base {base}, adjusted {'+' if d > 0 else '-'}{abs(d)})"
     return note
@@ -3260,6 +3265,9 @@ async def pay_payroll_run(run_id: int, approver_id: int, approver_name: str) -> 
                 await db.execute(
                     "INSERT INTO chip_log (ts, admin_id, admin_name, user_id, user_name, amount, note) VALUES (?,?,?,?,?,?,?)",
                     (now, approver_id, approver_name, it["user_id"], it["user_name"], final, note))
+                await db.execute(
+                    "INSERT INTO currency_log (user_id, event_type, amount, description, ts) VALUES (?, 'Dealer Pay', ?, ?, ?)",
+                    (it["user_id"], final, note, now))
 
             await db.execute(
                 "INSERT INTO audit_log (ts, action, user_id, user_name, detail) VALUES (?,?,?,?,?)",

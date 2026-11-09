@@ -28,6 +28,25 @@ def _rate() -> Fraction:
     return Fraction(str(getattr(config, "DEALER_PAY_RATE", 0.35)))
 
 
+def _bonus_cfg():
+    g = lambda k, d: int(getattr(config, k, d))
+    return g("BONUS_FIRST_MIN", 500), g("BONUS_FIRST_AMT", 500), g("BONUS_STEP_MIN", 250), g("BONUS_STEP_AMT", 250)
+
+
+def hosting_bonus(seconds: int) -> int:
+    """Per game, per run: first_amt chips at first_min minutes hosted, then step_amt per further step_min minutes."""
+    first_min, first_amt, step_min, step_amt = _bonus_cfg()
+    m = int(seconds) // 60
+    if m < first_min:
+        return 0
+    return first_amt + step_amt * ((m - first_min) // step_min)
+
+
+def _bonus_note() -> str:
+    first_min, first_amt, step_min, step_amt = _bonus_cfg()
+    return f"Hosting bonus (per game): +{first_amt} at {first_min} min, then +{step_amt} per {step_min} min"
+
+
 def _utcnow() -> dt.datetime:
     return dt.datetime.utcnow()
 
@@ -90,12 +109,14 @@ async def compute(start: dt.datetime, end: dt.datetime) -> dict:
         p_base = math.ceil(pool_p * e["p_sec"] / tot_p) if tot_p > 0 and pool_p > 0 else 0
         u_base = math.ceil(pool_u * e["u_sec"] / tot_u) if tot_u > 0 and pool_u > 0 else 0
 
+        p_bonus, u_bonus = hosting_bonus(e["p_sec"]), hosting_bonus(e["u_sec"])
+
         items.append({
             **e,
             "p_base": p_base,
             "u_base": u_base,
-            "p_adj": None,
-            "u_adj": None,
+            "p_adj": p_base + p_bonus if p_bonus else None,
+            "u_adj": u_base + u_bonus if u_bonus else None,
         })
 
     items.sort(key=lambda x: -(x["p_sec"] + x["u_sec"]))
@@ -216,7 +237,8 @@ def _section_text(items: list[dict], game: str, pool: int) -> str:
         final = it[adj_k] if it[adj_k] is not None else it[base_k]
         total += final
 
-        share = f" · {final / pool * 100:.1f}%" if pool > 0 else ""
+        # share of the pool (base only) — adjustments/bonuses don't change it
+        share = f" · {it[base_k] / pool * 100:.1f}%" if pool > 0 and it[sec] > 0 else ""
 
         lines.append(
             f"<@{it['user_id']}>  ·  **{fmt_pay(it[base_k], it[adj_k])}** {chip}"
@@ -299,6 +321,7 @@ def _payroll_layout(
         discord.ui.TextDisplay(
             content=_status_text(status, decided_by, dry, uno_paid)
         ),
+        discord.ui.TextDisplay(content=f"-# {_bonus_note()}"),
     )
 
 
@@ -373,114 +396,94 @@ async def _guard(interaction: discord.Interaction):
     return got
 
 
+_AMT_RE = re.compile(r"^([+-])?\s*(\d+)$")
+
+
+def parse_amount(text: str):
+    """'+100' / '-100' -> ('add', ±100); '2000' -> ('set', 2000); anything else -> None."""
+    m = _AMT_RE.match(text.replace(",", "").strip())
+    if not m:
+        return None
+    n = int(m.group(2))
+    return ("add", n) if m.group(1) == "+" else ("add", -n) if m.group(1) == "-" else ("set", n)
+
+
 class AdjustModal(discord.ui.Modal, title="Adjust payout"):
-    game = discord.ui.TextInput(
-        label="Game (poker / uno)",
-        default="poker",
-        max_length=5,
-    )
-
-    user = discord.ui.TextInput(
-        label="User (ID or @mention)",
-        placeholder="123456789012345678",
-        max_length=60,
-    )
-
-    amount = discord.ui.TextInput(
-        label="Final payout (that game's chips)",
-        placeholder="250",
-        max_length=12,
-    )
+    """One popup: user dropdown, game dropdown, amount box (+100 / -100 / 2000)."""
 
     def __init__(self, message: discord.Message):
         super().__init__()
         self.message = message
+        self.user_sel = discord.ui.UserSelect(
+            placeholder="Pick a user", min_values=1, max_values=1, required=True
+        )
+        self.game_sel = discord.ui.Select(options=[
+            discord.SelectOption(label="Poker (poker chips)", value="poker", default=True),
+            discord.SelectOption(label="UNO (UNO chips)", value="uno"),
+        ])
+        self.amount = discord.ui.TextInput(placeholder="+100, -100 or 2000", max_length=12)
+        self.add_item(discord.ui.Label(text="User", component=self.user_sel))
+        self.add_item(discord.ui.Label(text="Game", component=self.game_sel))
+        self.add_item(discord.ui.Label(
+            text="Amount",
+            description="+100 / -100 change the payout · 2000 sets the final",
+            component=self.amount,
+        ))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        m = re.search(r"\d{15,20}", self.user.value)
-
-        try:
-            final = int(self.amount.value.replace(",", "").strip())
-        except ValueError:
-            final = -1
-
-        g = self.game.value.strip().lower()
-        game = "uno" if g.startswith("u") else "poker" if g.startswith("p") else None
-
-        if not m or final < 0 or not game:
+        parsed = parse_amount(self.amount.value)
+        if parsed is None:
             await interaction.followup.send(
-                "❌ Need game (poker/uno), a user ID/@mention and a whole-number amount ≥ 0.",
-                ephemeral=True,
+                "❌ Use `+100`, `-100` or a plain number like `2000`.", ephemeral=True
             )
             return
 
-        uid = int(m.group())
+        if not self.user_sel.values:
+            await interaction.followup.send("❌ Pick a user.", ephemeral=True)
+            return
+
+        member = self.user_sel.values[0]
+        game = self.game_sel.values[0]
 
         got = await pdb.get_payroll_run_by_message(self.message.id)
-
         if not got:
             await interaction.followup.send("❌ Run not found.", ephemeral=True)
             return
 
-        run, items = got
-        existing = next((i for i in items if i["user_id"] == uid), None)
-
-        member = interaction.guild.get_member(uid)
-
-        if member is None:
-            try:
-                member = await interaction.guild.fetch_member(uid)
-            except discord.NotFound:
-                member = None
-
-        name = member.display_name if member else (
-            existing["user_name"] if existing else None
+        mode, n = parsed
+        ok, err, _ = await pdb.apply_payroll_adjustment(
+            got[0]["id"], game, member.id, member.display_name, mode, n,
+            interaction.user.id, interaction.user.display_name,
         )
-
-        if not name:
-            await interaction.followup.send(
-                "❌ That user isn't in this server.",
-                ephemeral=True,
-            )
-            return
-
-        ok, err = await pdb.set_payroll_adjustment(
-            run["id"],
-            game,
-            uid,
-            name,
-            final,
-            interaction.user.id,
-            interaction.user.display_name,
-        )
-
         if not ok:
             await interaction.followup.send(f"❌ {err}", ephemeral=True)
             return
 
-        run, items = await pdb.get_payroll_run(run["id"])
-
+        run, items = await pdb.get_payroll_run(got[0]["id"])
         await self.message.edit(view=render_run(run, items))
 
-        row = next((i for i in items if i["user_id"] == uid), None)
-
+        row = next((i for i in items if i["user_id"] == member.id), None)
+        shown = "0"
         if row:
-            shown = fmt_pay(
-                *(
-                    (row["base_amount"], row["adjusted_amount"])
-                    if game == "poker"
-                    else (row["uno_amount"], row["adj_uno"])
-                )
-            )
-        else:
-            shown = "0"
+            shown = fmt_pay(*(
+                (row["base_amount"], row["adjusted_amount"]) if game == "poker"
+                else (row["uno_amount"], row["adj_uno"])
+            ))
 
         await interaction.followup.send(
-            f"✅ {game.upper()} · <@{uid}>: {shown}",
-            ephemeral=True,
+            f"✅ {game.upper()} · <@{member.id}>: **{shown}**", ephemeral=True
         )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            await interaction.followup.send(
+                "❌ Adjustment failed — nothing changed. Check logs.", ephemeral=True
+            )
+        except Exception:
+            pass
 
 
 class _PayrollButton(discord.ui.Button):

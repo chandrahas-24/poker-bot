@@ -109,7 +109,8 @@ async def compute(start: dt.datetime, end: dt.datetime) -> dict:
         p_base = math.ceil(pool_p * e["p_sec"] / tot_p) if tot_p > 0 and pool_p > 0 else 0
         u_base = math.ceil(pool_u * e["u_sec"] / tot_u) if tot_u > 0 and pool_u > 0 else 0
 
-        p_bonus, u_bonus = hosting_bonus(e["p_sec"]), hosting_bonus(e["u_sec"])
+        p_bonus = hosting_bonus(e["p_sec"])
+        u_bonus = 0 # no bonus for uno yet
 
         items.append({
             **e,

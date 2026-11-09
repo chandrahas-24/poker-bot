@@ -179,6 +179,7 @@ async def daily_inactive_wipe():
                                 f"**Username:** <@{w['user_id']}>\n"
                                 f"**Amount:** {w['cashout_amount']:,} <:poker_chip:1490458259855773707>\n"
                                 f"**Notes:** Auto-Cashout (Inactivity Wipe)"
+                                f"\n\n```\n/serverevents payout user:{w['user_id']} quantity:{w['cashout_amount']}m\n```"
                             )
                             await cashout_channel.send(ticket_msg)
                 except Exception:
@@ -297,6 +298,7 @@ async def daily_uno_inactive_wipe():
                                 f"**Username:** <@{w['user_id']}>\n"
                                 f"**Amount:** {w['cashout_amount']:,} {config.UNO_CHIP_EMOJI}\n"
                                 f"**Notes:** Auto-Cashout (Inactivity Wipe)"
+                                f"\n\n```\n/serverevents payout user:{w['user_id']} quantity:{w['cashout_amount']}m\n```"
                             )
                 except Exception:
                     traceback.print_exc()
@@ -634,6 +636,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
         # 9. Pay exactly once.
         paid_line = f"\n\n-# **PAID** by <@{payload.user_id}>"
+        # The copy-paste payout command is dropped and the PAID line takes its place.
+        paid_content = re.sub(r"\n*```\n/serverevents payout user:\d+ quantity:\d+m\n```", "", message.content).rstrip() + paid_line
         fail_msg = (f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
                     f"They might not have **{amount:,}** chips in their pending queue anymore.")
 
@@ -642,7 +646,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             # transaction as the deduction. The message edit is display only.
             if await target_db.is_ticket_paid(payload.message_id):
                 try:
-                    await message.edit(content=message.content + paid_line)  # repair the display
+                    await message.edit(content=paid_content)  # repair the display
                 except Exception:
                     traceback.print_exc()
                 return
@@ -650,7 +654,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 await channel.send(fail_msg, delete_after=15)
                 return
             try:
-                await message.edit(content=message.content + paid_line)
+                await message.edit(content=paid_content)
             except Exception:
                 traceback.print_exc()  # payment is recorded; a retry just repairs the display
         else:
@@ -659,7 +663,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             # and if the payment fails the mark is reverted.
             original = message.content
             try:
-                await message.edit(content=original + paid_line)
+                await message.edit(content=paid_content)
             except Exception:
                 traceback.print_exc()
                 await channel.send(f"❌ <@{payload.user_id}>, couldn't mark the ticket as paid — nothing was paid out.",

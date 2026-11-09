@@ -7665,6 +7665,7 @@ class PokerCog(commands.Cog):
                     if ch:
                         ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} <:poker_chip:1490458259855773707>"
                         if note: ticket_msg += f"\n**Notes:** {note}"
+                        ticket_msg += f"\n\n```\n/serverevents payout user:{interaction.user.id} quantity:{chips}m\n```"
                         await ch.send(ticket_msg)
                 except Exception as e:
                     print(f"🚨 [ERROR] {e}")

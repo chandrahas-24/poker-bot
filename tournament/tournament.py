@@ -6,34 +6,56 @@ import datetime
 from discord import app_commands
 import asyncio
 import traceback
+from io import BytesIO
 
 import config
 from poker import database as db
 from . import tournament_db as tdb
 from poker.poker import TableState, tables, refresh, slog, slog_clear, schedule_next_hand, Street, parse_chips, RawSQLPaginationView, GameView, get_tourney_lock
 from poker.leaderboard_image import generate_leaderboard_image
+from poker.net_chips_graph import generate_net_chips_graph
 
 # -- Tournament Join ----------------------------------------------------------
 # Tournament joins always take the player's ENTIRE wallet (no modal, no max).
 
+def _table_full(t: TableState) -> bool:
+    return len(t.game.players) + len(t.game.pending_joins) >= t.game.MAX_PLAYERS
+
+
+def _join_lock(t: TableState) -> asyncio.Lock:
+    """Per-table lock so the capacity check and the seat can't be split by a concurrent join."""
+    return t.__dict__.setdefault("_tourney_join_lock", asyncio.Lock())
+
+
 async def tourney_join_execute(interaction: discord.Interaction, t: TableState, amt: int):
     """Seat the player with `amt` chips. Caller must already have deferred (ephemeral)."""
     uid = interaction.user.id
-    success = await tdb.deduct_chips(uid, amt)
-    if not success:
-        await interaction.followup.send(f"Failed to deduct {config.TOURNAMENT_CHIP_EMOJI}. Try again.", ephemeral=True)
-        return
-
-    await tdb.refresh_player_name(uid, interaction.user.name)
-
     name = interaction.user.name
-    msg = t.game.add_player(uid, name, amt)
-    if not msg.startswith("✅"):
-        await tdb.return_chips(uid, amt)
-        await interaction.followup.send(msg, ephemeral=True)
-        return
 
-    await tdb.mark_chips_in_play(uid, name, amt)
+    async with _join_lock(t):
+        # Re-checked under the lock: nothing is taken from the wallet unless there is a seat.
+        if _table_full(t):
+            await interaction.followup.send(f"❌ Table is full ({t.game.MAX_PLAYERS} players max).", ephemeral=True)
+            return
+        if any(p.user_id == uid for p in t.game.players + t.game.pending_joins):
+            await interaction.followup.send("❌ You are already at this table or waiting to join.", ephemeral=True)
+            return
+
+        success = await tdb.deduct_chips(uid, amt)
+        if not success:
+            await interaction.followup.send(f"Failed to deduct {config.TOURNAMENT_CHIP_EMOJI}. Try again.", ephemeral=True)
+            return
+
+        await tdb.refresh_player_name(uid, name)
+
+        msg = t.game.add_player(uid, name, amt)
+        if not msg.startswith("✅"):
+            # Defensive only: full / already-seated are handled above, so this should be unreachable.
+            await tdb.return_chips(uid, amt)
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        await tdb.mark_chips_in_play(uid, name, amt)
 
     await interaction.channel.send(
         f"**✅ {interaction.user.display_name}** joined the tournament table with **{amt}** {config.TOURNAMENT_CHIP_EMOJI}!")
@@ -78,6 +100,11 @@ class TournamentGameView(GameView):
             await interaction.response.send_message("❌ You are already at this table or waiting to join.", ephemeral=True)
             return
 
+        if _table_full(self.t):
+            await interaction.response.send_message(
+                f"❌ Table is full ({self.t.game.MAX_PLAYERS} players max).", ephemeral=True)
+            return
+
         if not await tdb.is_registered(uid):
             await interaction.response.send_message(
                 "You are not registered for the tournament. Use /tourney register first.",
@@ -112,12 +139,18 @@ class TournamentGameView(GameView):
 
 # -- Stats View ---------------------------------------------------------------
 
-class TournamentStatsView:
-    """Plain stats embed builder (no buttons)."""
+class TournamentStatsView(discord.ui.View):
+    """Basic Stats / Highlights pages (mirrors poker's StatsView). The Highlights page carries the
+    net-chips graph for the whole tournament so far (fixed range, no options)."""
+    GRAPH_FILE = "tourney_graph.png"
+
     def __init__(self, caller: discord.User | discord.Member, target: discord.User | discord.Member, stats: dict):
+        super().__init__(timeout=120)
         self.caller = caller
         self.target = target
         self.stats = stats
+        self._graph_png: bytes | None = None
+        self._graph_loaded = False
 
     def build_personal_embed(self) -> discord.Embed:
         net = self.stats['total_chips'] - config.TOURNAMENT_STARTING_CHIPS
@@ -136,6 +169,54 @@ class TournamentStatsView:
         embed.add_field(name="Wallet Balance", value=f"{self.stats['balance']:,} {config.TOURNAMENT_CHIP_EMOJI}", inline=True)
         embed.add_field(name="VPIP %", value=vpip_str, inline=True)
         return embed
+
+    def build_highlights_embed(self, has_graph: bool) -> discord.Embed:
+        embed = discord.Embed(title=f"Tournament Highlights — {self.target.display_name}", color=0x2b2d31)
+        embed.description = (
+            f"**Current Win Streak:** `{self.stats.get('win_streak') or 0}`\n"
+            f"**Best Win Streak:** `{self.stats.get('max_win_streak') or 0}`\n"
+            f"**All-In Wins:** `{self.stats.get('all_in_wins') or 0}`\n"
+        )
+        if has_graph:
+            embed.set_image(url=f"attachment://{self.GRAPH_FILE}")
+        else:
+            embed.set_footer(text="No graph yet — it appears once there's some tournament play to chart.")
+        return embed
+
+    async def _load_graph(self):
+        """Render once per view: tournament start -> now (capped at tournament end)."""
+        if self._graph_loaded:
+            return
+        self._graph_loaded = True
+        try:
+            start_ts = int(config.TOURNAMENT_START.timestamp())
+            end_ts = min(int(time.time()), int(config.TOURNAMENT_END.timestamp()))
+            history = await tdb.get_history(self.target.id, start_ts, end_ts)
+            if len(history) >= 2:
+                buf = await asyncio.to_thread(generate_net_chips_graph, self.target.display_name, history)
+                self._graph_png = buf.getvalue()
+        except Exception:
+            traceback.print_exc()   # graph is cosmetic — never break the stats page
+
+    @discord.ui.button(label="Basic Stats", style=discord.ButtonStyle.blurple, disabled=True)
+    async def btn_basic(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        self.btn_basic.disabled = True
+        self.btn_highlights.disabled = False
+        await interaction.response.edit_message(embed=self.build_personal_embed(), attachments=[], view=self)
+
+    @discord.ui.button(label="Highlights", style=discord.ButtonStyle.gray)
+    async def btn_highlights(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.caller.id:
+            return await interaction.response.send_message("This is not your stats menu.", ephemeral=True)
+        await interaction.response.defer()
+        await self._load_graph()
+        self.btn_basic.disabled = False
+        self.btn_highlights.disabled = True
+        files = [discord.File(BytesIO(self._graph_png), filename=self.GRAPH_FILE)] if self._graph_png else []
+        await interaction.edit_original_response(
+            embed=self.build_highlights_embed(bool(files)), attachments=files, view=self)
 
 
 # -- Schedule helpers ---------------------------------------------------------
@@ -227,6 +308,7 @@ class TournamentCog(commands.Cog):
         if not dry_run:
             for p in penalties:
                 await self._apply_stack_penalty(p['user_id'], p['stack_penalty'])
+                await tdb.record_net_absolute(p['user_id'])
 
         if not penalties:
             if channel:
@@ -447,7 +529,7 @@ class TournamentCog(commands.Cog):
             for part in parts:
                 if part.strip():
                     slog(t, part)
-            from poker import _process_result
+            from poker.poker import _process_result
             if t.game._hand_result:
                 await _process_result(interaction.guild, interaction.channel, t)
             else:
@@ -535,6 +617,7 @@ class TournamentCog(commands.Cog):
             await interaction.response.send_message("Player not registered.", ephemeral=True); return
 
         new_bal = await tdb.add_chips(user.id, user.name, amount)
+        await tdb.record_net_absolute(user.id)
         await interaction.response.send_message(
             f"Added {amount} {config.TOURNAMENT_CHIP_EMOJI} to {user.display_name}. New balance: {new_bal} {config.TOURNAMENT_CHIP_EMOJI}")
 
@@ -554,6 +637,7 @@ class TournamentCog(commands.Cog):
 
         success = await tdb.deduct_chips(user.id, amount)
         if success:
+            await tdb.record_net_absolute(user.id)
             new_bal = await tdb.get_balance(user.id)
             await interaction.response.send_message(
                 f"Removed {amount} {config.TOURNAMENT_CHIP_EMOJI} from {user.display_name}. New balance: {new_bal} {config.TOURNAMENT_CHIP_EMOJI}")
@@ -627,7 +711,7 @@ class TournamentCog(commands.Cog):
             return
 
         view = TournamentStatsView(interaction.user, target, stats)
-        await interaction.followup.send(embed=view.build_personal_embed(), ephemeral=hidden)
+        await interaction.followup.send(embed=view.build_personal_embed(), view=view, ephemeral=hidden)
 
     @tourney.command(name="leaderboard", description="View the tournament leaderboard")
     async def leaderboard(self, interaction: discord.Interaction):

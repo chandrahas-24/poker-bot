@@ -1,9 +1,14 @@
 import aiosqlite
 import asyncio
 import os
+import logging
 import shutil
+import time
 from datetime import datetime, timedelta
 import config
+from poker.net_history_db import shape_history
+
+log = logging.getLogger("tournament")
 
 DB_PATH = config.TOURNAMENT_DB_PATH
 _db: aiosqlite.Connection | None = None
@@ -75,6 +80,25 @@ async def init_db():
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
+
+        # Highlights columns (each in its own try so one existing column never skips the rest)
+        for col in ("win_streak", "max_win_streak", "all_in_wins"):
+            try:
+                await db.execute(f"ALTER TABLE players ADD COLUMN {col} INTEGER DEFAULT 0")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
+
+        # Net-chips history (graph on the Highlights page)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS net_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                net_chips INTEGER NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_net_history_user_ts ON net_history(user_id, ts)")
 
         await db.commit()
 
@@ -248,13 +272,20 @@ async def process_hand_result(result, table_name: str):
             # Catch the VPIP flag from the engine (default to 0 if not present)
             vpip_inc = 1 if (hasattr(result, 'vpip_ids') and user_id in result.vpip_ids) else 0
 
+            # Same definition as poker's record_hand_full
+            all_in_win = 1 if (won and getattr(result, 'allin_user_ids', None) and user_id in result.allin_user_ids) else 0
+
             await db.execute("""
                         UPDATE players SET 
                         hands_played = hands_played + 1,
                         hands_won = hands_won + ?,
-                        vpip_count = COALESCE(vpip_count, 0) + ?
+                        vpip_count = COALESCE(vpip_count, 0) + ?,
+                        win_streak = CASE WHEN ? THEN COALESCE(win_streak, 0) + 1 ELSE 0 END,
+                        max_win_streak = MAX(COALESCE(max_win_streak, 0),
+                                             CASE WHEN ? THEN COALESCE(win_streak, 0) + 1 ELSE 0 END),
+                        all_in_wins = COALESCE(all_in_wins, 0) + ?
                         WHERE user_id = ?
-                    """, (1 if won else 0, vpip_inc, user_id))
+                    """, (1 if won else 0, vpip_inc, won, won, all_in_win, user_id))
         await db.commit()
 
 async def log_hand(table_name: str, winner_id: int, winner_name: str, pot: int, summary: str):
@@ -266,6 +297,72 @@ async def log_hand(table_name: str, winner_id: int, winner_name: str, pot: int, 
             VALUES (?, ?, ?, ?, ?, ?)
         """, (table_name, winner_id, winner_name, pot, summary, now))
         await db.commit()
+
+# ── Net-chips history (graph) ──
+
+async def _net_of(db, user_id: int) -> int | None:
+    async with db.execute("""
+        SELECT p.balance + COALESCE(c.amount, 0)
+        FROM players p LEFT JOIN chips_in_play c ON p.user_id = c.user_id
+        WHERE p.user_id = ?
+    """, (user_id,)) as c:
+        row = await c.fetchone()
+    return None if row is None else row[0] - config.TOURNAMENT_STARTING_CHIPS
+
+
+async def record_net_history(deltas: dict):
+    """Call after a hand's chips_in_play sync. deltas = {user_id: chip delta}; only
+    changed nets are recorded. Same shape as poker's net_history_db.record
+    (first point also gets a baseline 1s earlier). Best-effort — never affects the hand."""
+    try:
+        db = await _get_db()
+        now = int(time.time())
+        async with _write_lock:
+            for uid, delta in deltas.items():
+                if not delta:
+                    continue
+                net_after = await _net_of(db, uid)
+                if net_after is None:
+                    continue
+                async with db.execute("SELECT 1 FROM net_history WHERE user_id=? LIMIT 1", (uid,)) as c:
+                    first = await c.fetchone() is None
+                if first:
+                    await db.execute("INSERT INTO net_history (ts, user_id, net_chips) VALUES (?, ?, ?)",
+                                     (now - 1, uid, net_after - delta))
+                await db.execute("INSERT INTO net_history (ts, user_id, net_chips) VALUES (?, ?, ?)",
+                                 (now, uid, net_after))
+            await db.commit()
+    except Exception:
+        log.exception("tournament net history write failed")
+
+
+async def record_net_absolute(user_id: int):
+    """Out-of-hand change to someone's net (addchips/removechips, wipe penalties).
+    Records their current net. Best-effort."""
+    try:
+        db = await _get_db()
+        async with _write_lock:
+            net = await _net_of(db, user_id)
+            if net is not None:
+                await db.execute("INSERT INTO net_history (ts, user_id, net_chips) VALUES (?, ?, ?)",
+                                 (int(time.time()), user_id, net))
+                await db.commit()
+    except Exception:
+        log.exception("tournament net history write failed")
+
+
+async def get_history(user_id: int, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
+    """[{ts, net_chips}, ...] — same contract as poker's get_history. Never raises."""
+    try:
+        db = await _get_db()
+        async with db.execute(
+                "SELECT ts, net_chips FROM net_history WHERE user_id=? ORDER BY ts, id", (user_id,)) as c:
+            raw = [(r[0], r[1]) for r in await c.fetchall()]
+        return shape_history(raw, start_ts, end_ts)
+    except Exception:
+        log.exception("tournament net history read failed")
+        return []
+
 
 # ── Stats & Leaderboards ──
 

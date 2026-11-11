@@ -163,48 +163,53 @@ async def record_absolute(user_id: int, net_chips: int):
         await conn.commit()
 
 
-async def get_history(user_id: int, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
-    """[{ts, net_chips}, ...] ascending, shaped as a step function so the
-    graph is flat while a player is idle:
+def shape_history(raw: list[tuple[int, int]], start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
+    """Pure: [(ts, net_chips), ...] ascending -> [{ts, net_chips}, ...] shaped as a
+    step function so the graph is flat while a player is idle:
       - if start_ts is given, a baseline point at start_ts (last value before it)
       - long series are thinned to ~MAX_POINTS (keeps the last point)
       - before every change a point is added 1s earlier at the previous value
       - the line is extended flat to end_ts (capped at "now")
-    Never raises — returns [] on any failure."""
+    Shared by poker and the tournament history."""
+    if not raw:
+        return []
+
+    series = [r for r in raw if (start_ts is None or r[0] >= start_ts) and (end_ts is None or r[0] <= end_ts)]
+    if start_ts is not None:
+        before = [r for r in raw if r[0] < start_ts]
+        if before:
+            series.insert(0, (start_ts, before[-1][1]))
+    if not series:
+        return []
+
+    if len(series) > MAX_POINTS:
+        k = -(-len(series) // MAX_POINTS)
+        last = series[-1]
+        series = series[::k]
+        if series[-1] != last:
+            series.append(last)
+
+    rows: list[tuple[int, int]] = []
+    for ts, n in series:
+        if rows and n != rows[-1][1] and ts - 1 > rows[-1][0]:
+            rows.append((ts - 1, rows[-1][1]))
+        rows.append((ts, n))
+
+    now = int(time.time())
+    tail_ts = now if end_ts is None else min(end_ts, now)
+    if tail_ts > rows[-1][0]:
+        rows.append((tail_ts, rows[-1][1]))
+    return [{"ts": ts, "net_chips": n} for ts, n in rows]
+
+
+async def get_history(user_id: int, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
+    """[{ts, net_chips}, ...] ascending — see shape_history. Never raises — returns [] on any failure."""
     try:
         conn = await _get_db()
         async with conn.execute(
                 "SELECT ts, net_chips FROM net_history WHERE user_id=? ORDER BY ts, id", (user_id,)) as c:
             raw = [(r[0], r[1]) for r in await c.fetchall()]
-        if not raw:
-            return []
-
-        series = [r for r in raw if (start_ts is None or r[0] >= start_ts) and (end_ts is None or r[0] <= end_ts)]
-        if start_ts is not None:
-            before = [r for r in raw if r[0] < start_ts]
-            if before:
-                series.insert(0, (start_ts, before[-1][1]))
-        if not series:
-            return []
-
-        if len(series) > MAX_POINTS:
-            k = -(-len(series) // MAX_POINTS)
-            last = series[-1]
-            series = series[::k]
-            if series[-1] != last:
-                series.append(last)
-
-        rows: list[tuple[int, int]] = []
-        for ts, n in series:
-            if rows and n != rows[-1][1] and ts - 1 > rows[-1][0]:
-                rows.append((ts - 1, rows[-1][1]))
-            rows.append((ts, n))
-
-        now = int(time.time())
-        tail_ts = now if end_ts is None else min(end_ts, now)
-        if tail_ts > rows[-1][0]:
-            rows.append((tail_ts, rows[-1][1]))
-        return [{"ts": ts, "net_chips": n} for ts, n in rows]
+        return shape_history(raw, start_ts, end_ts)
     except Exception:
         log.exception("poker net history read failed")
         return []

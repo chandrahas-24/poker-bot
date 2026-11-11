@@ -3058,6 +3058,8 @@ async def _process_result(guild, channel, t: TableState):
             await tournament_db.sync_chips_in_play(chip_map)
         except Exception:
             traceback.print_exc()
+        # Net-chips graph point (best-effort, handles its own errors)
+        await tournament_db.record_net_history(result.chip_deltas or {})
         # Return chips & set rejoin cooldown for pending leaves
         for uid in list(t.game.pending_leaves):
             p = t.game.get_player(uid)
@@ -5661,7 +5663,7 @@ class GameView(discord.ui.View):
         super().__init__(timeout=None)
         self.t = t
         in_hand = t.game.street not in (Street.WAITING, Street.SHOWDOWN)
-        table_full = (len(t.game.players) + len(t.game.pending_joins)) >= 12
+        table_full = (len(t.game.players) + len(t.game.pending_joins)) >= t.game.MAX_PLAYERS
         self.btn_join.disabled = table_full or t.closing
 
         self.btn_leave.disabled = t.closing  # <-- ADD THIS LINE

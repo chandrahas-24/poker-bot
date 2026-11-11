@@ -179,7 +179,7 @@ async def daily_inactive_wipe():
                                 f"**Username:** <@{w['user_id']}>\n"
                                 f"**Amount:** {w['cashout_amount']:,} <:poker_chip:1490458259855773707>\n"
                                 f"**Notes:** Auto-Cashout (Inactivity Wipe)"
-                                f"\n\n```\n/serverevents payout user:{w['user_id']} quantity:{w['cashout_amount']}m\n```"
+                                f"\n\n`\n/serverevents payout user:{w['user_id']} quantity:{w['cashout_amount']}m\n`"
                             )
                             await cashout_channel.send(ticket_msg)
                 except Exception:
@@ -298,7 +298,7 @@ async def daily_uno_inactive_wipe():
                                 f"**Username:** <@{w['user_id']}>\n"
                                 f"**Amount:** {w['cashout_amount']:,} {config.UNO_CHIP_EMOJI}\n"
                                 f"**Notes:** Auto-Cashout (Inactivity Wipe)"
-                                f"\n\n```\n/serverevents payout user:{w['user_id']} quantity:{w['cashout_amount']}m\n```"
+                                f"\n\n`\n/serverevents payout user:{w['user_id']} quantity:{w['cashout_amount']}m\n`"
                             )
                 except Exception:
                     traceback.print_exc()
@@ -637,7 +637,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         # 9. Pay exactly once.
         paid_line = f"\n\n-# **PAID** by <@{payload.user_id}>"
         # The copy-paste payout command is dropped and the PAID line takes its place.
-        paid_content = re.sub(r"\n*```\n/serverevents payout user:\d+ quantity:\d+m\n```", "", message.content).rstrip() + paid_line
+        paid_content = re.sub(r"\n*`\n/serverevents payout user:\d+ quantity:\d+m\n`", "", message.content).rstrip() + paid_line
         fail_msg = (f"❌ <@{payload.user_id}>, failed to process cashout for <@{target_user_id}>. "
                     f"They might not have **{amount:,}** chips in their pending queue anymore.")
 

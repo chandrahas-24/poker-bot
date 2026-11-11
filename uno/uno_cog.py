@@ -4625,7 +4625,7 @@ class UnoGame(commands.Cog):
                     ticket_msg = f"**Username:** {interaction.user.mention}\n**Amount:** {chips} {config.UNO_CHIP_EMOJI}"
                     if note:
                         ticket_msg += f"\n**Notes:** {note}"
-                    ticket_msg += f"\n\n```\n/serverevents payout user:{interaction.user.id} quantity:{chips}m\n```"
+                    ticket_msg += f"\n\n`\n/serverevents payout user:{interaction.user.id} quantity:{chips}m\n`"
                     ticket = await ch.send(ticket_msg)
             except Exception:
                 log.exception("Failed to post UNO cashout ticket")

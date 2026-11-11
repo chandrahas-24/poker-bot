@@ -7376,8 +7376,11 @@ class PokerCog(commands.Cog):
         elif raw == "high":
             sb, bb, min_b, max_b = 25, 50, 250, 5000
             preset_name = "High Table"
+        elif raw == "higherer":
+            sb, bb, min_b, max_b = 50, 100, 500, 7500
+            preset_name = "Higher Table"
         elif raw == "higherest":
-            sb, bb, min_b, max_b = 100, 200, 1000, 7500
+            sb, bb, min_b, max_b = 100, 200, 1000, 10000
             preset_name = "Really High Table?"
         elif raw == "teeny":
             sb, bb, min_b, max_b = 1, 2, 5, 5

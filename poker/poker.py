@@ -2031,9 +2031,12 @@ async def leave_table_execute(guild: discord.Guild, channel, t: TableState, inte
     chips_back, msg = t.game.remove_player(interaction.user.id)
 
     if t.is_tournament:
-        if chips_back > 0:
-            await tdb.return_chips(interaction.user.id, chips_back)
-        await tdb.clear_chips_in_play(interaction.user.id)
+        # "will leave" = queued mid-hand: stack is still on the table, so keep its chips_in_play row
+        # (_process_result returns the chips and clears the row at hand end)
+        if "will leave" not in msg:
+            if chips_back > 0:
+                await tdb.return_chips(interaction.user.id, chips_back)
+            await tdb.clear_chips_in_play(interaction.user.id)
     else:
         if chips_back > 0:
             await db.return_chips(interaction.user.id, chips_back)

@@ -31,8 +31,8 @@ PAYOUT_MANAGER_ROLE = 1019909875913998388
 LOCKDOWN_CHANNELS = [799685122701000754]
 
 RESTRICTED_CHANNELS = {
-    1508645866712465479: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table"],  #allowed exceptions
-    1513018821982814270: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table"],
+    1508645866712465479: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table", "tourney open"],  #allowed exceptions
+    1513018821982814270: ["poker start", "poker open", "poker rebuy", "poker close", "poker gamble", "tourney wallet", "poker table", "pokerset table", "tourney open"],
 }
 
 # ── ECONOMY & TAX ──

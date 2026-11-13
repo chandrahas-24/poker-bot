@@ -436,7 +436,7 @@ if config.DONATION_CONVERSION_ENABLED:
 
         # ── 3.5. Ensure we haven't already processed this message (persistent check) ──
         for reaction in message.reactions:
-            if reaction.me and str(reaction.emoji) == "✅":
+            if reaction.me and str(reaction.emoji) in "✅✔️☑️🎷":
                 return
 
         # ── 4. Content filter — extract all text, look for the success phrase ──

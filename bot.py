@@ -436,7 +436,7 @@ if config.DONATION_CONVERSION_ENABLED:
 
         # ── 3.5. Ensure we haven't already processed this message (persistent check) ──
         for reaction in message.reactions:
-            if reaction.me and str(reaction.emoji) in "✅✔️☑️🎷":
+            if reaction.me and str(reaction.emoji) in "✅":
                 return
 
         # ── 4. Content filter — extract all text, look for the success phrase ──
@@ -572,7 +572,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     # 3. Trigger on standard ✅ OR any custom emoji with "check" or "tick" in the name
     emoji_name = str(payload.emoji.name).lower()
-    if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name != "✅":
+    if "check" not in emoji_name and "tick" not in emoji_name and payload.emoji.name not in "✅✔️☑️🎷":
         return
 
     # ── Concurrency Check ─────────────────────────────────────────────────────

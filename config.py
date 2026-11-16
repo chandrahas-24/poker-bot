@@ -107,7 +107,7 @@ UNO_PAYOUT_MANAGER_ROLE = 1019909875913998388
 _UTC = datetime.timezone.utc
 # Players can only /tourney register inside this window
 TOURNAMENT_REGISTRATION_OPEN  = datetime.datetime(2026, 11, 8, 11, 0, tzinfo=_UTC)
-TOURNAMENT_REGISTRATION_CLOSE = datetime.datetime(2026, 11, 16, 3, 0, tzinfo=_UTC)
+TOURNAMENT_REGISTRATION_CLOSE = datetime.datetime(2026, 11, 17, 3, 0, tzinfo=_UTC)
 # Tournament start = start of the first session on day 1.
 # Wipes are enforced only after this moment, up to and including TOURNAMENT_END
 # (7 days => 7 wipes; the last one runs right after day 7's second session).

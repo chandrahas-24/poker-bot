@@ -12,7 +12,7 @@ from uno.database import init_db as init_uno_db
 from poker import database as db
 from uno import database as uno_db
 from poker.tutorial_db import init_db as init_tutorial_db
-from tournament import tournament_db
+# from tournament import tournament_db
 from eventlog import eventlog_database
 from discord.ext import tasks
 import datetime
@@ -342,7 +342,7 @@ async def _run_startup():
     await init_uno_db()
     await init_tutorial_db()
     await eventlog_database.init_log_db()
-    await tournament_db.init_db()
+    # await tournament_db.init_db()
 
     recovered = await recover_chips_in_play()
     await close_unclosed_dealer_sessions()
@@ -358,11 +358,11 @@ async def _run_startup():
               f"NOT auto-refunded. Check each channel with an open UNO table: /uno resume "
               f"first, or /unoadmin recoverchips once you've confirmed a game won't be resumed.")
 
-    tourney_recovered = await tournament_db.recover_chips_in_play()
-    if tourney_recovered:
-         print(f"⚠️  Recovered tournament chips for {len(tourney_recovered)} player(s) after restart:")
-         for r in tourney_recovered:
-             print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
+    # tourney_recovered = await tournament_db.recover_chips_in_play()
+    # if tourney_recovered:
+    #      print(f"⚠️  Recovered tournament chips for {len(tourney_recovered)} player(s) after restart:")
+    #      for r in tourney_recovered:
+    #          print(f"   {r['username']}: +{r['amount']} tournament chips returned to wallet")
 
     await _load_ext("poker.poker")
     await _load_ext("poker.tutorial_cog")
@@ -373,7 +373,7 @@ async def _run_startup():
     await _load_ext("uno.uno_cog")
     await _load_ext("highlight")
     await _load_ext("payroll")
-    await bot.load_extension("tournament.tournament")
+    #await bot.load_extension("tournament.tournament")
 
 
     YOUR_GUILD_ID = config.GUILD_ID
@@ -780,7 +780,7 @@ async def reload(ctx, cog_name: str = None):
                 return ([name_raw], [])
 
     if cog_name is None:
-        helpers_to_reload = ["config", "poker.net_history_db", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "tournament.tournament_db", "poker.tutorial_db", "poker.leaderboard_image", "poker.net_chips_graph"]
+        helpers_to_reload = ["config", "poker.net_history_db", "poker.database", "poker.engine", "poker.card_images", "poker.jackpot", "poker.taxation", "eventlog.eventlog_database", "poker.tutorial_db", "poker.leaderboard_image", "poker.net_chips_graph"]
         helpers_to_reload += [h for h in UNO_HELPERS if h not in helpers_to_reload]
         cogs_to_reload = ["poker.poker", "eventlog.eventlog", "poker.tutorial_cog", "poker.pokerai", "uno.uno_cog", "highlight", "payroll"]
     else:

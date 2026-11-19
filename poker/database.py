@@ -3020,11 +3020,16 @@ async def get_dealer_minutes_between(period_start, period_end) -> list[dict]:
     ]
 
 
+
 async def get_dealer_minutes(start_date: str, end_date: str) -> list[dict]:
     from datetime import datetime as dt, timedelta
-    # Whole UTC dates, half-open: [start_date 00:00, day_after_end_date 00:00)
-    period_start = dt.fromisoformat(start_date)
-    period_end = dt.fromisoformat(end_date) + timedelta(days=1)
+
+    # Whole UTC dates, half-open: [start_date 05:30, day_after_end_date 05:30)
+
+    period_start = dt.fromisoformat(start_date).replace(hour=5, minute=30, second=0, microsecond=0)
+
+    period_end = (dt.fromisoformat(end_date) + timedelta(days=1)).replace(hour=5, minute=30, second=0, microsecond=0)
+
     return await get_dealer_minutes_between(period_start, period_end)
 
 

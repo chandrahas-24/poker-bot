@@ -820,6 +820,7 @@ async def _auto_next_hand(t: TableState, channel):
 
     # Auto-remove or auto-rebuy players below big blind
     bb = t.game.BIG_BLIND
+    min_buy = t.game.MIN_BUYIN
     for p in list(t.game.players):
         if (p.chips + p.pending_rebuy) < bb and p.user_id not in t.game.pending_leaves:
 
@@ -858,7 +859,7 @@ async def _auto_next_hand(t: TableState, channel):
                 top_up_needed = target_stack - current_total
 
                 # Only proceed if they actually need chips, and the target is at least the Big Blind
-                if top_up_needed > 0 and target_stack >= bb:
+                if top_up_needed > 0 and target_stack >= bb and target_stack > min_buy:
                     wallet_bal = await _bal(p.user_id)
 
                     # STRICT ALL-OR-NOTHING CHECK
@@ -7609,6 +7610,8 @@ class PokerCog(commands.Cog):
         current_stack = 0
         if p:
             current_stack = p.chips + p.pending_rebuy
+            if t.game.street != Street.WAITING and not p.folded:
+                current_stack += p.total_bet  # chips already committed this hand
         elif pj:
             current_stack = pj.chips + pj.pending_rebuy
 

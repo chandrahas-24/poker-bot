@@ -940,25 +940,12 @@ class HighlightCog(commands.Cog):
             lines[0] = f"↪ {lines[0]}"
         return lines
 
-    def _render_group(self, records: list, trigger_id: int, pattern) -> str:
-        """One author's consecutive messages: linked name, then '[time] msg' lines."""
-        name = discord.utils.escape_markdown(records[0]["author"])
-        lines = [f"**[{name}]({records[0]['url']})**"]
-        for rec in records:
-            body = self._render_body(rec, pattern)
-            body[0] = f"[<t:{rec['ts']}:T>] {body[0]}"
-            lines.extend(body)
-        return "\n".join(lines)
-
-    @staticmethod
-    def _group_by_author(records: list) -> list:
-        groups = []
-        for rec in records:
-            if groups and groups[-1][0]["author"] == rec["author"]:
-                groups[-1].append(rec)
-            else:
-                groups.append([rec])
-        return groups
+    def _render_line(self, rec: dict, pattern) -> str:
+        """'[time] **name:** msg' per message; extra lines of a multi-line message sit below without a prefix."""
+        name = discord.utils.escape_markdown(rec["author"])
+        body = self._render_body(rec, pattern)
+        body[0] = f"[<t:{rec['ts']}:T>] **{name}:** {body[0]}"
+        return "\n".join(body)
 
     @staticmethod
     def _render_plain(records: list, pattern) -> str:
@@ -977,20 +964,17 @@ class HighlightCog(commands.Cog):
         before = list(before)
 
         def render():
-            records = before + [trigger] + list(after)
-            return [self._render_group(g, trigger["id"], pattern) for g in self._group_by_author(records)]
+            return "\n".join(self._render_line(r, pattern) for r in before + [trigger] + list(after))
 
         # Stay under the CV2 text cap by dropping the oldest "before" context first.
-        groups = render()
-        while before and len(header) + sum(map(len, groups)) > MAX_TEXT_CHARS:
+        body = render()
+        while before and len(header) + len(body) > MAX_TEXT_CHARS:
             before.pop(0)
-            groups = render()
+            body = render()
 
-        container = discord.ui.Container()
+        container = discord.ui.Container(accent_colour=discord.Colour.gold())
         container.add_item(discord.ui.TextDisplay(header))
-        for group in groups:
-            container.add_item(discord.ui.Separator())
-            container.add_item(discord.ui.TextDisplay(group))
+        container.add_item(discord.ui.TextDisplay(body))
         container.add_item(discord.ui.Separator())
         container.add_item(discord.ui.ActionRow(
             discord.ui.Button(label="Jump to message", url=jump_url)
@@ -1050,9 +1034,10 @@ class HighlightCog(commands.Cog):
             sources = [self._pattern_source(user_prefs, w) for w in sorted(valid_words, key=len, reverse=True)]
             pattern = re.compile("|".join(sources), re.IGNORECASE)
 
-            shown = ", ".join(discord.utils.escape_markdown(w) for w in valid_words)
+            shown = ", ".join(f'"{discord.utils.escape_markdown(w)}"' for w in valid_words)
+            label = "Highlight word" if len(valid_words) == 1 else "Highlight words"
             header = (
-                f"### {shown}\n"
+                f"### {label} {shown}\n"
                 f"{message.channel.mention} · <t:{int(message.created_at.timestamp())}:R>"
             )
 

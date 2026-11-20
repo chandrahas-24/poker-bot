@@ -854,9 +854,6 @@ class HighlightCog(commands.Cog):
 
     @staticmethod
     def _make_record(m: discord.Message) -> dict:
-        reply_to = None
-        if m.reference and isinstance(m.reference.resolved, discord.Message):
-            reply_to = m.reference.resolved.author.name
         return {
             "id": m.id,
             "author": m.author.name,
@@ -867,7 +864,7 @@ class HighlightCog(commands.Cog):
             "stickers": [s.name for s in m.stickers],
             "has_embeds": bool(m.embeds),
             "url": m.jump_url,
-            "reply_to": reply_to,
+            "is_reply": m.type == discord.MessageType.reply,
         }
 
     def _slice_context(self, channel_id: int, msg_id: int, before: int, after: int):
@@ -932,15 +929,16 @@ class HighlightCog(commands.Cog):
     def _render_body(self, rec: dict, pattern) -> list:
         esc = discord.utils.escape_markdown
         parts = []
-        if rec["reply_to"]:
-            parts.append(f"↪ replying to {esc(rec['reply_to'])}")
         if rec["content"]:
             parts.append(self._format_text(self._truncate(rec["content"]), pattern))
         parts += [f"📎 {esc(name)}" for name in rec["attachments"]]
         parts += [f"[sticker: {esc(name)}]" for name in rec["stickers"]]
         if not rec["content"] and not rec["attachments"] and not rec["stickers"]:
             parts.append("[embed]" if rec["has_embeds"] else "*(empty)*")
-        return [ln for ln in "\n".join(parts).split("\n") if ln.strip()]
+        lines = [ln for ln in "\n".join(parts).split("\n") if ln.strip()]
+        if rec.get("is_reply"):
+            lines[0] = f"↪ {lines[0]}"
+        return lines
 
     def _render_group(self, records: list, trigger_id: int, pattern) -> str:
         """One author's consecutive messages: linked name, then '[time] msg' lines."""

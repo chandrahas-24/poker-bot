@@ -28,6 +28,17 @@ CONTEXT_BEFORE = 3   # messages before the trigger
 CONTEXT_AFTER = 4    # messages after the trigger (filled in after the delay)
 VERIFY_BEFORE = 5    # messages before the trigger sent to the AI verifier
 HISTORY_SIZE = 15    # per-channel rolling history (only needs the "before" context)
+MAX_LINE_CHARS = 200  # raw message text is cut to this before rendering
+MAX_TEXT_CHARS = 3900  # Components V2 caps total text at 4000 per message
+
+# Discord tokens that must never be escaped or highlighted inside (emoji, mentions, timestamps, links).
+TOKEN_RE = re.compile(
+    r'<a?:\w+:\d+>'
+    r'|<(?:@[!&]?|#)\d+>'
+    r'|<t:-?\d+(?::[tTdDfFR])?>'
+    r'|<id:\w+>'
+    r'|https?://\S+'
+)
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -91,7 +102,7 @@ class HighlightCog(commands.Cog):
         self._last_prune = 0.0
         self.regex_cache = {}
         self.last_active = {}  # Tracks {(user_id, channel_id): timestamp} for highlight users ONLY
-        self.channel_history = {}  # {channel_id: deque[(message_id, formatted_line)]}
+        self.channel_history = {}  # {channel_id: deque[record dict]} (see _make_record)
         self.session = None    # Persistent aiohttp session
 
     async def cog_load(self):
@@ -588,11 +599,7 @@ class HighlightCog(commands.Cog):
         if message.channel.id not in self.channel_history:
             self.channel_history[message.channel.id] = deque(maxlen=HISTORY_SIZE)
 
-        time_str = message.created_at.strftime('%H:%M:%S')
-        clean_content = discord.utils.escape_markdown(message.content)
-        self.channel_history[message.channel.id].append(
-            (message.id, f"**[{time_str}] {message.author.name}:** {clean_content}")
-        )
+        self.channel_history[message.channel.id].append(self._make_record(message))
 
         current_time = time.time()
         author_id_str = str(message.author.id)
@@ -843,40 +850,157 @@ class HighlightCog(commands.Cog):
                 print(f"[Groq] API error: {type(e).__name__}: {e} -> allowing highlight")
                 return True
 
+    # ── Rendering ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_record(m: discord.Message) -> dict:
+        reply_to = None
+        if m.reference and isinstance(m.reference.resolved, discord.Message):
+            reply_to = m.reference.resolved.author.name
+        return {
+            "id": m.id,
+            "author": m.author.name,
+            "avatar": m.author.display_avatar.url,
+            "ts": int(m.created_at.timestamp()),
+            "content": m.content,
+            "attachments": [a.filename for a in m.attachments],
+            "stickers": [s.name for s in m.stickers],
+            "has_embeds": bool(m.embeds),
+            "url": m.jump_url,
+            "reply_to": reply_to,
+        }
+
     def _slice_context(self, channel_id: int, msg_id: int, before: int, after: int):
-        """Returns formatted lines around msg_id, or None if it rolled out of history."""
+        """Returns records around msg_id, or None if it rolled out of history."""
         history = list(self.channel_history.get(channel_id, []))
-        idx = next((i for i, (mid, _) in enumerate(history) if mid == msg_id), None)
+        idx = next((i for i, rec in enumerate(history) if rec["id"] == msg_id), None)
         if idx is None:
             return None
-        return [line for _, line in history[max(0, idx - before): idx + 1 + after]]
+        return history[max(0, idx - before): idx + 1 + after]
 
     async def _fetch_after(self, message: discord.Message, count: int):
         """Fetches up to `count` non-bot messages after `message` straight from Discord."""
-        lines = []
+        records = []
         try:
             async for m in message.channel.history(after=message, limit=count * 5, oldest_first=True):
                 if m.author.bot:
                     continue
-                time_str = m.created_at.strftime('%H:%M:%S')
-                clean = discord.utils.escape_markdown(m.content)
-                lines.append(f"**[{time_str}] {m.author.name}:** {clean}")
-                if len(lines) >= count:
+                records.append(self._make_record(m))
+                if len(records) >= count:
                     break
         except (discord.Forbidden, discord.HTTPException):
             pass
-        return lines
+        return records
 
     @staticmethod
-    def _highlight_lines(lines, pattern) -> str:
-        out = []
-        for line in lines:
-            parts = line.split(":** ", 1)
-            if len(parts) == 2 and pattern:
-                out.append(parts[0] + ":** " + pattern.sub(r'`\g<0>`', parts[1]))
+    def _truncate(text: str) -> str:
+        if len(text) <= MAX_LINE_CHARS:
+            return text
+        cut = text[:MAX_LINE_CHARS]
+        lt = cut.rfind('<')
+        if lt != -1 and '>' not in cut[lt:]:
+            cut = cut[:lt]  # don't leave half an emoji/mention token
+        return cut.rstrip() + "…"
+
+    @staticmethod
+    def _escape_and_mark(segment: str, pattern) -> str:
+        esc = discord.utils.escape_markdown
+        if not segment:
+            return ""
+        if pattern is None:
+            return esc(segment)
+        out, last = [], 0
+        for m in pattern.finditer(segment):
+            if m.start() == m.end():
+                continue
+            out.append(esc(segment[last:m.start()]))
+            out.append(f"__**{esc(m.group(0))}**__")
+            last = m.end()
+        out.append(esc(segment[last:]))
+        return "".join(out)
+
+    def _format_text(self, text: str, pattern) -> str:
+        """Escapes markdown and highlights matches, leaving Discord tokens untouched."""
+        out, last = [], 0
+        for tok in TOKEN_RE.finditer(text):
+            out.append(self._escape_and_mark(text[last:tok.start()], pattern))
+            out.append(tok.group(0))
+            last = tok.end()
+        out.append(self._escape_and_mark(text[last:], pattern))
+        return "".join(out)
+
+    def _render_body(self, rec: dict, pattern) -> list:
+        esc = discord.utils.escape_markdown
+        parts = []
+        if rec["reply_to"]:
+            parts.append(f"↪ replying to {esc(rec['reply_to'])}")
+        if rec["content"]:
+            parts.append(self._format_text(self._truncate(rec["content"]), pattern))
+        parts += [f"📎 {esc(name)}" for name in rec["attachments"]]
+        parts += [f"[sticker: {esc(name)}]" for name in rec["stickers"]]
+        if not rec["content"] and not rec["attachments"] and not rec["stickers"]:
+            parts.append("[embed]" if rec["has_embeds"] else "*(empty)*")
+        return [ln for ln in "\n".join(parts).split("\n") if ln.strip()]
+
+    def _render_group(self, records: list, trigger_id: int, pattern) -> str:
+        """One author's consecutive messages: linked name, then '[time] msg' lines."""
+        name = discord.utils.escape_markdown(records[0]["author"])
+        lines = [f"**[{name}]({records[0]['url']})**"]
+        for rec in records:
+            body = self._render_body(rec, pattern)
+            body[0] = f"[<t:{rec['ts']}:T>] {body[0]}"
+            lines.extend(body)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _group_by_author(records: list) -> list:
+        groups = []
+        for rec in records:
+            if groups and groups[-1][0]["author"] == rec["author"]:
+                groups[-1].append(rec)
             else:
-                out.append(line)
+                groups.append([rec])
+        return groups
+
+    @staticmethod
+    def _render_plain(records: list, pattern) -> str:
+        """Plain chat log for the AI verifier; matches wrapped in backticks."""
+        out = []
+        for rec in records:
+            t = time.strftime('%H:%M:%S', time.gmtime(rec["ts"]))
+            content = rec["content"] or "[attachment]"
+            if pattern:
+                content = pattern.sub(r'`\g<0>`', content)
+            out.append(f"[{t}] {rec['author']}: {content}")
         return "\n".join(out)
+
+    def _build_view(self, header: str, before: list, trigger: dict, after: list,
+                    jump_url: str, pattern) -> discord.ui.LayoutView:
+        before = list(before)
+
+        def render():
+            records = before + [trigger] + list(after)
+            return [self._render_group(g, trigger["id"], pattern) for g in self._group_by_author(records)]
+
+        # Stay under the CV2 text cap by dropping the oldest "before" context first.
+        groups = render()
+        while before and len(header) + sum(map(len, groups)) > MAX_TEXT_CHARS:
+            before.pop(0)
+            groups = render()
+
+        container = discord.ui.Container()
+        container.add_item(discord.ui.TextDisplay(header))
+        for group in groups:
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(group))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.ActionRow(
+            discord.ui.Button(label="Jump to message", url=jump_url)
+        ))
+
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        return view
 
     @staticmethod
     def _pattern_source(user_prefs: dict, word: str) -> str:
@@ -898,7 +1022,8 @@ class HighlightCog(commands.Cog):
             context_words = user_prefs.get("context_words", set())
 
             # Context up to and including the trigger message (nothing after it).
-            pre_lines = self._slice_context(message.channel.id, message.id, VERIFY_BEFORE, 0) or []
+            pre_records = self._slice_context(message.channel.id, message.id, VERIFY_BEFORE, 0) \
+                or [self._make_record(message)]
 
             valid_words = []
             for word in words:
@@ -911,7 +1036,7 @@ class HighlightCog(commands.Cog):
                 if is_context_word:
                     word_pattern = re.compile(self._pattern_source(user_prefs, word), re.IGNORECASE)
                     is_valid_target = await self.verify_context_with_gemini(
-                        word, self._highlight_lines(pre_lines, word_pattern)
+                        word, self._render_plain(pre_records, word_pattern)
                     )
                     if not is_valid_target:
                         # Rejected hits must not burn the cooldown.
@@ -927,40 +1052,29 @@ class HighlightCog(commands.Cog):
             sources = [self._pattern_source(user_prefs, w) for w in sorted(valid_words, key=len, reverse=True)]
             pattern = re.compile("|".join(sources), re.IGNORECASE)
 
-            if len(valid_words) == 1:
-                title = f"Highlight word \"{valid_words[0]}\""
-            else:
-                title = "Highlight words " + ", ".join(f"\"{w}\"" for w in valid_words)
-
-            # Initial DM: instant, trigger message is the last line.
-            initial_lines = pre_lines[-(CONTEXT_BEFORE + 1):]
-            embed = discord.Embed(
-                title=title,
-                description=self._highlight_lines(initial_lines, pattern),
-                color=discord.Color.gold(),
-                timestamp=message.created_at
+            shown = ", ".join(discord.utils.escape_markdown(w) for w in valid_words)
+            header = (
+                f"### {shown}\n"
+                f"{message.channel.mention} · <t:{int(message.created_at.timestamp())}:R>"
             )
 
-            embed.add_field(name="Source message", value=f"[Jump to]({message.jump_url})", inline=False)
-            embed.set_footer(text="Triggered")
-
-            ping_content = f"{user.mention} | In **{message.guild.name}** › {message.channel.mention}"
-            dm_message = await user.send(content=ping_content, embed=embed)
-
-            # After the delay, edit the DM to include the following messages.
+            trigger = pre_records[-1]
+            before = pre_records[-(CONTEXT_BEFORE + 1):-1]
             delay = HIGHLIGHT_CONFIG.get("alert_delay_seconds", 0)
+
+            view = self._build_view(header, before, trigger, [], message.jump_url, pattern)
+            dm_message = await user.send(view=view)
+
             if delay <= 0:
                 return
 
+            # After the delay, edit the DM to include the following messages.
             await asyncio.sleep(delay)
+            after = await self._fetch_after(message, CONTEXT_AFTER)
 
-            after_lines = await self._fetch_after(message, CONTEXT_AFTER)
-            if not after_lines:
-                return  # nothing followed
-
-            embed.description = self._highlight_lines(initial_lines + after_lines, pattern)
+            view = self._build_view(header, before, trigger, after, message.jump_url, pattern)
             try:
-                await dm_message.edit(embed=embed)
+                await dm_message.edit(view=view)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 

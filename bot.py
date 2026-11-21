@@ -713,24 +713,54 @@ async def _jsk_channel_only(ctx):
     # Jishaku only works in config.JSK_CHANNEL_ID; everything else is unaffected.
     return ctx.cog is None or ctx.cog.qualified_name != "Jishaku" or ctx.channel.id in config.JSK_CHANNEL_IDS
 
-@bot.command(aliases=["deploy","kiloyeeters"])
-async def restart(ctx):
-    if ctx.author.id not in AUTHORIZED_ADMINS:
-        await ctx.send("**Access Denied.** This command is restricted.")
-        return
+def _active_games() -> int:
+    uno = bot.get_cog("UnoGame")
+    return len(getattr(bot, "poker_tables", {})) + len(getattr(uno, "sessions", {}) if uno else {})
 
+
+async def _deploy(ctx):
     await ctx.send("**Initiating Deployment...**")
-
     try:
         repo_dir = os.path.dirname(os.path.abspath(__file__))
         pull_output = subprocess.check_output(["git", "pull"], cwd=repo_dir).decode("utf-8")
         await ctx.send(f"**Git Pull Success:**\n```\n{pull_output}\n```")
         await ctx.send("**Restarting bot service...**")
         os._exit(0)
-
     except Exception as e:
         traceback.print_exc()
         await ctx.send(f"**Deployment Failed:**\n```python\n{e}\n```")
+
+
+async def _queued_deploy(ctx):
+    while _active_games():
+        await asyncio.sleep(10)
+    await _deploy(ctx)
+
+
+@bot.command(aliases=["deploy","kiloyeeters"])
+async def restart(ctx, mode: str = None):
+    if ctx.author.id not in AUTHORIZED_ADMINS:
+        await ctx.send("**Access Denied.** This command is restricted.")
+        return
+
+    task = getattr(bot, "queued_deploy_task", None)
+    if mode == "cancel":
+        if task and not task.done():
+            task.cancel()
+            await ctx.send("**Queued restart cancelled.**")
+        else:
+            await ctx.send("No restart queued.")
+        return
+
+    if mode == "queue":
+        if task and not task.done():
+            await ctx.send("Restart already queued.")
+            return
+        bot.queued_deploy_task = asyncio.create_task(_queued_deploy(ctx))
+        await ctx.send(f"**Restart queued** — runs when all tables/games close ({_active_games()} active).")
+        return
+
+    await _deploy(ctx)
 
 
 @bot.command(aliases=["hotreload"])

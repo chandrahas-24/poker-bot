@@ -752,15 +752,15 @@ async def restart(ctx, mode: str = None):
             await ctx.send("No restart queued.")
         return
 
-    if mode == "queue":
-        if task and not task.done():
-            await ctx.send("Restart already queued.")
-            return
-        bot.queued_deploy_task = asyncio.create_task(_queued_deploy(ctx))
-        await ctx.send(f"**Restart queued** — runs when all tables/games close ({_active_games()} active).")
+    if mode == "force":
+        await _deploy(ctx)
         return
 
-    await _deploy(ctx)
+    if task and not task.done():
+        await ctx.send("Restart already queued.")
+        return
+    bot.queued_deploy_task = asyncio.create_task(_queued_deploy(ctx))
+    await ctx.send(f"**Restart queued** — runs when all tables/games close ({_active_games()} active).")
 
 
 @bot.command(aliases=["hotreload"])

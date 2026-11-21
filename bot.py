@@ -30,7 +30,11 @@ intents.members = True
 
 def _get_prefix(bot, message):
     # ".." only works in the jsk channel; mentions work everywhere.
-    extra = ("..",) if message.channel.id in config.JSK_CHANNEL_IDS else ()
+    extra = ()
+    if message.channel.id in config.JSK_CHANNEL_IDS:
+        extra = ("..",)
+        if message.content.split(maxsplit=1)[:1] in (["jsk"], ["jishaku"]):
+            extra += ("",)  # bare "jsk ..." works here; "" must stay last
     return commands.when_mentioned_or(*extra)(bot, message)
 
 bot = commands.Bot(command_prefix=_get_prefix, intents=intents, allowed_mentions=discord.AllowedMentions(users=True),

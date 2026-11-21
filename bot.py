@@ -30,7 +30,7 @@ intents.members = True
 
 def _get_prefix(bot, message):
     # ".." only works in the jsk channel; mentions work everywhere.
-    extra = ("..",) if message.channel.id in config.JSK_CHANNEL_IDs else ()
+    extra = ("..",) if message.channel.id in config.JSK_CHANNEL_IDS else ()
     return commands.when_mentioned_or(*extra)(bot, message)
 
 bot = commands.Bot(command_prefix=_get_prefix, intents=intents, allowed_mentions=discord.AllowedMentions(users=True),

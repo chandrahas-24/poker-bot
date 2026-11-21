@@ -28,7 +28,13 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, allowed_mentions=discord.AllowedMentions(users=True))
+def _get_prefix(bot, message):
+    # ".." only works in the jsk channel; mentions work everywhere.
+    extra = ("..",) if message.channel.id in config.JSK_CHANNEL_IDs else ()
+    return commands.when_mentioned_or(*extra)(bot, message)
+
+bot = commands.Bot(command_prefix=_get_prefix, intents=intents, allowed_mentions=discord.AllowedMentions(users=True),
+                   owner_ids=set(config.DEV_USER_IDS))
 bot.startup_complete = False
 
 
@@ -373,6 +379,7 @@ async def _run_startup():
     await _load_ext("uno.uno_cog")
     await _load_ext("highlight")
     await _load_ext("payroll")
+    await _load_ext("jishaku")
     #await bot.load_extension("tournament.tournament")
 
 
@@ -694,11 +701,17 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, discord.ext.commands.CommandNotFound):
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
         return
+    traceback.print_exception(type(error), error, error.__traceback__)
 
 
 AUTHORIZED_ADMINS = config.DEV_USER_IDS
+
+@bot.check
+async def _jsk_channel_only(ctx):
+    # Jishaku only works in config.JSK_CHANNEL_ID; everything else is unaffected.
+    return ctx.cog is None or ctx.cog.qualified_name != "Jishaku" or ctx.channel.id in config.JSK_CHANNEL_IDS
 
 @bot.command(aliases=["deploy","kiloyeeters"])
 async def restart(ctx):
